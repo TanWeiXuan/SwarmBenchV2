@@ -90,6 +90,7 @@ Only the latest rating state is committed; permanent tournament history lives in
 | Rank | Controller | Author | Rating | RD | W | D | L | Games |
 | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | 1 | Aegis Apex V2 | TanWeiXuan | 1509 | 68 | 0 | 0 | 0 | 0 |
+| 2 | Phalanx V2 | TanWeiXuan | 1438 | 68 | 0 | 0 | 0 | 0 |
 <!-- LEADERBOARD_END -->
 
 ## Reproducibility and security
