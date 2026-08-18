@@ -20,7 +20,7 @@ All vehicle pairs, friendly or opposing, use a continuous relative swept-point t
 
 Each TANK has five rounds. Firing is disabled before `t=5.0 s`; each Tank then has its own four-second cooldown. A valid fire direction is normalized and produces a point projectile moving at a constant absolute velocity of 20 m/s. Projectile velocity does not inherit Tank velocity.
 
-Projectiles originate at the source Tank's center and cannot hit that source. They can hit friendly or opposing vehicles using a continuous relative sweep against the 0.25 m vehicle radius. The first hit destroys the vehicle and consumes the projectile. Obstacles consume projectiles, arena exit removes them, and projectiles neither pierce nor collide with each other. Every active projectile's ID, team, source, position, and velocity is perfect information.
+Projectiles originate at the source Tank's center and cannot hit that source. They can hit friendly or opposing vehicles using a continuous relative sweep with a 0.75 m contact radius. The first hit destroys the vehicle and consumes the projectile. Obstacles consume projectiles, arena exit removes them, and projectiles neither pierce nor collide with each other. Every active projectile's ID, team, source, position, and velocity is perfect information.
 
 Candidates sort by normalized contact time, then priority and stable IDs. Exact-time priority is projectile/obstacle, vehicle/obstacle, projectile/vehicle, vehicle/vehicle, goal, then projectile exit. This preserves obstacle shielding, one-for-one vehicle contact, and deterministic outcomes.
 
