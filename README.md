@@ -89,8 +89,9 @@ Only the latest rating state is committed; permanent tournament history lives in
 <!-- LEADERBOARD_START -->
 | Rank | Controller | Author | Rating | RD | W | D | L | Games |
 | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | Aegis Apex V2 | TanWeiXuan | 1509 | 68 | 0 | 0 | 0 | 0 |
-| 2 | Phalanx V2 | TanWeiXuan | 1438 | 68 | 0 | 0 | 0 | 0 |
+| 1 | Wayfinder V2 | TanWeiXuan | 1569 | 49 | 0 | 0 | 0 | 0 |
+| 2 | Aegis Apex V2 | TanWeiXuan | 1509 | 68 | 0 | 0 | 0 | 0 |
+| 3 | Phalanx V2 | TanWeiXuan | 1438 | 68 | 0 | 0 | 0 | 0 |
 <!-- LEADERBOARD_END -->
 
 ## Reproducibility and security

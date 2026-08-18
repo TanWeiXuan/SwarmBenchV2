@@ -29,6 +29,20 @@
       "wins": 0
     },
     {
+      "author": "TanWeiXuan",
+      "built_in": false,
+      "controller_id": "TanWeiXuan/wayfinder_v2",
+      "deviation": 48.68427219450873,
+      "display_name": "Wayfinder V2",
+      "draws": 0,
+      "games": 0,
+      "losses": 0,
+      "rating": 1569.4958710509547,
+      "version_sha": "72c8b51b87ce619dfdefe99a64909e29676e8027",
+      "volatility": 0.05999687268034018,
+      "wins": 0
+    },
+    {
       "author": "SwarmBench",
       "built_in": true,
       "controller_id": "assignment",
