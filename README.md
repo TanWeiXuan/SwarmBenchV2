@@ -2,7 +2,7 @@
 
 SwarmBench is a deterministic, open-source benchmark and Kaggle-style competition for multi-agent swarm control and combat. Two Python controllers command mirrored mixed-class teams through a randomized 100 m × 60 m arena. The authoritative simulator is headless; replays and rendering are separate.
 
-![SwarmBench v2 match replay](match.gif)
+![Aegis Apex V2 versus Wayfinder V2 match replay](match.gif)
 
 Each team has 10–14 SCOUT vehicles, 4–8 TRANSPORT vehicles, and 2–4 TANK vehicles. A vehicle scores by reaching the opposite goal. All vehicle contacts—including friendly contacts—destroy both participants within 0.75 m. Tanks fire visible, non-piercing 20 m/s projectiles that obstacles or either team's vehicles can intercept. The higher score after 90 simulation seconds wins.
 
