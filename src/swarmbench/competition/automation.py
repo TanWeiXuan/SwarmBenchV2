@@ -161,7 +161,13 @@ def create_discussion(data: dict[str, Any], repository: str) -> dict[str, str]:
     owner, name = repository.split("/", 1)
     repository_id, category_id = _discussion_category(owner, name)
     kind = "Ranking" if data["mode"] == "official" else "Exhibition"
-    title = f"{kind} Tournament #{data['tournament_id']} — {datetime.now(UTC).date().isoformat()}"
+    title_prefix = f"{kind} Tournament #{data['tournament_id']} —"
+    title = f"{title_prefix} {datetime.now(UTC).date().isoformat()}"
+    query = "query($owner:String!,$name:String!,$categoryId:ID!){repository(owner:$owner,name:$name){discussions(first:100,categoryId:$categoryId,orderBy:{field:CREATED_AT,direction:DESC}){nodes{id url title}}}}"
+    existing = _gh_graphql(query, owner=owner, name=name, categoryId=category_id)["data"]["repository"]["discussions"]["nodes"]
+    match = next((item for item in existing if str(item["title"]).startswith(title_prefix)), None)
+    if match is not None:
+        return {"id": match["id"], "url": match["url"], "title": match["title"]}
     mutation = "mutation($repositoryId:ID!,$categoryId:ID!,$title:String!,$body:String!){createDiscussion(input:{repositoryId:$repositoryId,categoryId:$categoryId,title:$title,body:$body}){discussion{id url}}}"
     result = _gh_graphql(
         mutation,
