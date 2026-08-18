@@ -31,6 +31,44 @@ def test_graphql_failure_includes_cli_error(monkeypatch: pytest.MonkeyPatch) -> 
         automation._gh_graphql("query { viewer { login } }")
 
 
+def test_create_discussion_reuses_the_latest_matching_tournament(monkeypatch: pytest.MonkeyPatch) -> None:
+    data = prepare_plan(records(), seed=42, mode="official", size="small", run_id="123", repository="owner/repo")
+    monkeypatch.setattr(automation, "_discussion_category", lambda *_args: ("R1", "C1"))
+
+    def graphql(query: str, **_fields: str):
+        assert "createDiscussion" not in query
+        return {
+            "data": {
+                "repository": {
+                    "discussions": {
+                        "nodes": [
+                            {
+                                "id": "D2",
+                                "url": "https://example.test/discussions/2",
+                                "title": "Ranking Tournament #123 — 2026-08-19",
+                            },
+                            {
+                                "id": "D1",
+                                "url": "https://example.test/discussions/1",
+                                "title": "Ranking Tournament #123 — 2026-08-18",
+                            },
+                        ]
+                    }
+                }
+            }
+        }
+
+    monkeypatch.setattr(automation, "_gh_graphql", graphql)
+
+    discussion = automation.create_discussion(data, "owner/repo")
+
+    assert discussion == {
+        "id": "D2",
+        "url": "https://example.test/discussions/2",
+        "title": "Ranking Tournament #123 — 2026-08-19",
+    }
+
+
 def test_failed_stage_only_reports_tournament_work() -> None:
     jobs = [
         {"name": "Maintain live tournament Discussion", "conclusion": "failure"},
