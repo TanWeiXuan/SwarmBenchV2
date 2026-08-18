@@ -1,0 +1,103 @@
+{
+  "controllers": [
+    {
+      "author": "SwarmBench",
+      "built_in": true,
+      "controller_id": "assignment",
+      "deviation": 350.0,
+      "display_name": "Assignment",
+      "draws": 0,
+      "games": 0,
+      "losses": 0,
+      "rating": 1500.0,
+      "version_sha": "",
+      "volatility": 0.06,
+      "wins": 0
+    },
+    {
+      "author": "SwarmBench",
+      "built_in": true,
+      "controller_id": "convoy",
+      "deviation": 350.0,
+      "display_name": "Convoy",
+      "draws": 0,
+      "games": 0,
+      "losses": 0,
+      "rating": 1500.0,
+      "version_sha": "",
+      "volatility": 0.06,
+      "wins": 0
+    },
+    {
+      "author": "SwarmBench",
+      "built_in": true,
+      "controller_id": "defend",
+      "deviation": 350.0,
+      "display_name": "Defend",
+      "draws": 0,
+      "games": 0,
+      "losses": 0,
+      "rating": 1500.0,
+      "version_sha": "",
+      "volatility": 0.06,
+      "wins": 0
+    },
+    {
+      "author": "SwarmBench",
+      "built_in": true,
+      "controller_id": "greedy_value",
+      "deviation": 350.0,
+      "display_name": "Greedy Value",
+      "draws": 0,
+      "games": 0,
+      "losses": 0,
+      "rating": 1500.0,
+      "version_sha": "",
+      "volatility": 0.06,
+      "wins": 0
+    },
+    {
+      "author": "SwarmBench",
+      "built_in": true,
+      "controller_id": "marksman",
+      "deviation": 350.0,
+      "display_name": "Marksman",
+      "draws": 0,
+      "games": 0,
+      "losses": 0,
+      "rating": 1500.0,
+      "version_sha": "",
+      "volatility": 0.06,
+      "wins": 0
+    },
+    {
+      "author": "SwarmBench",
+      "built_in": true,
+      "controller_id": "potential_field",
+      "deviation": 350.0,
+      "display_name": "Potential Field",
+      "draws": 0,
+      "games": 0,
+      "losses": 0,
+      "rating": 1500.0,
+      "version_sha": "",
+      "volatility": 0.06,
+      "wins": 0
+    },
+    {
+      "author": "SwarmBench",
+      "built_in": true,
+      "controller_id": "rush",
+      "deviation": 350.0,
+      "display_name": "Rush",
+      "draws": 0,
+      "games": 0,
+      "losses": 0,
+      "rating": 1500.0,
+      "version_sha": "",
+      "volatility": 0.06,
+      "wins": 0
+    }
+  ],
+  "schema_version": 1
+}

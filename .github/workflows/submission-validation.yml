@@ -1,0 +1,151 @@
+name: Submission Validation
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: submission-validation-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  structure:
+    name: Submission structure
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      path: ${{ steps.path.outputs.path }}
+      is_submission: ${{ steps.path.outputs.is_submission }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -e ".[competition]"
+      - name: Validate changed files
+        env:
+          PR_AUTHOR: ${{ github.event.pull_request.user.login || 'github-actions[bot]' }}
+          BASE_REF: ${{ github.event.pull_request.base.sha || 'origin/main' }}
+        run: python -m swarmbench.competition.submission structure --base-ref "$BASE_REF" --author "$PR_AUTHOR" --output structure.json
+      - id: path
+        run: python -c "import json,os; p=json.load(open('structure.json', encoding='utf-8'))['submission_path']; out=open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8'); out.write('path='+(p or '')+'\n'); out.write('is_submission='+str(p is not None).lower()+'\n'); out.close()"
+
+  source:
+    name: Controller import and API
+    needs: structure
+    if: ${{ needs.structure.outputs.is_submission == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -e ".[competition]"
+      - env:
+          SUBMISSION_PATH: ${{ needs.structure.outputs.path }}
+        run: python -m swarmbench.competition.submission source "$SUBMISSION_PATH"
+
+  smoke:
+    name: Empty-arena smoke and timing
+    needs: [structure, source]
+    if: ${{ needs.structure.outputs.is_submission == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -e ".[competition]"
+      - run: docker build --tag swarmbench-controller --file Dockerfile.controller .
+      - env:
+          SUBMISSION_PATH: ${{ needs.structure.outputs.path }}
+          SWARMBENCH_BACKEND: docker
+        run: python -m swarmbench.competition.submission smoke "$SUBMISSION_PATH" --output smoke-result.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: smoke-result
+          path: smoke-result.json
+          retention-days: 14
+
+  calibration:
+    name: Calibration seed ${{ matrix.seed_index }}
+    needs: [structure, smoke]
+    if: ${{ needs.structure.outputs.is_submission == 'true' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        seed_index: [0, 1, 2, 3]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -e ".[competition]"
+      - run: docker build --tag swarmbench-controller --file Dockerfile.controller .
+      - env:
+          SUBMISSION_PATH: ${{ needs.structure.outputs.path }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          SEED_INDEX: ${{ matrix.seed_index }}
+          SWARMBENCH_BACKEND: docker
+        run: python -m swarmbench.competition.submission calibrate "$SUBMISSION_PATH" --submission-id "$SUBMISSION_PATH" --head-sha "$HEAD_SHA" --seed-index "$SEED_INDEX" --output "calibration-seed-$SEED_INDEX.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: calibration-seed-${{ matrix.seed_index }}
+          path: calibration-seed-${{ matrix.seed_index }}.json
+          retention-days: 14
+
+  submission-gate:
+    name: Submission Gate
+    needs: [structure, source, smoke, calibration]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Enforce required validation outcomes
+        env:
+          IS_SUBMISSION: ${{ needs.structure.outputs.is_submission }}
+          STRUCTURE_RESULT: ${{ needs.structure.result }}
+          SOURCE_RESULT: ${{ needs.source.result }}
+          SMOKE_RESULT: ${{ needs.smoke.result }}
+          CALIBRATION_RESULT: ${{ needs.calibration.result }}
+        run: python -c "import os,sys; required=[os.environ['STRUCTURE_RESULT']]; required += [os.environ['SOURCE_RESULT'],os.environ['SMOKE_RESULT'],os.environ['CALIBRATION_RESULT']] if os.environ['IS_SUBMISSION']=='true' else []; sys.exit(0 if all(value=='success' for value in required) else 1)"
+      - uses: actions/checkout@v4
+        if: ${{ needs.structure.outputs.is_submission == 'true' }}
+      - uses: actions/setup-python@v5
+        if: ${{ needs.structure.outputs.is_submission == 'true' }}
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -e ".[competition]"
+        if: ${{ needs.structure.outputs.is_submission == 'true' }}
+      - uses: actions/download-artifact@v4
+        if: ${{ needs.structure.outputs.is_submission == 'true' }}
+        with:
+          pattern: calibration-seed-*
+          path: calibration-parts
+          merge-multiple: true
+      - env:
+          SUBMISSION_PATH: ${{ needs.structure.outputs.path }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: python -m swarmbench.competition.submission aggregate calibration-parts --submission-id "$SUBMISSION_PATH" --submission-path "$SUBMISSION_PATH" --head-sha "$HEAD_SHA" --output calibration-result.json
+        if: ${{ needs.structure.outputs.is_submission == 'true' }}
+      - uses: actions/upload-artifact@v4
+        if: ${{ needs.structure.outputs.is_submission == 'true' }}
+        with:
+          name: calibration-result
+          path: calibration-result.json
+          retention-days: 30
