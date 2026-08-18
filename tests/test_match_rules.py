@@ -99,9 +99,22 @@ def test_projectile_friendly_fire_is_continuous_and_non_piercing() -> None:
     assert simulator.projectile_snapshots() == ()
 
 
+def test_projectile_uses_point_seven_five_metre_contact_radius() -> None:
+    tank = moving(0, Team.A, (10.0, 10.0), (0.0, 0.0), DroneType.TANK)
+    target = moving(20, Team.B, (10.5, 10.7), (0.0, 0.0))
+    simulator = Simulator(scenario_with(tank, target))
+    simulator.time = 5.0
+    simulator.fire(Team.A, {0: (1.0, 0.0)})
+
+    events = simulator.step()
+
+    assert next(event for event in events if event.event_type is EventType.PROJECTILE_HIT).drone_ids == (20,)
+    assert simulator.drones[20].snapshot.status is DroneStatus.ELIMINATED
+
+
 def test_obstacle_blocks_projectile_before_vehicle() -> None:
     tank = moving(0, Team.A, (10.0, 10.0), (0.0, 0.0), DroneType.TANK)
-    target = moving(20, Team.B, (11.0, 10.0), (0.0, 0.0))
+    target = moving(20, Team.B, (12.0, 10.0), (0.0, 0.0))
     wall = RectangleObstacle(10.4, 10.6, 9.0, 11.0)
     simulator = Simulator(scenario_with(tank, target, obstacles=(wall,)))
     simulator.time = 5.0
