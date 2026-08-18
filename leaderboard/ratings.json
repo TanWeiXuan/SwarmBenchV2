@@ -15,6 +15,20 @@
       "wins": 0
     },
     {
+      "author": "TanWeiXuan",
+      "built_in": false,
+      "controller_id": "TanWeiXuan/phalanx_v2",
+      "deviation": 68.06819671740557,
+      "display_name": "Phalanx V2",
+      "draws": 0,
+      "games": 0,
+      "losses": 0,
+      "rating": 1437.5426735032465,
+      "version_sha": "139bf57b82e2811d11dc77f57013f48dca84ace3",
+      "volatility": 0.05999690883471203,
+      "wins": 0
+    },
+    {
       "author": "SwarmBench",
       "built_in": true,
       "controller_id": "assignment",
