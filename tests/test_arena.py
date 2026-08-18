@@ -1,6 +1,6 @@
 from math import hypot
 
-from swarmbench.api import DRONE_COUNT_RANGES, DRONE_RADIUS, DRONE_SPECS, DroneType, GoalZone, Team
+from swarmbench.api import DYNAMICS_VARIATION, DRONE_COUNT_RANGES, DRONE_RADIUS, DRONE_SPECS, DroneType, GoalZone, Team
 from swarmbench.engine.arena import (
     SPAWN_MIN_SPACING,
     generate_scenario,
@@ -42,9 +42,9 @@ def test_generated_scenario_has_valid_goals_spawns_and_obstacles() -> None:
     )
     for kind, spec in scenario.drone_specs:
         nominal = DRONE_SPECS[kind]
-        assert nominal.max_speed * 0.9 <= spec.max_speed <= nominal.max_speed * 1.1
-        assert nominal.max_acceleration * 0.9 <= spec.max_acceleration <= nominal.max_acceleration * 1.1
-        assert nominal.max_jerk * 0.9 <= spec.max_jerk <= nominal.max_jerk * 1.1
+        assert nominal.max_speed * (1 - DYNAMICS_VARIATION) <= spec.max_speed <= nominal.max_speed * (1 + DYNAMICS_VARIATION)
+        assert nominal.max_acceleration * (1 - DYNAMICS_VARIATION) <= spec.max_acceleration <= nominal.max_acceleration * (1 + DYNAMICS_VARIATION)
+        assert nominal.max_jerk * (1 - DYNAMICS_VARIATION) <= spec.max_jerk <= nominal.max_jerk * (1 + DYNAMICS_VARIATION)
 
 
 def test_hundreds_of_seeded_arenas_are_valid_and_reachable() -> None:

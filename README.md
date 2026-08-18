@@ -12,7 +12,7 @@ Each team has 10–14 SCOUT vehicles, 4–8 TRANSPORT vehicles, and 2–4 TANK v
 | TRANSPORT | 4–8 | 2.5 m/s | 2.0 m/s² | 8.0 m/s³ | 5 |
 | TANK | 2–4 | 1.5 m/s | 1.2 m/s² | 4.8 m/s³ | 1 |
 
-Speed, acceleration, and jerk are sampled independently within ±10% of the nominal values once per game and shared by both sides. Counts, dynamics, goals, obstacles, and spawns are reproducible from the one game seed.
+Speed, acceleration, and jerk are sampled independently within ±20% of the nominal values once per game and shared by both sides. Counts, dynamics, goals, obstacles, and spawns are reproducible from the one game seed.
 
 ## Quick start
 
