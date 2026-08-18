@@ -1,6 +1,20 @@
 {
   "controllers": [
     {
+      "author": "TanWeiXuan",
+      "built_in": false,
+      "controller_id": "TanWeiXuan/aegis_apex_v2",
+      "deviation": 68.06819671347274,
+      "display_name": "Aegis Apex V2",
+      "draws": 0,
+      "games": 0,
+      "losses": 0,
+      "rating": 1508.922475212791,
+      "version_sha": "0f53d6dbf9549023c28481bb46199a64d671ad02",
+      "volatility": 0.059996805297160824,
+      "wins": 0
+    },
+    {
       "author": "SwarmBench",
       "built_in": true,
       "controller_id": "assignment",

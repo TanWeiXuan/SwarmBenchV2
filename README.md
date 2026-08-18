@@ -89,7 +89,7 @@ Only the latest rating state is committed; permanent tournament history lives in
 <!-- LEADERBOARD_START -->
 | Rank | Controller | Author | Rating | RD | W | D | L | Games |
 | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| — | No community controllers yet | — | — | — | — | — | — | — |
+| 1 | Aegis Apex V2 | TanWeiXuan | 1509 | 68 | 0 | 0 | 0 | 0 |
 <!-- LEADERBOARD_END -->
 
 ## Reproducibility and security
