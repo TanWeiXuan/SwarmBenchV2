@@ -54,7 +54,7 @@ DRONE_SPECS = {
     DroneType.TRANSPORT: DroneSpec(2.5, 2.0, 8.0, 5),
     DroneType.TANK: DroneSpec(1.5, 1.2, 4.8, 1),
 }
-DYNAMICS_VARIATION = 0.10
+DYNAMICS_VARIATION = 0.20
 DRONE_COUNT_RANGES = {
     DroneType.SCOUT: (10, 14),
     DroneType.TRANSPORT: (4, 8),

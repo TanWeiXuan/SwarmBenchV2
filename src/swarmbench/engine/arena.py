@@ -276,7 +276,7 @@ def validate_scenario(scenario: Scenario, *, check_traversability: bool = True) 
     for drone_type, spec in specs.items():
         nominal = DRONE_SPECS[drone_type]
         for sampled, base in ((spec.max_speed, nominal.max_speed), (spec.max_acceleration, nominal.max_acceleration), (spec.max_jerk, nominal.max_jerk)):
-            if not base * 0.9 <= sampled <= base * 1.1:
+            if not base * (1 - DYNAMICS_VARIATION) <= sampled <= base * (1 + DYNAMICS_VARIATION):
                 raise ValueError("sampled dynamics lie outside the documented range")
         if spec.point_value != nominal.point_value:
             raise ValueError("point value must not vary")

@@ -6,7 +6,7 @@ The v2 constants are `ENGINE_VERSION=2.0.0`, controller API 2, scenario generato
 
 The arena is 100 m × 60 m. Team A starts left and targets the right goal; Team B is its exact reflection across x=50. One seeded count is shared by both sides: 10–14 SCOUT, 4–8 TRANSPORT, and 2–4 TANK vehicles. SCOUT and TANK score 1 point; TRANSPORT scores 5. Every vehicle has physical radius 0.25 m and one hit point.
 
-Nominal SCOUT dynamics are 5 m/s speed, 4 m/s² acceleration, and 16 m/s³ jerk. TRANSPORT uses 2.5, 2, and 8; TANK uses 1.5, 1.2, and 4.8. Each value is sampled independently and uniformly within ±10% once per scenario and shared by both teams. Controllers receive the exact values before play.
+Nominal SCOUT dynamics are 5 m/s speed, 4 m/s² acceleration, and 16 m/s³ jerk. TRANSPORT uses 2.5, 2, and 8; TANK uses 1.5, 1.2, and 4.8. Each value is sampled independently and uniformly within ±20% once per scenario and shared by both teams. Controllers receive the exact values before play.
 
 Goals are 3 m deep and 14 m high. The generator creates 8–15 non-overlapping circle/axis-aligned-rectangle obstacles: mirrored pairs plus one self-mirrored centerline obstacle for odd totals. Goals, obstacles, spawn coordinates, class assignment, counts, and dynamics are x-mirrored. Candidate arenas retain protected spawn/goal strips and must pass the existing 0.5 m-grid reachability test after clearance inflation.
 
