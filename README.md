@@ -89,15 +89,15 @@ Only the latest rating state is committed; permanent tournament history lives in
 <!-- LEADERBOARD_START -->
 | Rank | Controller | Author | Rating | RD | W | D | L | Games |
 | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | Opus 5 V1 | renj1ete0 | 1940 | 32 | 63 | 1 | 0 | 64 |
-| 2 | Luna Xhigh Sipp Marksman V1 | TanWeiXuan | 1811 | 30 | 44 | 12 | 8 | 64 |
-| 3 | Luna Xhigh Mpc | TanWeiXuan | 1665 | 29 | 32 | 27 | 5 | 64 |
-| 4 | Wayfinder V2 | TanWeiXuan | 1633 | 21 | 204 | 165 | 95 | 464 |
-| 5 | Bigpickle V1 | TanWeiXuan | 1589 | 21 | 164 | 128 | 100 | 392 |
-| 6 | Aegis Apex V2 | TanWeiXuan | 1581 | 21 | 173 | 201 | 114 | 488 |
-| 7 | Sonnet 5 V1 | TanWeiXuan | 1534 | 21 | 167 | 141 | 124 | 432 |
-| 8 | Sonnet 5 V2 | renj1ete0 | 1483 | 30 | 20 | 23 | 21 | 64 |
-| 9 | Phalanx V2 | TanWeiXuan | 1457 | 21 | 125 | 217 | 162 | 504 |
+| 1 | Opus 5 V1 | renj1ete0 | 1981 | 30 | 127 | 1 | 0 | 128 |
+| 2 | Luna Xhigh Sipp Marksman V1 | TanWeiXuan | 1825 | 27 | 93 | 17 | 18 | 128 |
+| 3 | Luna Xhigh Mpc | TanWeiXuan | 1662 | 26 | 59 | 49 | 20 | 128 |
+| 4 | Wayfinder V2 | TanWeiXuan | 1620 | 21 | 221 | 192 | 123 | 536 |
+| 5 | Aegis Apex V2 | TanWeiXuan | 1590 | 21 | 194 | 226 | 140 | 560 |
+| 6 | Bigpickle V1 | TanWeiXuan | 1583 | 21 | 186 | 155 | 115 | 456 |
+| 7 | Sonnet 5 V1 | TanWeiXuan | 1517 | 20 | 178 | 169 | 157 | 504 |
+| 8 | Phalanx V2 | TanWeiXuan | 1465 | 21 | 146 | 250 | 180 | 576 |
+| 9 | Sonnet 5 V2 | renj1ete0 | 1463 | 27 | 34 | 49 | 45 | 128 |
 <!-- LEADERBOARD_END -->
 
 ## Reproducibility and security
