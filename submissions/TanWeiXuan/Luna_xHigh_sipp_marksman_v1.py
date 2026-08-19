@@ -47,14 +47,16 @@ TRACKING_RESERVATION_RADIUS = VEHICLE_COLLISION_RADIUS + TRACKING_RESERVATION_MA
 PATH_CLEARANCE = 0.35
 ROADMAP_MARGIN = 0.18
 PLANNING_HORIZON = 12.0
-REPLAN_PERIOD = 0.7
+REPLAN_PERIOD = 0.90
 EDGE_SPEED_FACTOR = 0.80
 EDGE_TRACKING_SLACK = 0.35
 DEPARTURE_GRANULARITY = 0.10
-RESERVATION_SAMPLE_PERIOD = 0.30
+RESERVATION_SAMPLE_PERIOD = 0.60
 RECEDING_GOAL_FRACTION = 0.55
-PREDICTION_HORIZON = 6.0
+PREDICTION_HORIZON = 4.5
 EMERGENCY_GUARD_HORIZON = 4.5
+ENDPOINT_CONNECTION_LIMIT = 12
+CIRCLE_ROADMAP_SAMPLES = 6
 
 
 def _distance(left: Vec2, right: Vec2) -> float:
@@ -87,7 +89,26 @@ def _segment_clear(
     obstacles: tuple[CircleObstacle | RectangleObstacle, ...],
 ) -> bool:
     padding = 0.25 + PATH_CLEARANCE
-    return all(swept_obstacle_contact(left, right, obstacle, padding) is None for obstacle in obstacles)
+    segment_bounds = _segment_bounds(left, right, padding)
+    for obstacle in obstacles:
+        if isinstance(obstacle, CircleObstacle):
+            radius = obstacle.radius + padding
+            obstacle_bounds = (
+                obstacle.center[0] - radius,
+                obstacle.center[0] + radius,
+                obstacle.center[1] - radius,
+                obstacle.center[1] + radius,
+            )
+        else:
+            obstacle_bounds = (
+                obstacle.x_min - padding,
+                obstacle.x_max + padding,
+                obstacle.y_min - padding,
+                obstacle.y_max + padding,
+            )
+        if _bounds_overlap(segment_bounds, obstacle_bounds) and swept_obstacle_contact(left, right, obstacle, padding) is not None:
+            return False
+    return True
 
 
 class ReservationSegment(NamedTuple):
@@ -321,8 +342,8 @@ class SpatialGraph:
         for obstacle in obstacles:
             if isinstance(obstacle, CircleObstacle):
                 radius = obstacle.radius + clearance
-                for index in range(12):
-                    angle = 2.0 * pi * index / 12.0
+                for index in range(CIRCLE_ROADMAP_SAMPLES):
+                    angle = 2.0 * pi * index / CIRCLE_ROADMAP_SAMPLES
                     points.append((obstacle.center[0] + radius * cos(angle), obstacle.center[1] + radius * sin(angle)))
             else:
                 points.extend(
@@ -350,7 +371,15 @@ class SpatialGraph:
         points = list(self.points) + [start, goal]
         adjacency = [list(neighbors) for neighbors in self.adjacency] + [[], []]
         start_index, goal_index = len(points) - 2, len(points) - 1
-        for index, point in enumerate(points[:-2]):
+        candidates = sorted(
+            range(len(self.points)),
+            key=lambda index: (
+                min(_distance(start, self.points[index]), _distance(goal, self.points[index])),
+                index,
+            ),
+        )[:ENDPOINT_CONNECTION_LIMIT]
+        for index in candidates:
+            point = points[index]
             if _segment_clear(start, point, obstacles):
                 adjacency[start_index].append(index)
                 adjacency[index].append(start_index)
@@ -629,7 +658,7 @@ class ConservativeFireControl:
     URGENT_HARD_THRESHOLD = 0.60
     MAX_TARGETS_TO_EVALUATE = 2
     MAX_FLIGHT_TIME = 6.0
-    AIM_OFFSETS_DEGREES = (0.0, 0.40, -0.40, 1.0, -1.0)
+    AIM_OFFSETS_DEGREES = (0.0, 0.75, -0.75)
     HARD_MODES = frozenset({"brake", "left", "right", "forward_left", "forward_right", "brake_left", "brake_right"})
 
     def __init__(
