@@ -31,6 +31,20 @@
     {
       "author": "TanWeiXuan",
       "built_in": false,
+      "controller_id": "TanWeiXuan/Luna_xHigh_opus_breaker",
+      "deviation": 34.544775668864446,
+      "display_name": "Luna Xhigh Opus Breaker",
+      "draws": 0,
+      "games": 0,
+      "losses": 0,
+      "rating": 1899.592750149668,
+      "version_sha": "2a9b184c824fabd2da9a98f058db526bb5838e90",
+      "volatility": 0.06000103689153003,
+      "wins": 0
+    },
+    {
+      "author": "TanWeiXuan",
+      "built_in": false,
       "controller_id": "TanWeiXuan/Luna_xHigh_sipp_marksman_v1",
       "deviation": 34.51842400670253,
       "display_name": "Luna Xhigh Sipp Marksman V1",
