@@ -4,7 +4,7 @@ SwarmBench is a deterministic, open-source benchmark and Kaggle-style competitio
 
 ![Aegis Apex V2 versus Wayfinder V2 match replay](match.gif)
 
-Each team has 10–14 SCOUT vehicles, 4–8 TRANSPORT vehicles, and 2–4 TANK vehicles. A vehicle scores by reaching the opposite goal. All vehicle contacts—including friendly contacts—destroy both participants within 0.75 m. Tanks fire visible, non-piercing 20 m/s projectiles that obstacles or either team's vehicles can intercept. The higher score after 90 simulation seconds wins.
+Each team has 10–14 SCOUT vehicles, 4–8 TRANSPORT vehicles, and 2–4 TANK vehicles. A vehicle scores by reaching the opposite goal. All vehicle contacts—including friendly contacts—destroy both participants within 0.75 m. Tanks fire visible, non-piercing 20 m/s projectiles that obstacles or either team's vehicles can intercept. Each Tank carries five shots, cannot fire during the first five seconds, and can fire at most once every four seconds thereafter. The higher score after 90 simulation seconds wins.
 
 | Type | Count | Nominal speed | Nominal acceleration | Nominal jerk | Value |
 | --- | ---: | ---: | ---: | ---: | ---: |
