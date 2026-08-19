@@ -17,6 +17,20 @@
     {
       "author": "TanWeiXuan",
       "built_in": false,
+      "controller_id": "TanWeiXuan/Luna_xHigh_mpc",
+      "deviation": 35.75275669762936,
+      "display_name": "Luna Xhigh Mpc",
+      "draws": 0,
+      "games": 0,
+      "losses": 0,
+      "rating": 1631.801536399361,
+      "version_sha": "6628acbde6dbf60ce0f43c44347dcf2796f60fb4",
+      "volatility": 0.059997182921360415,
+      "wins": 0
+    },
+    {
+      "author": "TanWeiXuan",
+      "built_in": false,
       "controller_id": "TanWeiXuan/aegis_apex_v2",
       "deviation": 21.139483058334015,
       "display_name": "Aegis Apex V2",

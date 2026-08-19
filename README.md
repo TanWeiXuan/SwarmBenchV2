@@ -89,12 +89,13 @@ Only the latest rating state is committed; permanent tournament history lives in
 <!-- LEADERBOARD_START -->
 | Rank | Controller | Author | Rating | RD | W | D | L | Games |
 | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | Wayfinder V2 | TanWeiXuan | 1652 | 22 | 158 | 118 | 52 | 328 |
-| 2 | Bigpickle V1 | TanWeiXuan | 1611 | 23 | 116 | 91 | 57 | 264 |
-| 3 | Aegis Apex V2 | TanWeiXuan | 1587 | 22 | 127 | 151 | 74 | 352 |
-| 4 | Sonnet 5 V1 | TanWeiXuan | 1520 | 22 | 110 | 87 | 83 | 280 |
-| 5 | Sonnet 5 V2 | renj1ete0 | 1489 | 37 | 0 | 0 | 0 | 0 |
-| 6 | Phalanx V2 | TanWeiXuan | 1461 | 22 | 90 | 157 | 113 | 360 |
+| 1 | Wayfinder V2 | TanWeiXuan | 1635 | 22 | 182 | 139 | 71 | 392 |
+| 2 | Luna Xhigh Mpc | TanWeiXuan | 1632 | 36 | 0 | 0 | 0 | 0 |
+| 3 | Bigpickle V1 | TanWeiXuan | 1610 | 22 | 144 | 111 | 73 | 328 |
+| 4 | Aegis Apex V2 | TanWeiXuan | 1589 | 21 | 159 | 172 | 93 | 424 |
+| 5 | Sonnet 5 V1 | TanWeiXuan | 1524 | 21 | 140 | 115 | 105 | 360 |
+| 6 | Sonnet 5 V2 | renj1ete0 | 1489 | 37 | 0 | 0 | 0 | 0 |
+| 7 | Phalanx V2 | TanWeiXuan | 1459 | 21 | 107 | 189 | 136 | 432 |
 <!-- LEADERBOARD_END -->
 
 ## Reproducibility and security
