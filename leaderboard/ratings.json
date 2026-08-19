@@ -3,6 +3,20 @@
     {
       "author": "TanWeiXuan",
       "built_in": false,
+      "controller_id": "TanWeiXuan/BigPickle_V1",
+      "deviation": 41.34174819586517,
+      "display_name": "Bigpickle V1",
+      "draws": 0,
+      "games": 0,
+      "losses": 0,
+      "rating": 1594.9192794145351,
+      "version_sha": "8f7cb044af06b15982c39771ef513dc0ed4c997b",
+      "volatility": 0.059996968026688975,
+      "wins": 0
+    },
+    {
+      "author": "TanWeiXuan",
+      "built_in": false,
       "controller_id": "TanWeiXuan/aegis_apex_v2",
       "deviation": 39.42956280384178,
       "display_name": "Aegis Apex V2",
