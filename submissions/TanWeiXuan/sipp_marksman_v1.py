@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from heapq import heappop, heappush
-from math import acos, cos, hypot, isfinite, pi, sin, sqrt
+from math import atan2, cos, hypot, isfinite, pi, sin, sqrt
 from typing import Iterable, Sequence
 
 from swarmbench import (
@@ -26,6 +26,7 @@ from swarmbench import (
     Team,
 )
 from swarmbench.api import Vec2
+from swarmbench.api import CONTROLLER_PERIOD, PHYSICS_DT, PROJECTILE_CONTACT_RADIUS, TANK_WEAPON_SPEC, WeaponSpec
 from swarmbench.engine.collisions import (
     swept_arena_exit,
     swept_obstacle_contact,
@@ -499,6 +500,453 @@ def _static_route(graph: SpatialGraph, obstacles: tuple[CircleObstacle | Rectang
     return tuple(route)
 
 
+@dataclass(frozen=True, slots=True)
+class ShotEvaluation:
+    target_id: int
+    aim_direction: Vec2
+    hit_fraction: float
+    hard_evasion_hit_fraction: float
+    mean_margin: float
+    target_hit_time: float | None
+    friendly_first_fraction: float
+    terrain_first_fraction: float
+
+
+@dataclass(frozen=True, slots=True)
+class _ShotOutcome:
+    first_kind: str | None
+    first_id: int | None
+    hit_time: float | None
+    margin: float
+
+
+def _unit(vector: Vec2) -> Vec2:
+    length = hypot(vector[0], vector[1])
+    if length <= EPS:
+        return (0.0, 0.0)
+    return (vector[0] / length, vector[1] / length)
+
+
+def _add(left: Vec2, right: Vec2) -> Vec2:
+    return (left[0] + right[0], left[1] + right[1])
+
+
+def _scale(vector: Vec2, factor: float) -> Vec2:
+    return (vector[0] * factor, vector[1] * factor)
+
+
+def _minimum_relative_distance(left_start: Vec2, left_end: Vec2, right_start: Vec2, right_end: Vec2) -> float:
+    relative_start = (left_start[0] - right_start[0], left_start[1] - right_start[1])
+    relative_velocity = (
+        (left_end[0] - left_start[0]) - (right_end[0] - right_start[0]),
+        (left_end[1] - left_start[1]) - (right_end[1] - right_start[1]),
+    )
+    speed_squared = relative_velocity[0] ** 2 + relative_velocity[1] ** 2
+    if speed_squared <= EPS:
+        return hypot(*relative_start)
+    closest = max(
+        0.0,
+        min(
+            1.0,
+            -(
+                relative_start[0] * relative_velocity[0]
+                + relative_start[1] * relative_velocity[1]
+            )
+            / speed_squared,
+        ),
+    )
+    return hypot(
+        relative_start[0] + relative_velocity[0] * closest,
+        relative_start[1] + relative_velocity[1] * closest,
+    )
+
+
+class ConservativeFireControl:
+    """Deterministic limited-ammunition fire control with hard safety gates."""
+
+    NORMAL_HIT_THRESHOLD = 0.90
+    NORMAL_HARD_THRESHOLD = 0.75
+    URGENT_HIT_THRESHOLD = 0.84
+    URGENT_HARD_THRESHOLD = 0.60
+    MAX_TARGETS_TO_EVALUATE = 6
+    MAX_FLIGHT_TIME = 6.0
+    AIM_OFFSETS_DEGREES = (0.0, 0.20, -0.20, 0.40, -0.40, 0.70, -0.70, 1.0, -1.0, 1.5, -1.5)
+    HARD_MODES = frozenset({"brake", "dodge_left", "dodge_right", "switch_left_right", "switch_right_left"})
+
+    def __init__(
+        self,
+        team: Team,
+        width: float,
+        height: float,
+        obstacles: tuple[CircleObstacle | RectangleObstacle, ...],
+        specs: dict[DroneType, DroneSpec],
+        weapon: WeaponSpec,
+        own_goal,
+    ) -> None:
+        self.team = team
+        self.width = width
+        self.height = height
+        self.obstacles = obstacles
+        self.specs = specs
+        self.weapon = weapon
+        self.own_goal = own_goal
+        self.histories: dict[int, list[tuple[float, Vec2, Vec2, Vec2]]] = {}
+        self.last_evaluations: tuple[ShotEvaluation, ...] = ()
+
+    def observe(self, state: GameState) -> None:
+        cutoff = state.time - 1.0
+        active_ids = set()
+        for enemy in state.opponent_drones:
+            if enemy.status is not DroneStatus.ACTIVE:
+                continue
+            active_ids.add(enemy.id)
+            history = self.histories.setdefault(enemy.id, [])
+            history.append((state.time, enemy.position, enemy.velocity, enemy.acceleration))
+            self.histories[enemy.id] = [sample for sample in history if sample[0] >= cutoff]
+        for enemy_id in tuple(self.histories):
+            if enemy_id not in active_ids and self.histories[enemy_id][-1][0] < cutoff:
+                del self.histories[enemy_id]
+
+    @staticmethod
+    def _lead_point(shooter: DroneSnapshot, target: DroneSnapshot, projectile_speed: float) -> Vec2 | None:
+        rx = target.position[0] - shooter.position[0]
+        ry = target.position[1] - shooter.position[1]
+        vx, vy = target.velocity
+        a = vx * vx + vy * vy - projectile_speed * projectile_speed
+        b = 2.0 * (rx * vx + ry * vy)
+        c = rx * rx + ry * ry
+        roots: list[float] = []
+        if abs(a) <= EPS:
+            if abs(b) > EPS:
+                roots.append(-c / b)
+        else:
+            discriminant = b * b - 4.0 * a * c
+            if discriminant >= -EPS:
+                root = sqrt(max(0.0, discriminant))
+                roots.extend(((-b - root) / (2.0 * a), (-b + root) / (2.0 * a)))
+        positive = [value for value in roots if value > EPS and isfinite(value)]
+        if not positive:
+            return None
+        time = min(positive)
+        point = (target.position[0] + target.velocity[0] * time, target.position[1] + target.velocity[1] * time)
+        return point if all(isfinite(value) for value in point) else None
+
+    def _maneuver_command(
+        self,
+        target: DroneSnapshot,
+        dynamic: DynamicState,
+        mode: str,
+        elapsed: float,
+        aim_direction: Vec2,
+        shooter_position: Vec2,
+        switch_time: float,
+    ) -> Vec2:
+        spec = self.specs[target.drone_type]
+        if elapsed < CONTROLLER_PERIOD - EPS:
+            return clip_vector(target.acceleration, spec.max_acceleration)
+        if mode == "switch_left_right":
+            mode = "left" if elapsed < switch_time else "right"
+        elif mode == "switch_right_left":
+            mode = "right" if elapsed < switch_time else "left"
+        elif mode == "switch_brake_left":
+            mode = "brake" if elapsed < switch_time else "left"
+        elif mode == "switch_brake_right":
+            mode = "brake" if elapsed < switch_time else "right"
+
+        velocity_direction = _unit(dynamic.velocity)
+        if velocity_direction == (0.0, 0.0):
+            velocity_direction = aim_direction
+        forward = velocity_direction
+        brake = (-forward[0], -forward[1])
+        left = (-aim_direction[1], aim_direction[0])
+        cross = aim_direction[0] * (dynamic.position[1] - shooter_position[1]) - aim_direction[1] * (dynamic.position[0] - shooter_position[0])
+        away = (-left[0], -left[1]) if cross > 0.0 else left
+        vectors = {
+            "continue": dynamic.acceleration,
+            "zero": (0.0, 0.0),
+            "brake": _scale(brake, spec.max_acceleration),
+            "forward": _scale(forward, spec.max_acceleration),
+            "left": _scale(left, spec.max_acceleration),
+            "right": _scale((-left[0], -left[1]), spec.max_acceleration),
+            "half_left": _scale(left, spec.max_acceleration * 0.5),
+            "half_right": _scale((-left[0], -left[1]), spec.max_acceleration * 0.5),
+            "forward_left": _scale(_unit(_add(forward, left)), spec.max_acceleration),
+            "forward_right": _scale(_unit(_add(forward, (-left[0], -left[1]))), spec.max_acceleration),
+            "brake_left": _scale(_unit(_add(brake, left)), spec.max_acceleration),
+            "brake_right": _scale(_unit(_add(brake, (-left[0], -left[1]))), spec.max_acceleration),
+            "dodge_left": _scale(away, spec.max_acceleration),
+            "dodge_right": _scale((-away[0], -away[1]), spec.max_acceleration),
+        }
+        return clip_vector(vectors.get(mode, (0.0, 0.0)), spec.max_acceleration)
+
+    def _target_trajectory(
+        self,
+        shooter: DroneSnapshot,
+        target: DroneSnapshot,
+        aim_direction: Vec2,
+        mode: str,
+        flight_time: float,
+    ) -> tuple[Vec2, ...]:
+        dynamic = DynamicState(target.position, target.velocity, target.acceleration)
+        samples = [dynamic.position]
+        switch_time = max(0.5, min(1.5, flight_time * 0.45))
+        for index in range(round(flight_time / PHYSICS_DT)):
+            elapsed = index * PHYSICS_DT
+            command = self._maneuver_command(
+                target,
+                dynamic,
+                mode,
+                elapsed,
+                aim_direction,
+                shooter.position,
+                switch_time,
+            )
+            dynamic = advance_dynamics(dynamic, command, self.specs[target.drone_type], PHYSICS_DT)
+            samples.append(dynamic.position)
+        return tuple(samples)
+
+    @staticmethod
+    def _prediction_position(prediction: Sequence[tuple[float, float, float]], timestamp: float) -> Vec2:
+        if not prediction:
+            return (0.0, 0.0)
+        if timestamp <= prediction[0][0]:
+            return (prediction[0][1], prediction[0][2])
+        for left, right in zip(prediction, prediction[1:]):
+            if timestamp <= right[0] + EPS:
+                fraction = (timestamp - left[0]) / max(EPS, right[0] - left[0])
+                return _lerp((left[1], left[2]), (right[1], right[2]), fraction)
+        return (prediction[-1][1], prediction[-1][2])
+
+    def _other_vehicle_position(
+        self,
+        vehicle: DroneSnapshot,
+        elapsed: float,
+        state: GameState,
+        predictions: dict[int, tuple[tuple[float, float, float], ...]],
+    ) -> Vec2:
+        if vehicle.team is self.team and vehicle.id in predictions:
+            return self._prediction_position(predictions[vehicle.id], state.time + elapsed)
+        return (
+            vehicle.position[0] + vehicle.velocity[0] * elapsed,
+            vehicle.position[1] + vehicle.velocity[1] * elapsed,
+        )
+
+    def _first_hit(
+        self,
+        shooter: DroneSnapshot,
+        target: DroneSnapshot,
+        target_samples: Sequence[Vec2],
+        aim_direction: Vec2,
+        state: GameState,
+        predictions: dict[int, tuple[tuple[float, float, float], ...]],
+    ) -> _ShotOutcome:
+        steps = len(target_samples) - 1
+        projectile_position = shooter.position
+        projectile_velocity = _scale(aim_direction, self.weapon.projectile_speed)
+        closest_target_distance = float("inf")
+        first: tuple[float, int, int, str, int | None] | None = None
+        vehicles = tuple(state.own_drones) + tuple(state.opponent_drones)
+        for index in range(steps):
+            elapsed = index * PHYSICS_DT
+            next_elapsed = elapsed + PHYSICS_DT
+            next_projectile = (
+                projectile_position[0] + projectile_velocity[0] * PHYSICS_DT,
+                projectile_position[1] + projectile_velocity[1] * PHYSICS_DT,
+            )
+            target_start, target_end = target_samples[index], target_samples[index + 1]
+            closest_target_distance = min(
+                closest_target_distance,
+                _minimum_relative_distance(projectile_position, next_projectile, target_start, target_end),
+            )
+            candidates: list[tuple[float, int, int, str, int | None]] = []
+            for obstacle_index, obstacle in enumerate(self.obstacles):
+                contact = swept_obstacle_contact(projectile_position, next_projectile, obstacle, 0.0)
+                if contact is not None:
+                    candidates.append((elapsed + contact * PHYSICS_DT, 0, obstacle_index, "terrain", None))
+            target_contact = swept_points_contact(
+                projectile_position,
+                next_projectile,
+                target_start,
+                target_end,
+                PROJECTILE_CONTACT_RADIUS,
+            )
+            if target_contact is not None:
+                candidates.append((elapsed + target_contact * PHYSICS_DT, 2, target.id, "target", target.id))
+            for vehicle in vehicles:
+                if vehicle.id in {shooter.id, target.id} or vehicle.status is not DroneStatus.ACTIVE:
+                    continue
+                vehicle_start = self._other_vehicle_position(vehicle, elapsed, state, predictions)
+                vehicle_end = self._other_vehicle_position(vehicle, next_elapsed, state, predictions)
+                contact = swept_points_contact(
+                    projectile_position,
+                    next_projectile,
+                    vehicle_start,
+                    vehicle_end,
+                    PROJECTILE_CONTACT_RADIUS,
+                )
+                if contact is not None:
+                    candidates.append(
+                        (
+                            elapsed + contact * PHYSICS_DT,
+                            2,
+                            vehicle.id,
+                            "friendly" if vehicle.team is self.team else "enemy",
+                            vehicle.id,
+                        )
+                    )
+            exit_contact = swept_arena_exit(projectile_position, next_projectile, self.width, self.height)
+            if exit_contact is not None:
+                candidates.append((elapsed + exit_contact * PHYSICS_DT, 5, -1, "exit", None))
+            if candidates:
+                first = min(candidates)
+                break
+            projectile_position = next_projectile
+        if first is None:
+            return _ShotOutcome(None, None, None, self.weapon.projectile_speed * 0.0 + PROJECTILE_CONTACT_RADIUS - closest_target_distance)
+        return _ShotOutcome(first[3], first[4], state.time + first[0], PROJECTILE_CONTACT_RADIUS - closest_target_distance)
+
+    def evaluate_target(
+        self,
+        shooter: DroneSnapshot,
+        target: DroneSnapshot,
+        state: GameState,
+        predictions: dict[int, tuple[tuple[float, float, float], ...]],
+    ) -> ShotEvaluation | None:
+        lead = self._lead_point(shooter, target, self.weapon.projectile_speed)
+        if lead is None:
+            return None
+        base_direction = _unit((lead[0] - shooter.position[0], lead[1] - shooter.position[1]))
+        if base_direction == (0.0, 0.0):
+            return None
+        flight_time = min(
+            self.MAX_FLIGHT_TIME,
+            max(0.25, _distance(shooter.position, lead) / max(EPS, self.weapon.projectile_speed) + 1.0),
+        )
+        modes = (
+            "continue",
+            "zero",
+            "brake",
+            "forward",
+            "left",
+            "right",
+            "half_left",
+            "half_right",
+            "forward_left",
+            "forward_right",
+            "brake_left",
+            "brake_right",
+            "dodge_left",
+            "dodge_right",
+            "switch_left_right",
+            "switch_right_left",
+        )
+        best: ShotEvaluation | None = None
+        for offset_degrees in self.AIM_OFFSETS_DEGREES:
+            offset = offset_degrees * pi / 180.0
+            angle = atan2(base_direction[1], base_direction[0]) + offset
+            aim_direction = (cos(angle), sin(angle))
+            outcomes = []
+            for mode in modes:
+                target_samples = self._target_trajectory(shooter, target, aim_direction, mode, flight_time)
+                outcomes.append(self._first_hit(shooter, target, target_samples, aim_direction, state, predictions))
+            hits = [outcome for outcome in outcomes if outcome.first_kind == "target" and outcome.first_id == target.id]
+            hard_outcomes = [outcome for mode, outcome in zip(modes, outcomes) if mode in self.HARD_MODES]
+            hard_hits = [outcome for outcome in hard_outcomes if outcome.first_kind == "target" and outcome.first_id == target.id]
+            hit_fraction = len(hits) / len(outcomes)
+            hard_fraction = len(hard_hits) / len(hard_outcomes)
+            mean_margin = sum(outcome.margin for outcome in outcomes) / len(outcomes)
+            evaluation = ShotEvaluation(
+                target.id,
+                aim_direction,
+                hit_fraction,
+                hard_fraction,
+                mean_margin,
+                min((outcome.hit_time for outcome in hits if outcome.hit_time is not None), default=None),
+                sum(outcome.first_kind == "friendly" for outcome in outcomes) / len(outcomes),
+                sum(outcome.first_kind == "terrain" for outcome in outcomes) / len(outcomes),
+            )
+            if best is None or (
+                evaluation.hit_fraction,
+                evaluation.hard_evasion_hit_fraction,
+                evaluation.mean_margin,
+                -abs(offset_degrees),
+            ) > (
+                best.hit_fraction,
+                best.hard_evasion_hit_fraction,
+                best.mean_margin,
+                0.0,
+            ):
+                best = evaluation
+        return best
+
+    def _urgent(self, target: DroneSnapshot, state: GameState) -> bool:
+        distance_to_goal = _distance(target.position, self.own_goal.center)
+        speed = max(0.1, self.specs[target.drone_type].max_speed)
+        return target.drone_type is DroneType.TRANSPORT and distance_to_goal / speed < 8.0
+
+    def _utility(self, target: DroneSnapshot, evaluation: ShotEvaluation, tank: DroneSnapshot, state: GameState) -> float:
+        score_value = self.specs[target.drone_type].point_value
+        goal_progress = max(0.0, 1.0 - _distance(target.position, self.own_goal.center) / 70.0)
+        score_denial = score_value * (1.0 + 2.0 * goal_progress)
+        urgency = 3.0 if self._urgent(target, state) else 0.0
+        threat = 0.0
+        if target.drone_type is DroneType.TANK:
+            threat = 0.35 * float(target.shots_remaining or 0)
+            nearest_transport = min(
+                (
+                    _distance(target.position, friend.position)
+                    for friend in state.own_drones
+                    if friend.status is DroneStatus.ACTIVE and friend.drone_type is DroneType.TRANSPORT
+                ),
+                default=100.0,
+            )
+            threat += max(0.0, 2.0 - nearest_transport / 8.0)
+        finish = 1.0 if evaluation.target_hit_time is None else max(0.0, 1.0 - (evaluation.target_hit_time - state.time) / self.MAX_FLIGHT_TIME)
+        ammo_cost = 0.25 + (0.45 if (tank.shots_remaining or 0) <= 2 else 0.0)
+        return score_denial + urgency + threat + finish + 0.5 * evaluation.mean_margin - ammo_cost
+
+    def choose_fire(
+        self,
+        tank: DroneSnapshot,
+        state: GameState,
+        predictions: dict[int, tuple[tuple[float, float, float], ...]],
+    ) -> Vec2 | None:
+        if (
+            tank.drone_type is not DroneType.TANK
+            or tank.status is not DroneStatus.ACTIVE
+            or not tank.shots_remaining
+            or tank.next_fire_time is None
+            or state.time + EPS < tank.next_fire_time
+        ):
+            return None
+        enemies = [enemy for enemy in state.opponent_drones if enemy.status is DroneStatus.ACTIVE]
+        rough = sorted(
+            enemies,
+            key=lambda enemy: (
+                _distance(enemy.position, self.own_goal.center) - 6.0 * self.specs[enemy.drone_type].point_value,
+                enemy.id,
+            ),
+        )[: self.MAX_TARGETS_TO_EVALUATE]
+        accepted: list[tuple[float, ShotEvaluation]] = []
+        for target in rough:
+            evaluation = self.evaluate_target(tank, target, state, predictions)
+            if evaluation is None:
+                continue
+            urgent = self._urgent(target, state)
+            hit_threshold = self.URGENT_HIT_THRESHOLD if urgent else self.NORMAL_HIT_THRESHOLD
+            hard_threshold = self.URGENT_HARD_THRESHOLD if urgent else self.NORMAL_HARD_THRESHOLD
+            if evaluation.hit_fraction + EPS < hit_threshold or evaluation.hard_evasion_hit_fraction + EPS < hard_threshold:
+                continue
+            if evaluation.friendly_first_fraction > EPS or evaluation.terrain_first_fraction > EPS:
+                continue
+            accepted.append((self._utility(target, evaluation, tank, state), evaluation))
+        self.last_evaluations = tuple(evaluation for _, evaluation in accepted)
+        if not accepted:
+            return None
+        _, selected = max(accepted, key=lambda item: (item[0], item[1].hit_fraction, item[1].hard_evasion_hit_fraction, -item[1].target_id))
+        return selected.aim_direction
+
+
 def _goal_target(goal, drone: DroneSnapshot, lane: float) -> Vec2:
     y = min(goal.y_max - 0.7, max(goal.y_min + 0.7, lane))
     return (goal.center[0], y)
@@ -516,6 +964,7 @@ class SwarmController(BaseSwarmController):
         self.width = game_info.arena_width
         self.height = game_info.arena_height
         self.direction = 1.0 if self.team is Team.A else -1.0
+        self.weapon = game_info.weapon_spec
         self.graph = SpatialGraph.from_obstacles(self.obstacles)
         ordered = sorted(game_info.own_initial_drones, key=lambda drone: (drone.drone_type.value, drone.id))
         self.lanes = {
@@ -528,6 +977,15 @@ class SwarmController(BaseSwarmController):
         self.predictions: dict[int, tuple[tuple[float, float, float], ...]] = {}
         self.last_plan_time = -float("inf")
         self.aging: dict[int, int] = {}
+        self.fire_control = ConservativeFireControl(
+            self.team,
+            self.width,
+            self.height,
+            self.obstacles,
+            self.specs,
+            self.weapon,
+            self.own_goal,
+        )
 
     def _destination(self, drone: DroneSnapshot, state: GameState) -> Vec2:
         return _goal_target(self.goal, drone, self.lanes.get(drone.id, self.goal.center[1]))
@@ -680,6 +1138,11 @@ class SwarmController(BaseSwarmController):
         if state.time - self.last_plan_time >= REPLAN_PERIOD - EPS or set(self.plans) != {drone.id for drone in active}:
             self.plans = self._plan_routes(state, active)
             self.last_plan_time = state.time
+        for drone in active:
+            plan = self.plans.get(drone.id)
+            if plan is not None:
+                self.predictions[drone.id] = self._predict_route(drone, plan, state.time, 3.0)
+        self.fire_control.observe(state)
         actions = {}
         for drone in active:
             plan = self.plans.get(drone.id)
@@ -688,5 +1151,11 @@ class SwarmController(BaseSwarmController):
             else:
                 target, hold = self._plan_target(plan, state.time)
                 command = self._steer(drone, target, hold=hold)
-            actions[drone.id] = self._emergency_guard(drone, command, state, self._priority(drone, state))
+            command = self._emergency_guard(drone, command, state, self._priority(drone, state))
+            if drone.drone_type is DroneType.TANK:
+                fire_direction = self.fire_control.choose_fire(drone, state, self.predictions)
+                if fire_direction is not None:
+                    actions[drone.id] = {"acceleration": command, "fire_direction": fire_direction}
+                    continue
+            actions[drone.id] = command
         return actions

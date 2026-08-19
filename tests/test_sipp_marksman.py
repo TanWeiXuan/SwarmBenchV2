@@ -6,6 +6,8 @@ from pathlib import Path
 
 import pytest
 
+from swarmbench import CircleObstacle, DroneSnapshot, DroneType, GameState, GoalZone, RectangleObstacle, Team
+from swarmbench.api import DRONE_SPECS, TANK_WEAPON_SPEC
 
 MODULE_PATH = Path(__file__).parents[1] / "submissions" / "TanWeiXuan" / "sipp_marksman_v1.py"
 SPEC = importlib.util.spec_from_file_location("sipp_marksman_v1", MODULE_PATH)
@@ -120,3 +122,110 @@ def test_planning_is_deterministic():
     first = planner(road, reservation, horizon=8.0).plan((0.0, 0.0), (10.0, 0.0))
     second = planner(road, reservation, horizon=8.0).plan((0.0, 0.0), (10.0, 0.0))
     assert first == second
+
+
+def make_fire_control(obstacles=()):
+    return sipp.ConservativeFireControl(
+        Team.A,
+        100.0,
+        60.0,
+        tuple(obstacles),
+        dict(DRONE_SPECS),
+        TANK_WEAPON_SPEC,
+        GoalZone(0.0, 3.0, 20.0, 40.0),
+    )
+
+
+def make_tank(*, time=5.0, next_fire_time=5.0, shots=5):
+    return DroneSnapshot(
+        0,
+        Team.A,
+        DroneType.TANK,
+        (10.0, 30.0),
+        shots_remaining=shots,
+        next_fire_time=next_fire_time,
+    )
+
+
+def test_fire_legality_gate_enforces_lockout_cooldown_and_ammo():
+    fire = make_fire_control()
+    target = DroneSnapshot(20, Team.B, DroneType.TRANSPORT, (20.0, 30.0))
+    tank = make_tank(time=4.9)
+    early = GameState(4.9, (tank,), (target,), 0, 0)
+    assert fire.choose_fire(tank, early, {}) is None
+
+    legal = GameState(5.0, (make_tank(),), (target,), 0, 0)
+    assert fire.choose_fire(legal.own_drones[0], legal, {}) is not None
+
+    cooldown_tank = make_tank(time=5.0, next_fire_time=9.0)
+    cooldown = GameState(5.0, (cooldown_tank,), (target,), 0, 0)
+    assert fire.choose_fire(cooldown_tank, cooldown, {}) is None
+
+    empty_tank = make_tank(shots=0)
+    empty = GameState(9.0, (empty_tank,), (target,), 0, 0)
+    assert fire.choose_fire(empty_tank, empty, {}) is None
+
+
+def test_stationary_short_range_transport_is_high_confidence():
+    fire = make_fire_control()
+    tank = make_tank()
+    target = DroneSnapshot(20, Team.B, DroneType.TRANSPORT, (20.0, 30.0))
+    state = GameState(5.0, (tank,), (target,), 0, 0)
+    evaluation = fire.evaluate_target(tank, target, state, {})
+    assert evaluation is not None
+    assert evaluation.hit_fraction >= 0.90
+    assert evaluation.hard_evasion_hit_fraction >= 0.75
+    assert fire.choose_fire(tank, state, {}) is not None
+
+
+def test_long_range_lateral_scout_fails_conservative_gate():
+    fire = make_fire_control()
+    tank = make_tank()
+    target = DroneSnapshot(20, Team.B, DroneType.SCOUT, (80.0, 30.0), velocity=(0.0, 5.0))
+    state = GameState(5.0, (tank,), (target,), 0, 0)
+    evaluation = fire.evaluate_target(tank, target, state, {})
+    assert evaluation is not None
+    assert evaluation.hit_fraction < fire.NORMAL_HIT_THRESHOLD
+    assert fire.choose_fire(tank, state, {}) is None
+
+
+def test_obstacle_and_friendly_first_hit_are_hard_vetoes():
+    wall = RectangleObstacle(14.0, 16.0, 28.0, 32.0)
+    fire = make_fire_control((wall,))
+    tank = make_tank()
+    target = DroneSnapshot(20, Team.B, DroneType.TRANSPORT, (20.0, 30.0))
+    state = GameState(5.0, (tank,), (target,), 0, 0)
+    blocked = fire.evaluate_target(tank, target, state, {})
+    assert blocked is not None
+    assert blocked.terrain_first_fraction > 0.0
+    assert fire.choose_fire(tank, state, {}) is None
+
+    friend = DroneSnapshot(1, Team.A, DroneType.SCOUT, (15.0, 30.0))
+    fire = make_fire_control()
+    friendly_state = GameState(5.0, (tank, friend), (target,), 0, 0)
+    friendly = fire.evaluate_target(tank, target, friendly_state, {})
+    assert friendly is not None
+    assert friendly.friendly_first_fraction > 0.0
+    assert fire.choose_fire(tank, friendly_state, {}) is None
+
+
+def test_non_piercing_first_enemy_blocks_intended_target():
+    fire = make_fire_control()
+    tank = make_tank()
+    nearer = DroneSnapshot(19, Team.B, DroneType.SCOUT, (15.0, 30.0))
+    target = DroneSnapshot(20, Team.B, DroneType.TRANSPORT, (20.0, 30.0))
+    state = GameState(5.0, (tank,), (nearer, target), 0, 0)
+    evaluation = fire.evaluate_target(tank, target, state, {})
+    assert evaluation is not None
+    assert evaluation.hit_fraction == 0.0
+    assert fire.choose_fire(tank, state, {}) is not None
+    assert all(item.target_id != target.id for item in fire.last_evaluations)
+
+
+def test_target_histories_are_bounded_and_deterministic():
+    fire = make_fire_control()
+    tank = make_tank()
+    target = DroneSnapshot(20, Team.B, DroneType.TRANSPORT, (20.0, 30.0))
+    for index in range(20):
+        fire.observe(GameState(5.0 + index * 0.1, (tank,), (target,), 0, 0))
+    assert len(fire.histories[target.id]) <= 11
