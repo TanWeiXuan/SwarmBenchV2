@@ -9,11 +9,11 @@ import pytest
 from swarmbench import CircleObstacle, DroneSnapshot, DroneType, GameState, GoalZone, RectangleObstacle, Team
 from swarmbench.api import DRONE_SPECS, TANK_WEAPON_SPEC
 
-MODULE_PATH = Path(__file__).parents[1] / "submissions" / "TanWeiXuan" / "sipp_marksman_v1.py"
-SPEC = importlib.util.spec_from_file_location("sipp_marksman_v1", MODULE_PATH)
+MODULE_PATH = Path(__file__).parents[1] / "submissions" / "TanWeiXuan" / "Luna_xHigh_sipp_marksman_v1.py"
+SPEC = importlib.util.spec_from_file_location("Luna_xHigh_sipp_marksman_v1", MODULE_PATH)
 assert SPEC is not None and SPEC.loader is not None
 sipp = importlib.util.module_from_spec(SPEC)
-sys.modules["sipp_marksman_v1"] = sipp
+sys.modules["Luna_xHigh_sipp_marksman_v1"] = sipp
 SPEC.loader.exec_module(sipp)
 
 
