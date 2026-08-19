@@ -19,6 +19,8 @@ Only the final trusted job can update current ratings. It requires all expected 
 
 Successful official runs open a small bot PR changing only `leaderboard/ratings.json` and the README top ten. Permanent history and detailed pair results remain in Discussions, not Git. Raw results and a small set of compressed representative/closest replay candidates are workflow artifacts.
 
+Rating-publication jobs are serialized across official tournaments and accepted submissions, and each job holds the publication lock until its bot PR actually merges. A controller accepted after a tournament is planned is not added to that frozen schedule, but its provisional rating is preserved for the next tournament. Finalization rejects a changed or missing existing participant instead of overwriting concurrent state. Engine or tournament-format changes remain fail-closed and require a fresh tournament run.
+
 Local tournament CLI:
 
 ```bash

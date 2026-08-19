@@ -224,6 +224,9 @@ jobs:
     name: Validate all batches and publish atomically
     needs: compute-4
     runs-on: ubuntu-latest
+    concurrency:
+      group: swarmbench-rating-publication
+      cancel-in-progress: false
     permissions:
       contents: read
       actions: read
@@ -270,6 +273,7 @@ jobs:
           git push --set-upstream origin "bot/tournament-$RUN_ID"
           url=$(gh pr create --title "Publish tournament $RUN_ID ratings" --body "Atomic current-state update from the completed official rating period." --base main --head "bot/tournament-$RUN_ID")
           gh pr merge "$url" --auto --squash
+          bash .github/scripts/wait-for-pr-merge.sh "$url"
       - uses: actions/upload-artifact@v4
         with:
           name: tournament-results
