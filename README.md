@@ -98,6 +98,7 @@ Only the latest rating state is committed; permanent tournament history lives in
 | 7 | Sonnet 5 V1 | TanWeiXuan | 1524 | 21 | 140 | 115 | 105 | 360 |
 | 8 | Sonnet 5 V2 | renj1ete0 | 1489 | 37 | 0 | 0 | 0 | 0 |
 | 9 | Phalanx V2 | TanWeiXuan | 1459 | 21 | 107 | 189 | 136 | 432 |
+| 10 | Nemotron 3 Ultra | TanWeiXuan | 1353 | 34 | 0 | 0 | 0 | 0 |
 <!-- LEADERBOARD_END -->
 
 ## Reproducibility and security
