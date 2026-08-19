@@ -45,6 +45,20 @@
     {
       "author": "TanWeiXuan",
       "built_in": false,
+      "controller_id": "TanWeiXuan/sonnet_5_v1",
+      "deviation": 39.35405150049664,
+      "display_name": "Sonnet 5 V1",
+      "draws": 0,
+      "games": 0,
+      "losses": 0,
+      "rating": 1436.268267472783,
+      "version_sha": "b8b5e508a58113f292cc2872752c24442c48a27b",
+      "volatility": 0.05999682961698387,
+      "wins": 0
+    },
+    {
+      "author": "TanWeiXuan",
+      "built_in": false,
       "controller_id": "TanWeiXuan/wayfinder_v2",
       "deviation": 33.816309384576094,
       "display_name": "Wayfinder V2",
