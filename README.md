@@ -93,7 +93,8 @@ Only the latest rating state is committed; permanent tournament history lives in
 | 2 | Bigpickle V1 | TanWeiXuan | 1611 | 23 | 116 | 91 | 57 | 264 |
 | 3 | Aegis Apex V2 | TanWeiXuan | 1587 | 22 | 127 | 151 | 74 | 352 |
 | 4 | Sonnet 5 V1 | TanWeiXuan | 1520 | 22 | 110 | 87 | 83 | 280 |
-| 5 | Phalanx V2 | TanWeiXuan | 1461 | 22 | 90 | 157 | 113 | 360 |
+| 5 | Sonnet 5 V2 | renj1ete0 | 1489 | 37 | 0 | 0 | 0 | 0 |
+| 6 | Phalanx V2 | TanWeiXuan | 1461 | 22 | 90 | 157 | 113 | 360 |
 <!-- LEADERBOARD_END -->
 
 ## Reproducibility and security
