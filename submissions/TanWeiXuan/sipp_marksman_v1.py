@@ -1079,6 +1079,38 @@ class SwarmController(BaseSwarmController):
         )
 
     def _destination(self, drone: DroneSnapshot, state: GameState) -> Vec2:
+        enemies = [enemy for enemy in state.opponent_drones if enemy.status is DroneStatus.ACTIVE]
+        if drone.drone_type is DroneType.SCOUT and enemies:
+            scouts = sorted(
+                (item for item in state.own_drones if item.status is DroneStatus.ACTIVE and item.drone_type is DroneType.SCOUT),
+                key=lambda item: item.id,
+            )
+            rank = next((index for index, item in enumerate(scouts) if item.id == drone.id), 0)
+            enemy_transports = [enemy for enemy in enemies if enemy.drone_type is DroneType.TRANSPORT]
+            if rank % 4 == 0 and enemy_transports:
+                target = min(
+                    enemy_transports,
+                    key=lambda enemy: (_distance(enemy.position, self.own_goal.center), enemy.id),
+                )
+                lead = min(1.0, _distance(drone.position, target.position) / max(1.0, self.specs[DroneType.SCOUT].max_speed))
+                return (target.position[0] + target.velocity[0] * lead, target.position[1] + target.velocity[1] * lead)
+            transports = [item for item in state.own_drones if item.status is DroneStatus.ACTIVE and item.drone_type is DroneType.TRANSPORT]
+            if rank % 4 == 1 and transports:
+                transport = min(transports, key=lambda item: (_distance(drone.position, item.position), item.id))
+                offset = ((rank % 5) - 2) * 1.1
+                return (
+                    transport.position[0] + 2.8 * self.direction,
+                    min(self.height - 0.7, max(0.7, transport.position[1] + offset)),
+                )
+        if drone.drone_type is DroneType.TANK:
+            transports = [item for item in state.own_drones if item.status is DroneStatus.ACTIVE and item.drone_type is DroneType.TRANSPORT]
+            midfield = self.width * (0.46 if self.team is Team.A else 0.54)
+            if transports:
+                lead_transport = max(transports, key=lambda item: (self.direction * item.position[0], -item.id))
+                desired_x = lead_transport.position[0] - self.direction * 5.5
+                if self.direction * (desired_x - midfield) > 0.0:
+                    return (desired_x, lead_transport.position[1])
+            return (midfield, self.lanes.get(drone.id, self.height * 0.5))
         return _goal_target(self.goal, drone, self.lanes.get(drone.id, self.goal.center[1]))
 
     def _priority(self, drone: DroneSnapshot, state: GameState) -> float:
@@ -1087,7 +1119,29 @@ class SwarmController(BaseSwarmController):
         urgency = remaining / max(0.1, self.specs[drone.drone_type].max_speed) / time_left
         value = self.specs[drone.drone_type].point_value
         class_bonus = 20.0 if drone.drone_type is DroneType.TRANSPORT else 10.0 if drone.drone_type is DroneType.TANK else 0.0
-        return 100.0 * urgency + class_bonus + min(10.0, 2.0 * self.aging.get(drone.id, 0)) - 0.01 * drone.id + value
+        emergency = 0.0
+        for friend in state.own_drones:
+            if friend.id == drone.id or friend.status is not DroneStatus.ACTIVE:
+                continue
+            dx, dy = friend.position[0] - drone.position[0], friend.position[1] - drone.position[1]
+            separation = hypot(dx, dy)
+            if separation >= 2.0:
+                continue
+            closing = ((friend.velocity[0] - drone.velocity[0]) * dx + (friend.velocity[1] - drone.velocity[1]) * dy) / max(EPS, separation)
+            if closing < 0.0:
+                emergency = max(emergency, (2.0 - separation) / 2.0)
+        passage = 0.0
+        for obstacle in self.obstacles:
+            if isinstance(obstacle, CircleObstacle):
+                center, radius = obstacle.center, obstacle.radius
+            else:
+                center = ((obstacle.x_min + obstacle.x_max) * 0.5, (obstacle.y_min + obstacle.y_max) * 0.5)
+                radius = hypot(obstacle.x_max - obstacle.x_min, obstacle.y_max - obstacle.y_min) * 0.5
+            surface = _distance(drone.position, center) - radius
+            if 0.0 < surface < 3.0:
+                passage = max(passage, (3.0 - surface) / 3.0)
+        aging = min(10.0, 2.0 * self.aging.get(drone.id, 0))
+        return 1000.0 * emergency + 35.0 * passage + 100.0 * urgency + class_bonus + aging - 0.01 * drone.id + value
 
     def _steer(self, drone: DroneSnapshot, target: Vec2, *, hold: bool = False) -> Vec2:
         spec = self.specs[drone.drone_type]
@@ -1211,6 +1265,30 @@ class SwarmController(BaseSwarmController):
                 continue
             if self._priority(friend, state) <= priority:
                 continue
+            own_prediction = self.predictions.get(drone.id)
+            friend_prediction = self.predictions.get(friend.id)
+            if own_prediction and friend_prediction:
+                samples = min(len(own_prediction), len(friend_prediction), round(1.5 / PHYSICS_DT) + 1)
+                predicted_miss = min(
+                    hypot(
+                        own_prediction[index][1] - friend_prediction[index][1],
+                        own_prediction[index][2] - friend_prediction[index][2],
+                    )
+                    for index in range(samples)
+                )
+                if predicted_miss < 0.82:
+                    spec = self.specs[drone.drone_type]
+                    relative = (friend.position[0] - drone.position[0], friend.position[1] - drone.position[1])
+                    away = hypot(relative[0], relative[1])
+                    if away < EPS:
+                        return clip_vector((-drone.velocity[0] * 3.0, -drone.velocity[1] * 3.0), spec.max_acceleration)
+                    return clip_vector(
+                        (
+                            -relative[0] / away * spec.max_acceleration - drone.velocity[0] * 3.0,
+                            -relative[1] / away * spec.max_acceleration - drone.velocity[1] * 3.0,
+                        ),
+                        spec.max_acceleration,
+                    )
             relative = (friend.position[0] - drone.position[0], friend.position[1] - drone.position[1])
             relative_velocity = (friend.velocity[0] - drone.velocity[0], friend.velocity[1] - drone.velocity[1])
             speed_squared = relative_velocity[0] ** 2 + relative_velocity[1] ** 2
