@@ -89,11 +89,11 @@ Only the latest rating state is committed; permanent tournament history lives in
 <!-- LEADERBOARD_START -->
 | Rank | Controller | Author | Rating | RD | W | D | L | Games |
 | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | Wayfinder V2 | TanWeiXuan | 1639 | 23 | 123 | 97 | 44 | 264 |
-| 2 | Bigpickle V1 | TanWeiXuan | 1628 | 24 | 96 | 63 | 41 | 200 |
-| 3 | Aegis Apex V2 | TanWeiXuan | 1580 | 23 | 105 | 123 | 60 | 288 |
-| 4 | Sonnet 5 V1 | TanWeiXuan | 1493 | 24 | 76 | 62 | 70 | 208 |
-| 5 | Phalanx V2 | TanWeiXuan | 1488 | 23 | 75 | 133 | 80 | 288 |
+| 1 | Wayfinder V2 | TanWeiXuan | 1652 | 22 | 158 | 118 | 52 | 328 |
+| 2 | Bigpickle V1 | TanWeiXuan | 1611 | 23 | 116 | 91 | 57 | 264 |
+| 3 | Aegis Apex V2 | TanWeiXuan | 1587 | 22 | 127 | 151 | 74 | 352 |
+| 4 | Sonnet 5 V1 | TanWeiXuan | 1520 | 22 | 110 | 87 | 83 | 280 |
+| 5 | Phalanx V2 | TanWeiXuan | 1461 | 22 | 90 | 157 | 113 | 360 |
 <!-- LEADERBOARD_END -->
 
 ## Reproducibility and security
