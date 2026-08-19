@@ -8,10 +8,9 @@ layer above a small jerk-aware tracker.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from heapq import heappop, heappush
 from math import atan2, cos, hypot, isfinite, pi, sin, sqrt
-from typing import Iterable, Sequence
+from typing import Iterable, NamedTuple, Sequence
 
 from swarmbench import (
     BaseSwarmController,
@@ -46,7 +45,9 @@ PLANNING_HORIZON = 12.0
 REPLAN_PERIOD = 0.7
 EDGE_SPEED_FACTOR = 0.80
 EDGE_TRACKING_SLACK = 0.35
-DEPARTURE_GRANULARITY = 0.05
+DEPARTURE_GRANULARITY = 0.10
+RESERVATION_SAMPLE_PERIOD = 0.20
+RECEDING_GOAL_FRACTION = 0.55
 
 
 def _distance(left: Vec2, right: Vec2) -> float:
@@ -82,36 +83,21 @@ def _segment_clear(
     return all(swept_obstacle_contact(left, right, obstacle, padding) is None for obstacle in obstacles)
 
 
-@dataclass(frozen=True, slots=True)
-class ReservationSegment:
+class ReservationSegment(NamedTuple):
     start_time: float
     end_time: float
     start: Vec2
     end: Vec2
-
-    @property
-    def velocity(self) -> Vec2:
-        duration = self.end_time - self.start_time
-        if duration <= EPS:
-            return (0.0, 0.0)
-        return (
-            (self.end[0] - self.start[0]) / duration,
-            (self.end[1] - self.start[1]) / duration,
-        )
-
-    @property
-    def bounds(self) -> tuple[float, float, float, float]:
-        return _segment_bounds(self.start, self.end, RESERVATION_RADIUS)
+    velocity: Vec2
+    bounds: tuple[float, float, float, float]
 
 
-@dataclass(frozen=True, slots=True)
-class TimedPoint:
+class TimedPoint(NamedTuple):
     time: float
     position: Vec2
 
 
-@dataclass(frozen=True, slots=True)
-class SippPlan:
+class SippPlan(NamedTuple):
     points: tuple[TimedPoint, ...]
     arrival_time: float
 
@@ -135,8 +121,39 @@ def reservation_segments(trajectory: Sequence[tuple[float, float, float] | Timed
     for left, right in zip(points, points[1:]):
         if right.time <= left.time + EPS:
             continue
-        segments.append(ReservationSegment(left.time, right.time, left.position, right.position))
+        duration = right.time - left.time
+        velocity = (
+            (right.position[0] - left.position[0]) / duration,
+            (right.position[1] - left.position[1]) / duration,
+        )
+        segments.append(
+            ReservationSegment(
+                left.time,
+                right.time,
+                left.position,
+                right.position,
+                velocity,
+                _segment_bounds(left.position, right.position, RESERVATION_RADIUS),
+            )
+        )
     return tuple(segments)
+
+
+def _coarsen_trajectory(
+    trajectory: Sequence[tuple[float, float, float]],
+    period: float = RESERVATION_SAMPLE_PERIOD,
+) -> tuple[tuple[float, float, float], ...]:
+    """Keep the forward-simulated path while bounding SIPP reservation work."""
+    if len(trajectory) <= 2:
+        return tuple(trajectory)
+    selected = [trajectory[0]]
+    next_time = trajectory[0][0] + period
+    for sample in trajectory[1:-1]:
+        if sample[0] + EPS >= next_time:
+            selected.append(sample)
+            next_time = sample[0] + period
+    selected.append(trajectory[-1])
+    return tuple(selected)
 
 
 def forbidden_interval_at_point(
@@ -385,15 +402,24 @@ class SippPlanner:
     ) -> float | None:
         if latest < earliest - EPS:
             return None
+        edge_bounds = _segment_bounds(graph.points[left], graph.points[right], RESERVATION_RADIUS)
+        relevant = tuple(
+            reservation for reservation in self.reservations if _bounds_overlap(edge_bounds, reservation.bounds)
+        )
+        if not relevant:
+            return earliest
         departure = earliest
         while departure <= latest + EPS:
             arrival = departure + duration
-            if not edge_conflicts(
-                graph.points[left],
-                graph.points[right],
-                departure,
-                arrival,
-                self.reservations,
+            if not any(
+                edge_conflicts_reservation(
+                    graph.points[left],
+                    graph.points[right],
+                    departure,
+                    arrival,
+                    reservation,
+                )
+                for reservation in relevant
             ):
                 return departure
             departure += DEPARTURE_GRANULARITY
@@ -500,8 +526,20 @@ def _static_route(graph: SpatialGraph, obstacles: tuple[CircleObstacle | Rectang
     return tuple(route)
 
 
-@dataclass(frozen=True, slots=True)
-class ShotEvaluation:
+def _receding_goal(route: Sequence[Vec2], speed: float, horizon: float) -> Vec2:
+    """Choose a reachable local route point for finite-horizon replanning."""
+    budget = max(2.0, speed * horizon * RECEDING_GOAL_FRACTION)
+    travelled = 0.0
+    for left, right in zip(route, route[1:]):
+        edge = _distance(left, right)
+        if travelled + edge > budget:
+            fraction = max(0.0, min(1.0, (budget - travelled) / max(EPS, edge)))
+            return _lerp(left, right, fraction)
+        travelled += edge
+    return route[-1]
+
+
+class ShotEvaluation(NamedTuple):
     target_id: int
     aim_direction: Vec2
     hit_fraction: float
@@ -512,8 +550,7 @@ class ShotEvaluation:
     terrain_first_fraction: float
 
 
-@dataclass(frozen=True, slots=True)
-class _ShotOutcome:
+class _ShotOutcome(NamedTuple):
     first_kind: str | None
     first_id: int | None
     hit_time: float | None
@@ -568,10 +605,10 @@ class ConservativeFireControl:
     NORMAL_HARD_THRESHOLD = 0.75
     URGENT_HIT_THRESHOLD = 0.84
     URGENT_HARD_THRESHOLD = 0.60
-    MAX_TARGETS_TO_EVALUATE = 6
+    MAX_TARGETS_TO_EVALUATE = 2
     MAX_FLIGHT_TIME = 6.0
-    AIM_OFFSETS_DEGREES = (0.0, 0.20, -0.20, 0.40, -0.40, 0.70, -0.70, 1.0, -1.0, 1.5, -1.5)
-    HARD_MODES = frozenset({"brake", "dodge_left", "dodge_right", "switch_left_right", "switch_right_left"})
+    AIM_OFFSETS_DEGREES = (0.0, 0.40, -0.40, 1.0, -1.0)
+    HARD_MODES = frozenset({"brake", "left", "right", "forward_left", "forward_right", "brake_left", "brake_right"})
 
     def __init__(
         self,
@@ -731,57 +768,66 @@ class ConservativeFireControl:
             vehicle.position[1] + vehicle.velocity[1] * elapsed,
         )
 
-    def _first_hit(
+    def _build_vehicle_tracks(
+        self,
+        state: GameState,
+        predictions: dict[int, tuple[tuple[float, float, float], ...]],
+        steps: int,
+    ) -> dict[int, tuple[Vec2, ...]]:
+        tracks: dict[int, tuple[Vec2, ...]] = {}
+        for vehicle in tuple(state.own_drones) + tuple(state.opponent_drones):
+            prediction = predictions.get(vehicle.id)
+            if prediction:
+                positions = []
+                for index in range(steps + 1):
+                    timestamp = state.time + index * PHYSICS_DT
+                    if index < len(prediction) and abs(prediction[index][0] - timestamp) <= 1.0e-6:
+                        positions.append((prediction[index][1], prediction[index][2]))
+                    else:
+                        positions.append(self._prediction_position(prediction, timestamp))
+                tracks[vehicle.id] = tuple(positions)
+            else:
+                tracks[vehicle.id] = tuple(
+                    (
+                        vehicle.position[0] + vehicle.velocity[0] * index * PHYSICS_DT,
+                        vehicle.position[1] + vehicle.velocity[1] * index * PHYSICS_DT,
+                    )
+                    for index in range(steps + 1)
+                )
+        return tracks
+
+    def _static_first_hit(
         self,
         shooter: DroneSnapshot,
         target: DroneSnapshot,
-        target_samples: Sequence[Vec2],
         aim_direction: Vec2,
         state: GameState,
-        predictions: dict[int, tuple[tuple[float, float, float], ...]],
-    ) -> _ShotOutcome:
-        steps = len(target_samples) - 1
+        tracks: dict[int, tuple[Vec2, ...]],
+        steps: int,
+    ) -> tuple[float, int, int, str, int | None] | None:
         projectile_position = shooter.position
         projectile_velocity = _scale(aim_direction, self.weapon.projectile_speed)
-        closest_target_distance = float("inf")
-        first: tuple[float, int, int, str, int | None] | None = None
         vehicles = tuple(state.own_drones) + tuple(state.opponent_drones)
         for index in range(steps):
             elapsed = index * PHYSICS_DT
-            next_elapsed = elapsed + PHYSICS_DT
             next_projectile = (
                 projectile_position[0] + projectile_velocity[0] * PHYSICS_DT,
                 projectile_position[1] + projectile_velocity[1] * PHYSICS_DT,
-            )
-            target_start, target_end = target_samples[index], target_samples[index + 1]
-            closest_target_distance = min(
-                closest_target_distance,
-                _minimum_relative_distance(projectile_position, next_projectile, target_start, target_end),
             )
             candidates: list[tuple[float, int, int, str, int | None]] = []
             for obstacle_index, obstacle in enumerate(self.obstacles):
                 contact = swept_obstacle_contact(projectile_position, next_projectile, obstacle, 0.0)
                 if contact is not None:
                     candidates.append((elapsed + contact * PHYSICS_DT, 0, obstacle_index, "terrain", None))
-            target_contact = swept_points_contact(
-                projectile_position,
-                next_projectile,
-                target_start,
-                target_end,
-                PROJECTILE_CONTACT_RADIUS,
-            )
-            if target_contact is not None:
-                candidates.append((elapsed + target_contact * PHYSICS_DT, 2, target.id, "target", target.id))
             for vehicle in vehicles:
                 if vehicle.id in {shooter.id, target.id} or vehicle.status is not DroneStatus.ACTIVE:
                     continue
-                vehicle_start = self._other_vehicle_position(vehicle, elapsed, state, predictions)
-                vehicle_end = self._other_vehicle_position(vehicle, next_elapsed, state, predictions)
+                vehicle_track = tracks[vehicle.id]
                 contact = swept_points_contact(
                     projectile_position,
                     next_projectile,
-                    vehicle_start,
-                    vehicle_end,
+                    vehicle_track[index],
+                    vehicle_track[index + 1],
                     PROJECTILE_CONTACT_RADIUS,
                 )
                 if contact is not None:
@@ -798,12 +844,54 @@ class ConservativeFireControl:
             if exit_contact is not None:
                 candidates.append((elapsed + exit_contact * PHYSICS_DT, 5, -1, "exit", None))
             if candidates:
-                first = min(candidates)
-                break
+                return min(candidates)
             projectile_position = next_projectile
-        if first is None:
-            return _ShotOutcome(None, None, None, self.weapon.projectile_speed * 0.0 + PROJECTILE_CONTACT_RADIUS - closest_target_distance)
-        return _ShotOutcome(first[3], first[4], state.time + first[0], PROJECTILE_CONTACT_RADIUS - closest_target_distance)
+        return None
+
+    def _first_hit(
+        self,
+        shooter: DroneSnapshot,
+        target: DroneSnapshot,
+        target_samples: Sequence[Vec2],
+        aim_direction: Vec2,
+        state: GameState,
+        static_first: tuple[float, int, int, str, int | None] | None,
+    ) -> _ShotOutcome:
+        steps = len(target_samples) - 1
+        projectile_position = shooter.position
+        projectile_velocity = _scale(aim_direction, self.weapon.projectile_speed)
+        closest_target_distance = float("inf")
+        for index in range(steps):
+            elapsed = index * PHYSICS_DT
+            next_elapsed = elapsed + PHYSICS_DT
+            next_projectile = (
+                projectile_position[0] + projectile_velocity[0] * PHYSICS_DT,
+                projectile_position[1] + projectile_velocity[1] * PHYSICS_DT,
+            )
+            target_start, target_end = target_samples[index], target_samples[index + 1]
+            closest_target_distance = min(
+                closest_target_distance,
+                _minimum_relative_distance(projectile_position, next_projectile, target_start, target_end),
+            )
+            target_contact = swept_points_contact(
+                projectile_position,
+                next_projectile,
+                target_start,
+                target_end,
+                PROJECTILE_CONTACT_RADIUS,
+            )
+            target_first: tuple[float, int, int, str, int | None] | None = None
+            if target_contact is not None:
+                target_first = (elapsed + target_contact * PHYSICS_DT, 2, target.id, "target", target.id)
+            if static_first is not None and static_first[0] <= next_elapsed + EPS:
+                first = min((candidate for candidate in (target_first, static_first) if candidate is not None))
+                return _ShotOutcome(first[3], first[4], state.time + first[0], PROJECTILE_CONTACT_RADIUS - closest_target_distance)
+            if target_first is not None:
+                return _ShotOutcome("target", target.id, state.time + target_first[0], PROJECTILE_CONTACT_RADIUS - closest_target_distance)
+            projectile_position = next_projectile
+        if static_first is not None:
+            return _ShotOutcome(static_first[3], static_first[4], state.time + static_first[0], PROJECTILE_CONTACT_RADIUS - closest_target_distance)
+        return _ShotOutcome(None, None, None, PROJECTILE_CONTACT_RADIUS - closest_target_distance)
 
     def evaluate_target(
         self,
@@ -811,6 +899,7 @@ class ConservativeFireControl:
         target: DroneSnapshot,
         state: GameState,
         predictions: dict[int, tuple[tuple[float, float, float], ...]],
+        tracks: dict[int, tuple[Vec2, ...]] | None = None,
     ) -> ShotEvaluation | None:
         lead = self._lead_point(shooter, target, self.weapon.projectile_speed)
         if lead is None:
@@ -835,20 +924,19 @@ class ConservativeFireControl:
             "forward_right",
             "brake_left",
             "brake_right",
-            "dodge_left",
-            "dodge_right",
-            "switch_left_right",
-            "switch_right_left",
         )
         best: ShotEvaluation | None = None
+        steps = round(flight_time / PHYSICS_DT)
+        tracks = tracks or self._build_vehicle_tracks(state, predictions, steps)
         for offset_degrees in self.AIM_OFFSETS_DEGREES:
             offset = offset_degrees * pi / 180.0
             angle = atan2(base_direction[1], base_direction[0]) + offset
             aim_direction = (cos(angle), sin(angle))
+            static_first = self._static_first_hit(shooter, target, aim_direction, state, tracks, steps)
             outcomes = []
             for mode in modes:
                 target_samples = self._target_trajectory(shooter, target, aim_direction, mode, flight_time)
-                outcomes.append(self._first_hit(shooter, target, target_samples, aim_direction, state, predictions))
+                outcomes.append(self._first_hit(shooter, target, target_samples, aim_direction, state, static_first))
             hits = [outcome for outcome in outcomes if outcome.first_kind == "target" and outcome.first_id == target.id]
             hard_outcomes = [outcome for mode, outcome in zip(modes, outcomes) if mode in self.HARD_MODES]
             hard_hits = [outcome for outcome in hard_outcomes if outcome.first_kind == "target" and outcome.first_id == target.id]
@@ -910,6 +998,7 @@ class ConservativeFireControl:
         tank: DroneSnapshot,
         state: GameState,
         predictions: dict[int, tuple[tuple[float, float, float], ...]],
+        tracks: dict[int, tuple[Vec2, ...]] | None = None,
     ) -> Vec2 | None:
         if (
             tank.drone_type is not DroneType.TANK
@@ -927,9 +1016,11 @@ class ConservativeFireControl:
                 enemy.id,
             ),
         )[: self.MAX_TARGETS_TO_EVALUATE]
+        if tracks is None:
+            tracks = self._build_vehicle_tracks(state, predictions, round(self.MAX_FLIGHT_TIME / PHYSICS_DT))
         accepted: list[tuple[float, ShotEvaluation]] = []
         for target in rough:
-            evaluation = self.evaluate_target(tank, target, state, predictions)
+            evaluation = self.evaluate_target(tank, target, state, predictions, tracks)
             if evaluation is None:
                 continue
             urgent = self._urgent(target, state)
@@ -1041,6 +1132,12 @@ class SwarmController(BaseSwarmController):
         routes: dict[int, SippPlan] = {}
         for drone in sorted(active, key=lambda item: (-self._priority(item, state), item.id)):
             target = self._destination(drone, state)
+            static_route = _static_route(self.graph, self.obstacles, drone.position, target)
+            planning_target = _receding_goal(
+                static_route,
+                self.specs[drone.drone_type].max_speed,
+                PLANNING_HORIZON,
+            )
             planner = SippPlanner(
                 self.graph,
                 self.obstacles,
@@ -1048,9 +1145,9 @@ class SwarmController(BaseSwarmController):
                 state.time,
                 speed=self.specs[drone.drone_type].max_speed,
             )
-            plan = planner.plan(drone.position, target)
+            plan = planner.plan(drone.position, planning_target)
             if plan is None:
-                fallback = _static_route(self.graph, self.obstacles, drone.position, target)
+                fallback = static_route
                 timed = []
                 elapsed = state.time
                 for left, right in zip(fallback, fallback[1:]):
@@ -1064,7 +1161,7 @@ class SwarmController(BaseSwarmController):
             routes[drone.id] = plan
             prediction = self._predict_route(drone, plan, state.time, 3.0)
             self.predictions[drone.id] = prediction
-            reservations.extend(reservation_segments(prediction))
+            reservations.extend(reservation_segments(_coarsen_trajectory(prediction)))
         return routes
 
     def _predict_route(
@@ -1143,6 +1240,31 @@ class SwarmController(BaseSwarmController):
             if plan is not None:
                 self.predictions[drone.id] = self._predict_route(drone, plan, state.time, 3.0)
         self.fire_control.observe(state)
+        vehicle_tracks = None
+        if any(
+            drone.drone_type is DroneType.TANK
+            and drone.shots_remaining
+            and drone.next_fire_time is not None
+            and state.time + EPS >= drone.next_fire_time
+            for drone in active
+        ):
+            vehicle_tracks = self.fire_control._build_vehicle_tracks(
+                state,
+                self.predictions,
+                round(self.fire_control.MAX_FLIGHT_TIME / PHYSICS_DT),
+            )
+        ready_tanks = [
+            drone
+            for drone in active
+            if drone.drone_type is DroneType.TANK
+            and drone.shots_remaining
+            and drone.next_fire_time is not None
+            and state.time + EPS >= drone.next_fire_time
+        ]
+        fire_tank_id = None
+        if ready_tanks:
+            ready_tanks.sort(key=lambda drone: drone.id)
+            fire_tank_id = ready_tanks[round(state.time / CONTROLLER_PERIOD) % len(ready_tanks)].id
         actions = {}
         for drone in active:
             plan = self.plans.get(drone.id)
@@ -1152,8 +1274,8 @@ class SwarmController(BaseSwarmController):
                 target, hold = self._plan_target(plan, state.time)
                 command = self._steer(drone, target, hold=hold)
             command = self._emergency_guard(drone, command, state, self._priority(drone, state))
-            if drone.drone_type is DroneType.TANK:
-                fire_direction = self.fire_control.choose_fire(drone, state, self.predictions)
+            if drone.drone_type is DroneType.TANK and drone.id == fire_tank_id:
+                fire_direction = self.fire_control.choose_fire(drone, state, self.predictions, vehicle_tracks)
                 if fire_direction is not None:
                     actions[drone.id] = {"acceleration": command, "fire_direction": fire_direction}
                     continue
