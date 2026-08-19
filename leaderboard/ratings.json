@@ -59,6 +59,20 @@
     {
       "author": "TanWeiXuan",
       "built_in": false,
+      "controller_id": "TanWeiXuan/nemotron_3_ultra",
+      "deviation": 33.82598917254205,
+      "display_name": "Nemotron 3 Ultra",
+      "draws": 0,
+      "games": 0,
+      "losses": 0,
+      "rating": 1353.2465144967928,
+      "version_sha": "0dd96f6ca63ecaba3067621fbc023973a0dcad7d",
+      "volatility": 0.05999729214007621,
+      "wins": 0
+    },
+    {
+      "author": "TanWeiXuan",
+      "built_in": false,
       "controller_id": "TanWeiXuan/phalanx_v2",
       "deviation": 21.438430356578603,
       "display_name": "Phalanx V2",
