@@ -37,8 +37,13 @@ from swarmbench.engine.dynamics import DynamicState, advance_dynamics, clip_vect
 EPS = 1.0e-9
 MERGE_EPS = 1.0e-7
 VEHICLE_COLLISION_RADIUS = 0.75
+# Keep the analytic reservation primitive close to the engine's center
+# collision radius.  The controller asks SIPP for a wider tracking tube below,
+# because the jerk-limited low-level tracker can lag a timed roadmap edge.
 RESERVATION_MARGIN = 0.15
 RESERVATION_RADIUS = VEHICLE_COLLISION_RADIUS + RESERVATION_MARGIN
+TRACKING_RESERVATION_MARGIN = 0.60
+TRACKING_RESERVATION_RADIUS = VEHICLE_COLLISION_RADIUS + TRACKING_RESERVATION_MARGIN
 PATH_CLEARANCE = 0.35
 ROADMAP_MARGIN = 0.18
 PLANNING_HORIZON = 12.0
@@ -46,8 +51,10 @@ REPLAN_PERIOD = 0.7
 EDGE_SPEED_FACTOR = 0.80
 EDGE_TRACKING_SLACK = 0.35
 DEPARTURE_GRANULARITY = 0.10
-RESERVATION_SAMPLE_PERIOD = 0.20
+RESERVATION_SAMPLE_PERIOD = 0.30
 RECEDING_GOAL_FRACTION = 0.55
+PREDICTION_HORIZON = 6.0
+EMERGENCY_GUARD_HORIZON = 4.5
 
 
 def _distance(left: Vec2, right: Vec2) -> float:
@@ -106,7 +113,10 @@ class SippPlan(NamedTuple):
         return self.points[-1].position
 
 
-def reservation_segments(trajectory: Sequence[tuple[float, float, float] | TimedPoint]) -> tuple[ReservationSegment, ...]:
+def reservation_segments(
+    trajectory: Sequence[tuple[float, float, float] | TimedPoint],
+    radius: float = RESERVATION_RADIUS,
+) -> tuple[ReservationSegment, ...]:
     """Convert timestamped points into the linear segments used by SIPP."""
     points: list[TimedPoint] = []
     for item in trajectory:
@@ -133,7 +143,7 @@ def reservation_segments(trajectory: Sequence[tuple[float, float, float] | Timed
                 left.position,
                 right.position,
                 velocity,
-                _segment_bounds(left.position, right.position, RESERVATION_RADIUS),
+                _segment_bounds(left.position, right.position, radius),
             )
         )
     return tuple(segments)
@@ -379,6 +389,7 @@ class SippPlanner:
         now: float,
         horizon: float = PLANNING_HORIZON,
         speed: float = 1.0,
+        reservation_radius: float = RESERVATION_RADIUS,
     ) -> None:
         self.graph = graph
         self.obstacles = obstacles
@@ -386,6 +397,7 @@ class SippPlanner:
         self.now = now
         self.horizon = horizon
         self.speed = max(0.1, speed)
+        self.reservation_radius = max(0.0, reservation_radius)
 
     def _edge_duration(self, graph: SpatialGraph, left: int, right: int) -> float:
         distance = _distance(graph.points[left], graph.points[right])
@@ -402,7 +414,7 @@ class SippPlanner:
     ) -> float | None:
         if latest < earliest - EPS:
             return None
-        edge_bounds = _segment_bounds(graph.points[left], graph.points[right], RESERVATION_RADIUS)
+        edge_bounds = _segment_bounds(graph.points[left], graph.points[right], self.reservation_radius)
         relevant = tuple(
             reservation for reservation in self.reservations if _bounds_overlap(edge_bounds, reservation.bounds)
         )
@@ -418,6 +430,7 @@ class SippPlanner:
                     departure,
                     arrival,
                     reservation,
+                    self.reservation_radius,
                 )
                 for reservation in relevant
             ):
@@ -428,7 +441,16 @@ class SippPlanner:
     def plan(self, start: Vec2, goal: Vec2) -> SippPlan | None:
         graph = self.graph.with_endpoints(start, goal, self.obstacles)
         start_index, goal_index = len(graph.points) - 2, len(graph.points) - 1
-        intervals = [safe_intervals(point, self.reservations, self.now, self.now + self.horizon) for point in graph.points]
+        intervals = [
+            safe_intervals(
+                point,
+                self.reservations,
+                self.now,
+                self.now + self.horizon,
+                self.reservation_radius,
+            )
+            for point in graph.points
+        ]
         start_interval = next(
             (index for index, interval in enumerate(intervals[start_index]) if interval[0] - EPS <= self.now <= interval[1] + EPS),
             None,
@@ -1143,7 +1165,15 @@ class SwarmController(BaseSwarmController):
         aging = min(10.0, 2.0 * self.aging.get(drone.id, 0))
         return 1000.0 * emergency + 35.0 * passage + 100.0 * urgency + class_bonus + aging - 0.01 * drone.id + value
 
-    def _steer(self, drone: DroneSnapshot, target: Vec2, *, hold: bool = False) -> Vec2:
+    def _steer(
+        self,
+        drone: DroneSnapshot,
+        target: Vec2,
+        *,
+        hold: bool = False,
+        timestamp: float | None = None,
+        arrival_time: float | None = None,
+    ) -> Vec2:
         spec = self.specs[drone.drone_type]
         dx, dy = target[0] - drone.position[0], target[1] - drone.position[1]
         distance = hypot(dx, dy)
@@ -1153,6 +1183,11 @@ class SwarmController(BaseSwarmController):
         else:
             forward = (dx / distance, dy / distance)
             desired_speed = min(spec.max_speed, sqrt(max(0.0, 2.0 * spec.max_acceleration * distance)))
+            if timestamp is not None and arrival_time is not None:
+                remaining = max(CONTROLLER_PERIOD, arrival_time - timestamp)
+                # Track the SIPP schedule, rather than racing to the next
+                # waypoint and then braking after the reservation window.
+                desired_speed = min(desired_speed, distance / remaining * 1.10)
             desired_velocity = (forward[0] * desired_speed, forward[1] * desired_speed)
         ax = 2.25 * (desired_velocity[0] - drone.velocity[0])
         ay = 2.25 * (desired_velocity[1] - drone.velocity[1])
@@ -1198,6 +1233,7 @@ class SwarmController(BaseSwarmController):
                 reservations,
                 state.time,
                 speed=self.specs[drone.drone_type].max_speed,
+                reservation_radius=TRACKING_RESERVATION_RADIUS,
             )
             plan = planner.plan(drone.position, planning_target)
             if plan is None:
@@ -1213,9 +1249,14 @@ class SwarmController(BaseSwarmController):
             else:
                 self.aging[drone.id] = max(0, self.aging.get(drone.id, 0) - 1)
             routes[drone.id] = plan
-            prediction = self._predict_route(drone, plan, state.time, 3.0)
+            prediction = self._predict_route(drone, plan, state.time, PREDICTION_HORIZON)
             self.predictions[drone.id] = prediction
-            reservations.extend(reservation_segments(_coarsen_trajectory(prediction)))
+            reservations.extend(
+                reservation_segments(
+                    _coarsen_trajectory(prediction),
+                    radius=TRACKING_RESERVATION_RADIUS,
+                )
+            )
         return routes
 
     def _predict_route(
@@ -1229,7 +1270,7 @@ class SwarmController(BaseSwarmController):
         samples = [(now, dynamic.position[0], dynamic.position[1])]
         for index in range(round(horizon / 0.05)):
             timestamp = now + index * 0.05
-            target, hold = self._plan_target(plan, timestamp)
+            target, hold, arrival_time = self._plan_target_details(plan, timestamp)
             command = self._steer(
                 DroneSnapshot(
                     drone.id,
@@ -1242,6 +1283,8 @@ class SwarmController(BaseSwarmController):
                 ),
                 target,
                 hold=hold,
+                timestamp=timestamp,
+                arrival_time=arrival_time,
             )
             dynamic = advance_dynamics(dynamic, command, self.specs[drone.drone_type], 0.05)
             samples.append((timestamp + 0.05, dynamic.position[0], dynamic.position[1]))
@@ -1249,15 +1292,20 @@ class SwarmController(BaseSwarmController):
 
     @staticmethod
     def _plan_target(plan: SippPlan, timestamp: float) -> tuple[Vec2, bool]:
+        target, hold, _ = SwarmController._plan_target_details(plan, timestamp)
+        return target, hold
+
+    @staticmethod
+    def _plan_target_details(plan: SippPlan, timestamp: float) -> tuple[Vec2, bool, float | None]:
         points = plan.points
         for index in range(1, len(points)):
             if timestamp <= points[index].time + EPS:
                 previous = points[index - 1]
                 if points[index].time - previous.time > MERGE_EPS and _distance(previous.position, points[index].position) > EPS:
                     if timestamp < points[index].time - MERGE_EPS:
-                        return points[index].position, False
-                return previous.position, True
-        return points[-1].position, True
+                        return points[index].position, False, points[index].time
+                return previous.position, True, None
+        return points[-1].position, True, None
 
     def _emergency_guard(self, drone: DroneSnapshot, command: Vec2, state: GameState, priority: float) -> Vec2:
         for friend in state.own_drones:
@@ -1268,7 +1316,11 @@ class SwarmController(BaseSwarmController):
             own_prediction = self.predictions.get(drone.id)
             friend_prediction = self.predictions.get(friend.id)
             if own_prediction and friend_prediction:
-                samples = min(len(own_prediction), len(friend_prediction), round(1.5 / PHYSICS_DT) + 1)
+                samples = min(
+                    len(own_prediction),
+                    len(friend_prediction),
+                    round(EMERGENCY_GUARD_HORIZON / PHYSICS_DT) + 1,
+                )
                 predicted_miss = min(
                     hypot(
                         own_prediction[index][1] - friend_prediction[index][1],
@@ -1316,7 +1368,7 @@ class SwarmController(BaseSwarmController):
         for drone in active:
             plan = self.plans.get(drone.id)
             if plan is not None:
-                self.predictions[drone.id] = self._predict_route(drone, plan, state.time, 3.0)
+                self.predictions[drone.id] = self._predict_route(drone, plan, state.time, PREDICTION_HORIZON)
         self.fire_control.observe(state)
         vehicle_tracks = None
         if any(
@@ -1349,8 +1401,14 @@ class SwarmController(BaseSwarmController):
             if plan is None:
                 command = self._steer(drone, self._destination(drone, state))
             else:
-                target, hold = self._plan_target(plan, state.time)
-                command = self._steer(drone, target, hold=hold)
+                target, hold, arrival_time = self._plan_target_details(plan, state.time)
+                command = self._steer(
+                    drone,
+                    target,
+                    hold=hold,
+                    timestamp=state.time,
+                    arrival_time=arrival_time,
+                )
             command = self._emergency_guard(drone, command, state, self._priority(drone, state))
             if drone.drone_type is DroneType.TANK and drone.id == fire_tank_id:
                 fire_direction = self.fire_control.choose_fire(drone, state, self.predictions, vehicle_tracks)
