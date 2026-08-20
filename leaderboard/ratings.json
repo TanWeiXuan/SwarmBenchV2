@@ -227,6 +227,20 @@
     {
       "author": "renj1ete0",
       "built_in": false,
+      "controller_id": "renj1ete0/gemini_3_1_pro_v1",
+      "deviation": 35.37743646754581,
+      "display_name": "Gemini 3 1 Pro V1",
+      "draws": 0,
+      "games": 0,
+      "losses": 0,
+      "rating": 1916.8457532051668,
+      "version_sha": "a66837507c0d3c45dbc1f155eb395a74529cb21c",
+      "volatility": 0.06000142024919519,
+      "wins": 0
+    },
+    {
+      "author": "renj1ete0",
+      "built_in": false,
       "controller_id": "renj1ete0/opus_5_v1",
       "deviation": 28.59689266572155,
       "display_name": "Opus 5 V1",
