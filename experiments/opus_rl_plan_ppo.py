@@ -37,6 +37,8 @@ EXPERIMENT_DIR = ROOT / ".rl_local" / "ppo"
 OBSERVATION_SIZE = 38
 ACTION_COUNT = 6
 DECISION_INTERVAL = 2.0
+VALIDATION_SEEDS = (9_100_019, 9_100_057)
+VALIDATION_OPPONENTS = ("opus", "breaker", "sipp", "mpc", "wayfinder", "potential", "greedy", "bigpickle")
 
 OPPONENTS = {
     "opus": ROOT / "submissions" / "renj1ete0" / "opus_5_v1.py",
@@ -326,8 +328,407 @@ def collect_jobs(jobs: list[RolloutJob], workers: int) -> tuple[list[EpisodeResu
     return results, time.perf_counter() - started
 
 
+def collect_with_pool(pool: ProcessPoolExecutor, jobs: list[RolloutJob]) -> tuple[list[EpisodeResult], float]:
+    started = time.perf_counter()
+    futures = [pool.submit(run_rollout_job, job) for job in jobs]
+    results = [future.result() for future in as_completed(futures)]
+    return results, time.perf_counter() - started
+
+
 def _frozen_state(model: ActorCritic) -> dict[str, torch.Tensor]:
     return {name: value.detach().cpu().clone() for name, value in model.state_dict().items()}
+
+
+@dataclass(frozen=True)
+class PPOConfig:
+    seed: int = 82_002
+    workers: int = 6
+    episodes_per_iteration: int = 30
+    iterations: int = 20
+    duration: float = DEFAULT_MATCH_DURATION
+    gamma: float = 0.995
+    gae_lambda: float = 0.95
+    clip_epsilon: float = 0.2
+    update_epochs: int = 6
+    minibatch_size: int = 256
+    learning_rate: float = 2.5e-4
+    entropy_coefficient: float = 0.02
+    value_coefficient: float = 0.5
+    max_gradient_norm: float = 0.5
+    target_kl: float = 0.03
+    reward_kind: str = "terminal"
+    validation_interval: int = 5
+
+
+TRAINING_OPPONENT_WEIGHTS = (
+    ("opus", 4),
+    ("breaker", 4),
+    ("sipp", 2),
+    ("mpc", 2),
+    ("wayfinder", 2),
+    ("potential", 2),
+    ("greedy", 2),
+    ("bigpickle", 1),
+    ("aegis", 1),
+    ("assignment", 1),
+    ("rush", 1),
+    ("defend", 1),
+    ("convoy", 1),
+    ("marksman", 1),
+)
+
+
+def _training_opponents() -> list[str]:
+    return [name for name, weight in TRAINING_OPPONENT_WEIGHTS for _ in range(weight)]
+
+
+def _training_jobs(config: PPOConfig, model: ActorCritic, iteration: int, rng: random.Random) -> list[RolloutJob]:
+    state = _frozen_state(model)
+    opponents = _training_opponents()
+    jobs = []
+    for index in range(config.episodes_per_iteration):
+        # Reserve the compact, published validation range completely.
+        seed = rng.randrange(1_000_000, 9_000_000)
+        jobs.append(
+            RolloutJob(
+                seed=seed,
+                side="A" if (index + iteration) % 2 == 0 else "B",
+                opponent=rng.choice(opponents),
+                policy_version=iteration,
+                policy_state=state,
+                stochastic=True,
+                reward_kind=config.reward_kind,
+                duration=config.duration,
+            )
+        )
+    return jobs
+
+
+def _validation_jobs(model: ActorCritic, policy_version: int, duration: float, seeds=VALIDATION_SEEDS, opponents=VALIDATION_OPPONENTS):
+    state = _frozen_state(model)
+    return [
+        RolloutJob(
+            seed=seed,
+            side=side,
+            opponent=opponent,
+            policy_version=policy_version,
+            policy_state=state,
+            stochastic=False,
+            reward_kind="terminal",
+            duration=duration,
+        )
+        for opponent in opponents
+        for seed in seeds
+        for side in ("A", "B")
+    ]
+
+
+def compute_gae(episodes: list[EpisodeResult], gamma: float, gae_lambda: float):
+    observations: list[list[float]] = []
+    actions: list[int] = []
+    old_log_probs: list[float] = []
+    old_values: list[float] = []
+    advantages: list[float] = []
+    returns: list[float] = []
+    for episode in episodes:
+        episode_advantages = [0.0] * episode.transitions
+        gae = 0.0
+        next_value = 0.0
+        for index in range(episode.transitions - 1, -1, -1):
+            nonterminal = 0.0 if episode.dones[index] else 1.0
+            delta = episode.rewards[index] + gamma * next_value * nonterminal - episode.old_values[index]
+            gae = delta + gamma * gae_lambda * nonterminal * gae
+            episode_advantages[index] = gae
+            next_value = episode.old_values[index]
+        observations.extend(episode.observations)
+        actions.extend(episode.actions)
+        old_log_probs.extend(episode.old_log_probs)
+        old_values.extend(episode.old_values)
+        advantages.extend(episode_advantages)
+        returns.extend(advantage + value for advantage, value in zip(episode_advantages, episode.old_values))
+    return {
+        "observations": torch.tensor(observations, dtype=torch.float32),
+        "actions": torch.tensor(actions, dtype=torch.long),
+        "old_log_probs": torch.tensor(old_log_probs, dtype=torch.float32),
+        "old_values": torch.tensor(old_values, dtype=torch.float32),
+        "advantages": torch.tensor(advantages, dtype=torch.float32),
+        "returns": torch.tensor(returns, dtype=torch.float32),
+    }
+
+
+def explained_variance(predictions: torch.Tensor, targets: torch.Tensor) -> float:
+    variance = torch.var(targets, unbiased=False)
+    if float(variance) < 1.0e-12:
+        return 0.0
+    return float(1.0 - torch.var(targets - predictions, unbiased=False) / variance)
+
+
+def ppo_update(model: ActorCritic, optimizer: torch.optim.Optimizer, batch, config: PPOConfig, generator: torch.Generator):
+    advantages = batch["advantages"]
+    advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1.0e-8)
+    count = len(advantages)
+    summaries = []
+    epochs_completed = 0
+    started = time.perf_counter()
+    for epoch in range(config.update_epochs):
+        permutation = torch.randperm(count, generator=generator)
+        epoch_kls = []
+        for start in range(0, count, config.minibatch_size):
+            indices = permutation[start:start + config.minibatch_size]
+            logits, values = model(batch["observations"][indices])
+            distribution = torch.distributions.Categorical(logits=logits)
+            new_log_probs = distribution.log_prob(batch["actions"][indices])
+            log_ratio = new_log_probs - batch["old_log_probs"][indices]
+            ratio = log_ratio.exp()
+            mb_advantages = advantages[indices]
+            unclipped = ratio * mb_advantages
+            clipped = torch.clamp(ratio, 1.0 - config.clip_epsilon, 1.0 + config.clip_epsilon) * mb_advantages
+            actor_loss = -torch.minimum(unclipped, clipped).mean()
+            critic_loss = 0.5 * (values - batch["returns"][indices]).square().mean()
+            entropy = distribution.entropy().mean()
+            loss = actor_loss + config.value_coefficient * critic_loss - config.entropy_coefficient * entropy
+
+            optimizer.zero_grad()
+            loss.backward()
+            gradient_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_gradient_norm)
+            optimizer.step()
+            with torch.no_grad():
+                approximate_kl = ((ratio - 1.0) - log_ratio).mean()
+                clip_fraction = ((ratio - 1.0).abs() > config.clip_epsilon).float().mean()
+            value = float(approximate_kl)
+            epoch_kls.append(value)
+            summaries.append(
+                {
+                    "actor_loss": float(actor_loss.detach()),
+                    "critic_loss": float(critic_loss.detach()),
+                    "entropy": float(entropy.detach()),
+                    "total_loss": float(loss.detach()),
+                    "approximate_kl": value,
+                    "clip_fraction": float(clip_fraction),
+                    "gradient_norm": float(gradient_norm),
+                }
+            )
+        epochs_completed = epoch + 1
+        if statistics.fmean(epoch_kls) > config.target_kl:
+            break
+    keys = summaries[0]
+    metrics = {key: statistics.fmean(item[key] for item in summaries) for key in keys}
+    metrics.update(
+        {
+            "epochs_completed": epochs_completed,
+            "optimization_seconds": time.perf_counter() - started,
+            "explained_variance_before": explained_variance(batch["old_values"], batch["returns"]),
+        }
+    )
+    return metrics
+
+
+def summarize_episodes(episodes: list[EpisodeResult]) -> dict[str, Any]:
+    outcomes = [episode.outcome for episode in episodes]
+    differences = [episode.score_for - episode.score_against for episode in episodes]
+    action_counts = Counter()
+    for episode in episodes:
+        action_counts.update(episode.action_counts)
+    total_actions = sum(action_counts.values())
+    return {
+        "matches": len(episodes),
+        "wins": sum(value > 0 for value in outcomes),
+        "draws": sum(value == 0 for value in outcomes),
+        "losses": sum(value < 0 for value in outcomes),
+        "match_points": sum(1.0 if value > 0 else 0.5 if value == 0 else 0.0 for value in outcomes),
+        "mean_score_difference": statistics.fmean(differences),
+        "median_score_difference": statistics.median(differences),
+        "decisions": total_actions,
+        "action_frequencies": {str(index): action_counts[index] / max(1, total_actions) for index in range(ACTION_COUNT)},
+        "mode_switches": sum(episode.mode_switches for episode in episodes),
+        "switches_per_match": statistics.fmean(episode.mode_switches for episode in episodes),
+        "policy_inference_seconds": sum(episode.inference_seconds for episode in episodes),
+    }
+
+
+def validation_details(episodes: list[EpisodeResult]) -> dict[str, Any]:
+    summary = summarize_episodes(episodes)
+    summary["by_opponent"] = {
+        opponent: summarize_episodes([episode for episode in episodes if episode.opponent == opponent])
+        for opponent in sorted({episode.opponent for episode in episodes})
+    }
+    summary["by_side"] = {
+        side: summarize_episodes([episode for episode in episodes if episode.side == side])
+        for side in ("A", "B")
+    }
+    return summary
+
+
+def _checkpoint_payload(model, optimizer, config, iteration, total_decisions, total_matches, rng, best_validation):
+    return {
+        "schema": "opus-rl-plan-ppo-v1",
+        "model_state": model.state_dict(),
+        "optimizer_state": optimizer.state_dict(),
+        "config": asdict(config),
+        "iteration": iteration,
+        "total_decisions": total_decisions,
+        "total_matches": total_matches,
+        "python_rng_state": rng.getstate(),
+        "torch_rng_state": torch.get_rng_state(),
+        "best_validation": best_validation,
+        "observation_normalization": "fixed_physical_scaling",
+    }
+
+
+def atomic_torch_save(payload, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    torch.save(payload, temporary)
+    temporary.replace(path)
+
+
+def _append_metric(path: Path, metric: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(metric, sort_keys=True) + "\n")
+
+
+def _validation_key(summary: dict[str, Any]) -> tuple[float, float]:
+    return float(summary["match_points"]), float(summary["mean_score_difference"])
+
+
+def train_ppo(args) -> None:
+    config = PPOConfig(
+        seed=args.seed,
+        workers=args.workers,
+        episodes_per_iteration=args.episodes,
+        iterations=args.iterations,
+        duration=args.duration,
+        gamma=args.gamma,
+        gae_lambda=args.gae_lambda,
+        clip_epsilon=args.clip,
+        update_epochs=args.epochs,
+        minibatch_size=args.minibatch,
+        learning_rate=args.learning_rate,
+        entropy_coefficient=args.entropy,
+        value_coefficient=args.value_coefficient,
+        max_gradient_norm=args.max_gradient_norm,
+        target_kl=args.target_kl,
+        reward_kind=args.reward,
+        validation_interval=args.validation_interval,
+    )
+    run_dir = EXPERIMENT_DIR / args.run_name
+    checkpoint_path = run_dir / "latest.pt"
+    metrics_path = run_dir / "metrics.jsonl"
+    torch.set_num_threads(1)
+    torch.manual_seed(config.seed)
+    model = ActorCritic()
+    optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate, eps=1.0e-5)
+    rng = random.Random(config.seed)
+    update_generator = torch.Generator().manual_seed(config.seed + 1)
+    start_iteration = 0
+    total_decisions = 0
+    total_matches = 0
+    best_validation = None
+    if args.resume:
+        checkpoint = torch.load(Path(args.resume), map_location="cpu", weights_only=False)
+        model.load_state_dict(checkpoint["model_state"])
+        optimizer.load_state_dict(checkpoint["optimizer_state"])
+        start_iteration = int(checkpoint["iteration"])
+        total_decisions = int(checkpoint["total_decisions"])
+        total_matches = int(checkpoint["total_matches"])
+        rng.setstate(checkpoint["python_rng_state"])
+        torch.set_rng_state(checkpoint["torch_rng_state"])
+        best_validation = checkpoint.get("best_validation")
+
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "config.json").write_text(json.dumps(asdict(config), indent=2, sort_keys=True), encoding="utf-8")
+    with ProcessPoolExecutor(max_workers=config.workers) as pool:
+        for iteration in range(start_iteration, config.iterations):
+            iteration_started = time.perf_counter()
+            jobs = _training_jobs(config, model, iteration, rng)
+            episodes, rollout_seconds = collect_with_pool(pool, jobs)
+            if any(episode.policy_version != iteration for episode in episodes):
+                raise RuntimeError("stale policy trajectory detected")
+            batch = compute_gae(episodes, config.gamma, config.gae_lambda)
+            update_metrics = ppo_update(model, optimizer, batch, config, update_generator)
+            total_decisions += sum(episode.transitions for episode in episodes)
+            total_matches += len(episodes)
+            total_seconds = time.perf_counter() - iteration_started
+            metric = {
+                "iteration": iteration + 1,
+                "policy_version": iteration,
+                "total_decisions": total_decisions,
+                "total_matches": total_matches,
+                "rollout_seconds": rollout_seconds,
+                "matches_per_second": len(episodes) / rollout_seconds,
+                "decisions_per_second": sum(episode.transitions for episode in episodes) / rollout_seconds,
+                "optimization_fraction": update_metrics["optimization_seconds"] / total_seconds,
+                "collection_fraction": rollout_seconds / total_seconds,
+                "workers": config.workers,
+                "controller_subprocesses": 0,
+                "serialization_checkpoint_seconds": 0.0,
+                "training": summarize_episodes(episodes),
+                "ppo": update_metrics,
+                "jobs": [{"seed": job.seed, "side": job.side, "opponent": job.opponent} for job in jobs],
+            }
+            if (iteration + 1) % config.validation_interval == 0 or iteration + 1 == config.iterations:
+                validation_episodes, validation_seconds = collect_with_pool(
+                    pool,
+                    _validation_jobs(model, iteration + 1, config.duration),
+                )
+                validation = validation_details(validation_episodes)
+                validation["wall_seconds"] = validation_seconds
+                metric["validation"] = validation
+                if best_validation is None or _validation_key(validation) > tuple(best_validation["key"]):
+                    best_validation = {"iteration": iteration + 1, "key": list(_validation_key(validation)), "summary": validation}
+                    atomic_torch_save(
+                        _checkpoint_payload(model, optimizer, config, iteration + 1, total_decisions, total_matches, rng, best_validation),
+                        run_dir / "best.pt",
+                    )
+            checkpoint_started = time.perf_counter()
+            atomic_torch_save(
+                _checkpoint_payload(model, optimizer, config, iteration + 1, total_decisions, total_matches, rng, best_validation),
+                checkpoint_path,
+            )
+            metric["serialization_checkpoint_seconds"] = time.perf_counter() - checkpoint_started
+            _append_metric(metrics_path, metric)
+            compact = {
+                "iteration": metric["iteration"],
+                "WDL": [metric["training"][key] for key in ("wins", "draws", "losses")],
+                "reward": config.reward_kind,
+                "mps": round(metric["matches_per_second"], 3),
+                "dps": round(metric["decisions_per_second"], 2),
+                "entropy": round(metric["ppo"]["entropy"], 3),
+                "kl": round(metric["ppo"]["approximate_kl"], 5),
+                "value_ev": round(metric["ppo"]["explained_variance_before"], 3),
+                "validation": metric.get("validation", {}).get("match_points"),
+            }
+            print(json.dumps(compact, sort_keys=True), flush=True)
+
+
+def evaluate_checkpoint(args) -> None:
+    checkpoint = torch.load(Path(args.checkpoint), map_location="cpu", weights_only=False)
+    model = ActorCritic()
+    model.load_state_dict(checkpoint["model_state"])
+    jobs = _validation_jobs(
+        model,
+        int(checkpoint["iteration"]),
+        args.duration,
+        seeds=tuple(args.seeds),
+        opponents=tuple(args.opponents),
+    )
+    episodes, elapsed = collect_jobs(jobs, args.workers)
+    summary = validation_details(episodes)
+    summary.update(
+        {
+            "checkpoint": str(Path(args.checkpoint)),
+            "policy_version": int(checkpoint["iteration"]),
+            "wall_seconds": elapsed,
+            "matches_per_second": len(episodes) / elapsed,
+            "decisions_per_second": sum(episode.transitions for episode in episodes) / elapsed,
+        }
+    )
+    print(json.dumps(summary, indent=2, sort_keys=True))
+    if args.output:
+        path = Path(args.output)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
 
 
 def benchmark_workers(args) -> None:
@@ -399,6 +800,37 @@ def build_parser() -> argparse.ArgumentParser:
     verify.add_argument("--seed", type=int, default=42)
     verify.add_argument("--duration", type=float, default=90.0)
     verify.set_defaults(function=verify_direct)
+
+    train = subparsers.add_parser("train")
+    train.add_argument("--run-name", required=True)
+    train.add_argument("--seed", type=int, default=PPOConfig.seed)
+    train.add_argument("--workers", type=int, default=PPOConfig.workers)
+    train.add_argument("--episodes", type=int, default=PPOConfig.episodes_per_iteration)
+    train.add_argument("--iterations", type=int, default=PPOConfig.iterations)
+    train.add_argument("--duration", type=float, default=PPOConfig.duration)
+    train.add_argument("--gamma", type=float, default=PPOConfig.gamma)
+    train.add_argument("--gae-lambda", type=float, default=PPOConfig.gae_lambda)
+    train.add_argument("--clip", type=float, default=PPOConfig.clip_epsilon)
+    train.add_argument("--epochs", type=int, default=PPOConfig.update_epochs)
+    train.add_argument("--minibatch", type=int, default=PPOConfig.minibatch_size)
+    train.add_argument("--learning-rate", type=float, default=PPOConfig.learning_rate)
+    train.add_argument("--entropy", type=float, default=PPOConfig.entropy_coefficient)
+    train.add_argument("--value-coefficient", type=float, default=PPOConfig.value_coefficient)
+    train.add_argument("--max-gradient-norm", type=float, default=PPOConfig.max_gradient_norm)
+    train.add_argument("--target-kl", type=float, default=PPOConfig.target_kl)
+    train.add_argument("--reward", choices=("terminal", "score_potential"), default=PPOConfig.reward_kind)
+    train.add_argument("--validation-interval", type=int, default=PPOConfig.validation_interval)
+    train.add_argument("--resume")
+    train.set_defaults(function=train_ppo)
+
+    evaluate = subparsers.add_parser("evaluate")
+    evaluate.add_argument("--checkpoint", required=True)
+    evaluate.add_argument("--workers", type=int, default=PPOConfig.workers)
+    evaluate.add_argument("--duration", type=float, default=DEFAULT_MATCH_DURATION)
+    evaluate.add_argument("--seeds", nargs="+", type=int, required=True)
+    evaluate.add_argument("--opponents", nargs="+", choices=OPPONENTS, required=True)
+    evaluate.add_argument("--output")
+    evaluate.set_defaults(function=evaluate_checkpoint)
     return parser
 
 
