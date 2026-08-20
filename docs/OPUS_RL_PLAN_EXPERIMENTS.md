@@ -157,7 +157,7 @@ The pure-Python export matched PyTorch logits to under 9e-9 on a numerical
 check and exactly matched its checkpoint's per-opponent outcomes on a separate
 16-game unseen equivalence schedule. No critic or training runtime is shipped.
 
-## Recommended next experiment
+## Experiment 2 recommended next experiment
 
 Before expanding the action space or learning targets, evaluate mode 4 against
 PPO on a much larger direct Opus/SIPP-heavy schedule and inspect states where
@@ -165,3 +165,188 @@ the actor chooses mode 5. If those decisions still never change outcomes, ship
 the simpler constant allocation or use state-restorable short-horizon
 counterfactuals to label only high-leverage decision states. Pairwise target
 scoring, recurrence, and end-to-end control remain unjustified.
+
+## Experiment 3: dynamic scout roles and learned targets
+
+Experiment 3 replaces the six-profile action with effective per-scout duties.
+It preserves the shipped controller and all Experiment 1/2 evidence; the
+research implementation is `experiments/opus_rl_plan_dynamic.py`. No
+Experiment 3 actor was exported into the submission because no checkpoint met
+the acceptance criteria below.
+
+### Representation and action
+
+The v2 actor-critic has 28,432 parameters. It uses:
+
+- the original 32 global features plus maximum friendly/enemy transport
+  progress, nearest enemy-scout and loaded-tank distance to a friendly
+  transport, and normalized guard/block opportunity counts (38 total);
+- a shared `14 -> 24 -> 16` live-drone encoder;
+- separate friendly/enemy mean and count-normalized-sum pooling, with no
+  padding;
+- a `102 -> 64 -> 48 -> 48 -> 48` global context encoder (the last two
+  48-wide layers are the larger-model experiment);
+- a shared per-scout role head receiving context, the scout embedding,
+  previous role, role duration, and current assignment counts;
+- a shared pairwise target head receiving context, scout embedding, target
+  entity features, relative geometry/velocity, distance/intercept proxy,
+  route/goal progress, value, ammunition, and ward geometry;
+- a centralized critic used only during training.
+
+The six roles are RUN, HUNT_TRANSPORT, HUNT_TANK, GUARD_TRANSPORT, KEEP, and
+BLOCK. Roles and targets are chosen autoregressively in sorted live-scout
+order. Occupied targets are removed from later masks. Impossible roles are
+masked. Raw IDs are used only as stable ordering/re-resolution keys and never
+as neural features. The whole assignment log probability is the sum of its
+sampled role and learned-target factors.
+
+Only active drones enter the set encoder, so random initial counts and deaths
+do not change tensor dimensions. Empty team sets pool to zero. The actor loops
+over the current live scout tuple; a dead/scored scout simply disappears at
+the next decision. Survival features continue to use the arena's sampled
+initial counts. If a selected target dies, the stable key cannot resolve and
+the deterministic skill safely falls back to RUN until reassignment. A valid
+zero-scout behavior-clone minibatch has no actor factor and is skipped rather
+than treated as an error.
+
+The actor runs every 1.0 simulated second. Low-level Opus path planning,
+interception, obstacle/collision/projectile avoidance, jerk limiting, tank
+movement, and gunnery remain deterministic.
+
+### PPO and league
+
+PPO uses terminal win/draw/loss reward, gamma 0.995, GAE lambda 0.95, clip 0.2,
+four epochs, minibatch 64, Adam 1e-4, entropy coefficient 0.01, value
+coefficient 0.5, gradient cap 0.5, and target KL 0.02. Each update contains 18
+complete matches from a frozen actor snapshot. Checkpoints include optimizer,
+RNG, opponent-league, and best-validation state and support resume.
+
+The adaptive league discovers every current submission plus built-ins. It
+retains 25% uniform sampling and weights the rest by learner losses, parity,
+rating, and a hard-field bonus. After early runs wasted matches on solved
+opponents, the initial hard-field mass was raised to 45.1%, split approximately
+equally across Opus, Breaker, GPT-5.3-Codex, Gemini 3.1 Pro, Sonnet 5 V3,
+SIPP/Marksman, and fixed mode 4. This change followed measured matchup results;
+no opponent identity is an actor input.
+
+### Effective-action instrumentation and ablations
+
+Every diagnostic rollout records selected roles/targets, resolved duties,
+duty and target changes, role duration, commands differing from a simultaneous
+fixed-mode-4 shadow, score timelines, simulator events, surviving value, and
+tank ammunition. Exact recorded-action replay is tested.
+
+The implemented evaluation ablations are:
+
+- full dynamic roles and learned targets;
+- freeze the first assignments for the match;
+- explicit all-RUN (the learned most-common static action);
+- dynamic learned roles with the old deterministic intercept-time target
+  ranking;
+- direct fixed mode 4 as an opponent/baseline.
+
+### Throughput
+
+The v2 12-match, 30-second benchmark retained six workers:
+
+| Workers | Matches/s | Decisions/s | Mean inference |
+| ---: | ---: | ---: | ---: |
+| 1 | 0.766 | 22.98 | 2.15 ms |
+| 2 | 0.837 | 25.11 | 3.22 ms |
+| 4 | 1.293 | 38.80 | 4.35 ms |
+| 6 | **1.404** | **42.12** | 4.95 ms |
+| 8 | 1.355 | 40.66 | 4.14 ms |
+| 12 | 1.313 | 39.38 | 5.80 ms |
+
+Optimization was about 3-6% of wall time in representative runs. Greedy
+evaluation of the trained checkpoint averaged about 2.1-2.3 ms per tactical
+decision, with no invalid actions or controller subprocesses.
+
+### Initialization and failed variants
+
+Fixed mode 4 produces highly imbalanced labels. Twelve-match clones contained
+only about 3% GUARD labels. Unweighted, weight-5, weight-10, weight-14, and
+weight-17 clones selected RUN for every scout. Weight 20/30 crossed an abrupt
+threshold, guarded 19% of decisions, changed duties about 21-31 times per
+match, and lost badly. Class weighting alone was therefore not a useful
+12-match solution.
+
+The retained bootstrap uses 60 teacher matches, eight epochs, GUARD weight 5,
+and independent seeds. It learned conditional guards instead of a global
+prior: representative training confusion was 220/384 true guards with 112
+false guards among 10,502 RUN labels. The three independent clones had
+94.5-95.2% exact full-assignment accuracy.
+
+Three terminal-PPO seeds from the larger clones were screened on ten fresh
+seeds, both sides, against Opus, Breaker, and fixed mode 4:
+
+| PPO seed | Points / 60 | Guard frequency | Duty changes/match |
+| ---: | ---: | ---: | ---: |
+| 1 | 31.5 | 4.23% | 5.45 |
+| 2 | 29.5 | 1.34% | 1.57 |
+| 3 | 29.0 | 2.71% | 4.02 |
+
+All deterministic actors remained RUN/GUARD-only. A training-only temperature
+of 1.5 roughly doubled entropy and sampled HUNT/KEEP/BLOCK about 2.4% of the
+time, but terminal validation stayed at 20/28. Bounded score-potential shaping
+with that temperature reached 27/28 on the small internal validation yet only
+29/60 on the fresh screen and reverted to 98.6% RUN. Both were rejected.
+
+The missing target initialization was then corrected. Behavior cloning kept
+the fixed-mode role teacher but added a target-only auxiliary loss that teaches
+the pairwise head the proven deterministic intercept ranking for every
+multi-candidate HUNT_TRANSPORT, HUNT_TANK, GUARD, and BLOCK set. It does not
+supply role labels, although its gradients also adapt the shared entity/context
+features. Runs performed 527-560 such minibatch updates.
+
+Target-pretrained PPO results on the same fresh screen were:
+
+| Seed | All | vs Opus | vs Breaker | vs fixed mode 4 |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 35.5/60 | 12.0/20 | 13.0/20 | 10.5/20 |
+| 2 | 30.0/60 | 10.0/20 | 11.0/20 | 9.0/20 |
+| 3 | 32.0/60 | 11.0/20 | 13.5/20 | 7.5/20 |
+| Combined | 97.5/180 | 33.0/60 | 37.5/60 | 27.0/60 |
+
+The method therefore replicated an Opus gain on this small screen (55% across
+seeds), but not a fixed-mode-4 gain. Seed 1 was the only checkpoint to beat all
+three. Its same-seed ablations were full 35.5/60, old targets 34.0/60, and
+freeze/all-RUN 29.0/60. Dynamic timing added 6.5 points and learned targeting
+added 1.5 points on that schedule, establishing consequential actions rather
+than nominal switching.
+
+### Larger evidence gate and conclusion
+
+The best seed-1 checkpoint was then tested on 50 new seeds, both sides (100
+games per opponent, 300 total):
+
+| Opponent | W-D-L | Points | Point rate | Paired-seed 95% CI | Mean diff |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Opus | 37-10-53 | 42.0 | 42.0% | 29.3-54.7% | -0.57 |
+| Opus Breaker | 59-12-29 | 65.0 | 65.0% | 53.1-76.9% | +1.62 |
+| fixed mode 4 | 32-47-21 | 55.5 | 55.5% | 49.0-62.0% | +0.65 |
+| Total | 128-69-103 | 162.5/300 | 54.2% | - | +0.57 |
+
+Side results were balanced (61-35-54 as A and 67-34-49 as B). The actor used
+RUN 98.05% and GUARD 1.95%, with 2.56 duty/target changes and 6.76 scout-command
+differences from mode 4 per match. Among the 63 Opus losses/draws, there were
+only three obstacle crashes; the dominant events were ordinary vehicle
+collisions and projectile trades, not invalid actions or path-planning failure.
+
+On the identical 100 Opus games, freeze/all-RUN scored 45.0 points, old targets
+43.5, and the full policy 42.0. Both learned guard timing and target choice hurt
+the Opus matchup on the larger schedule. The earlier 12-8 screen was sampling
+noise.
+
+Experiment 3 therefore does **not** satisfy the controller acceptance criteria.
+It proves that the variable-set/factorized implementation can learn and execute
+state-dependent assignments, and one checkpoint beats Breaker and fixed mode 4
+with useful dynamic/target ablations. It does not convincingly beat Opus, and
+the best result does not replicate against fixed mode 4 across training seeds.
+No 250-seed claim, pure-Python export, or submission replacement was made.
+
+The next evidence-supported experiment is state-restorable counterfactual
+labeling of the relatively rare pursuer states: compare RUN versus each
+feasible GUARD target over a short rollout, then train the existing small head
+on measured advantages. More PPO epochs, higher entropy, score shaping, a GRU,
+Transformers, and end-to-end control are not justified by these results.
