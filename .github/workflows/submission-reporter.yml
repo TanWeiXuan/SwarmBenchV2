@@ -74,7 +74,7 @@ jobs:
           path: reporter-artifact
           run-id: ${{ github.event.workflow_run.id }}
           github-token: ${{ github.token }}
-      - name: Update sticky progress and enable auto-merge
+      - name: Update sticky progress and automatically merge
         if: ${{ steps.submission.outputs.pr_number }}
         uses: actions/github-script@v7
         env:
@@ -120,29 +120,27 @@ jobs:
                 }
               }
             }
-            let mergeNote = '⏳ Auto-merge';
+            let mergeNote = '⏳ Automatic merge';
             if (run.status === 'completed' && run.conclusion === 'success') {
               try {
                 const {data: pull} = await github.rest.pulls.get({...context.repo, pull_number: prNumber});
-                if (pull.draft) {
-                  await github.graphql(`mutation($id: ID!) { markPullRequestReadyForReview(input: {pullRequestId: $id}) { clientMutationId } }`, {id: pull.node_id});
-                }
-                try {
-                  await github.graphql(`mutation($id: ID!) { enablePullRequestAutoMerge(input: {pullRequestId: $id, mergeMethod: SQUASH}) { clientMutationId } }`, {id: pull.node_id});
-                  mergeNote = pull.draft ? '✅ Marked ready and enabled auto-merge' : '✅ Auto-merge enabled';
-                } catch (error) {
-                  if (!error.message.includes('clean status')) throw error;
+                if (pull.head.sha !== run.head_sha) {
+                  mergeNote = '⏳ Validation result is stale; waiting for the latest commit';
+                } else {
+                  if (pull.draft) {
+                    await github.graphql(`mutation($id: ID!) { markPullRequestReadyForReview(input: {pullRequestId: $id}) { clientMutationId } }`, {id: pull.node_id});
+                  }
                   const {data: merge} = await github.rest.pulls.merge({
-                    ...context.repo, pull_number: prNumber, sha: pull.head.sha, merge_method: 'squash'
+                    ...context.repo, pull_number: prNumber, sha: run.head_sha, merge_method: 'squash'
                   });
                   if (!merge.merged) throw new Error(merge.message || 'merge was rejected');
                   mergeNote = pull.draft ? '✅ Marked ready and merged' : '✅ Merged';
                 }
               } catch (error) {
-                mergeNote = `⚠️ Validation passed; auto-merge could not be enabled (${error.message})`;
+                mergeNote = `⚠️ Validation passed; automatic merge failed (${error.message})`;
               }
             } else if (run.status === 'completed') {
-              mergeNote = '❌ Auto-merge blocked by validation';
+              mergeNote = '❌ Automatic merge blocked by validation';
             }
             body += `${mergeNote}\n\n[Validation run](${run.html_url})`;
             const {data: comments} = await github.rest.issues.listComments({...context.repo, issue_number: prNumber, per_page: 100});
