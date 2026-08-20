@@ -1406,7 +1406,12 @@ class AdaptiveOpponentLeague:
             strength = (self.ratings[name] - rating_low) / max(
                 1.0, rating_high - rating_low
             )
-            hard_bonus = 0.5 if name in HARD_OPPONENTS or name == "fixed_mode_4" else 0.0
+            # Early runs spent too many matches on already-solved opponents;
+            # keep broad 25% uniform coverage but focus the adaptive share on
+            # the current top field and the fixed-mode-4 tactical baseline.
+            hard_bonus = (
+                2.5 if name in HARD_OPPONENTS or name == "fixed_mode_4" else 0.0
+            )
             usefulness[name] = (
                 0.25
                 + 1.5 * learner_loss_rate
@@ -1995,6 +2000,7 @@ def behavior_clone_mode4(args) -> None:
     role_class_weights[GUARD_TRANSPORT] = args.guard_weight
     update_generator = torch.Generator().manual_seed(args.seed + 1)
     losses = []
+    skipped_empty_minibatches = 0
     started = time.perf_counter()
     for _epoch in range(args.epochs):
         permutation = torch.randperm(len(records), generator=update_generator)
@@ -2006,7 +2012,8 @@ def behavior_clone_mode4(args) -> None:
                 observations, actions, role_class_weights
             )
             if loss is None:
-                raise RuntimeError("behavior-clone minibatch contained no scouts")
+                skipped_empty_minibatches += 1
+                continue
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
@@ -2074,6 +2081,7 @@ def behavior_clone_mode4(args) -> None:
             "optimization_seconds": time.perf_counter() - started,
             "final_loss": losses[-1],
             "mean_loss": statistics.fmean(losses),
+            "skipped_empty_minibatches": skipped_empty_minibatches,
             "teacher_role_counts": dict(role_counts),
             "training_exact_assignment_rate": exact_assignments / len(records),
             "training_role_confusion": {

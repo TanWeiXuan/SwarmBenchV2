@@ -11,6 +11,7 @@ from experiments.opus_rl_plan_dynamic import (
     ENTITY_FEATURES,
     GLOBAL_FEATURES,
     GUARD_TRANSPORT,
+    HARD_OPPONENTS,
     HUNT_TRANSPORT,
     PAIR_FEATURES,
     ROLE_COUNT,
@@ -106,6 +107,18 @@ def test_dynamic_actor_is_small_and_set_context_is_permutation_invariant() -> No
     )
     assert sum(parameter.numel() for parameter in model.parameters()) < 100_000
     assert torch.allclose(model.encode_context(observation), model.encode_context(reversed_sets))
+
+
+def test_empty_live_scout_set_has_value_but_no_imitation_factor() -> None:
+    model = DynamicActorCritic()
+    observation = _observation(scouts=0, candidate=False)
+    log_probability, value, entropy, imitation_loss = model.evaluate_batch(
+        [observation], [tuple()], torch.ones(ROLE_COUNT)
+    )
+    assert log_probability.tolist() == [0.0]
+    assert torch.isfinite(value).all()
+    assert entropy.tolist() == [0.0]
+    assert imitation_loss is None
 
 
 def test_autoregressive_mask_prevents_duplicate_target_assignment() -> None:
@@ -220,3 +233,5 @@ def test_adaptive_league_is_normalized_and_contains_current_hard_field() -> None
     assert "renj1ete0/gemini_3_1_pro_v1" in weights
     assert "renj1ete0/sonnet_5_v3" in weights
     assert "fixed_mode_4" in weights
+    hard_mass = sum(weights[name] for name in (*HARD_OPPONENTS, "fixed_mode_4"))
+    assert hard_mass > 0.45
