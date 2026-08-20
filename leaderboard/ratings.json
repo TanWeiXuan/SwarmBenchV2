@@ -59,6 +59,20 @@
     {
       "author": "TanWeiXuan",
       "built_in": false,
+      "controller_id": "TanWeiXuan/Sol_5_6_RL",
+      "deviation": 35.91587741154589,
+      "display_name": "Sol 5 6 Rl",
+      "draws": 0,
+      "games": 0,
+      "losses": 0,
+      "rating": 1877.6343988244266,
+      "version_sha": "791679c099c3d4a8ae96544e3df9e8e03ac85bed",
+      "volatility": 0.06000057696159159,
+      "wins": 0
+    },
+    {
+      "author": "TanWeiXuan",
+      "built_in": false,
       "controller_id": "TanWeiXuan/aegis_apex_v2",
       "deviation": 20.84343920725857,
       "display_name": "Aegis Apex V2",
