@@ -559,6 +559,69 @@ class DynamicActorCritic(nn.Module):
             entropy = entropy / factor_count
         return PolicyDecision(tuple(chosen), log_probability, value, entropy, factor_count)
 
+    def deterministic_target_imitation_loss(
+        self, observations: list[TacticalObservation]
+    ) -> torch.Tensor | None:
+        """Teach target scoring from the proven intercept-time ranking.
+
+        This does not imitate tactical roles.  It only ensures that PPO role
+        exploration executes a sensible target choice instead of a random one.
+        """
+        contexts = self.encode_context_batch(observations)
+        packed_inputs = []
+        slices = []
+        for observation_index, observation in enumerate(observations):
+            if not observation.scouts:
+                continue
+            scout_encoded = self.entity_encoder(
+                torch.tensor(
+                    [scout.entity for scout in observation.scouts],
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+            )
+            for scout_index, scout in enumerate(observation.scouts):
+                for role in (
+                    HUNT_TRANSPORT,
+                    HUNT_TANK,
+                    GUARD_TRANSPORT,
+                    TACTICAL_BLOCK,
+                ):
+                    candidates = scout.candidates[role]
+                    if len(candidates) < 2:
+                        continue
+                    start = len(packed_inputs)
+                    for candidate in candidates:
+                        packed_inputs.append(
+                            torch.cat(
+                                (
+                                    contexts[observation_index],
+                                    scout_encoded[scout_index],
+                                    torch.tensor(
+                                        candidate.features,
+                                        dtype=torch.float32,
+                                        device=self.device,
+                                    ),
+                                )
+                            )
+                        )
+                    teacher_index = min(
+                        range(len(candidates)),
+                        key=lambda index: (
+                            candidates[index].features[25],
+                            candidates[index].key,
+                        ),
+                    )
+                    slices.append((start, len(packed_inputs), teacher_index))
+        if not packed_inputs:
+            return None
+        logits = self.target_head(torch.stack(packed_inputs)).squeeze(-1)
+        losses = [
+            -torch.log_softmax(logits[start:end], dim=0)[teacher_index]
+            for start, end, teacher_index in slices
+        ]
+        return torch.stack(losses).mean()
+
 
 def _clamp(value: float, low: float, high: float) -> float:
     return low if value < low else high if value > high else value
@@ -2001,6 +2064,7 @@ def behavior_clone_mode4(args) -> None:
     update_generator = torch.Generator().manual_seed(args.seed + 1)
     losses = []
     skipped_empty_minibatches = 0
+    target_ranking_updates = 0
     started = time.perf_counter()
     for _epoch in range(args.epochs):
         permutation = torch.randperm(len(records), generator=update_generator)
@@ -2014,6 +2078,12 @@ def behavior_clone_mode4(args) -> None:
             if loss is None:
                 skipped_empty_minibatches += 1
                 continue
+            target_ranking_loss = model.deterministic_target_imitation_loss(
+                observations
+            )
+            if target_ranking_loss is not None:
+                loss = loss + args.target_ranking_weight * target_ranking_loss
+                target_ranking_updates += 1
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
@@ -2056,6 +2126,7 @@ def behavior_clone_mode4(args) -> None:
         "epochs": args.epochs,
         "learning_rate": args.learning_rate,
         "guard_weight": args.guard_weight,
+        "target_ranking_weight": args.target_ranking_weight,
         "teacher": "fixed_mode_4",
         "league_weights": weights,
     }
@@ -2072,6 +2143,7 @@ def behavior_clone_mode4(args) -> None:
             "epochs",
             "learning_rate",
             "guard_weight",
+            "target_ranking_weight",
             "teacher",
         )
     }
@@ -2082,6 +2154,7 @@ def behavior_clone_mode4(args) -> None:
             "final_loss": losses[-1],
             "mean_loss": statistics.fmean(losses),
             "skipped_empty_minibatches": skipped_empty_minibatches,
+            "target_ranking_updates": target_ranking_updates,
             "teacher_role_counts": dict(role_counts),
             "training_exact_assignment_rate": exact_assignments / len(records),
             "training_role_confusion": {
@@ -2427,6 +2500,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=30.0,
         help="relative role-loss weight for the rare mode-4 guard decisions",
+    )
+    clone.add_argument(
+        "--target-ranking-weight",
+        type=float,
+        default=0.25,
+        help="auxiliary loss for deterministic target rankings across all roles",
     )
     clone.set_defaults(function=behavior_clone_mode4)
 

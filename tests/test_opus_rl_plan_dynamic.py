@@ -222,6 +222,10 @@ def test_old_target_ablation_uses_deterministic_intercept_ranking() -> None:
     )
     assert decision.actions == (ScoutAction(HUNT_TRANSPORT, 1),)
     assert decision.factor_count == 1
+    target_loss = model.deterministic_target_imitation_loss([ranked_observation])
+    assert target_loss is not None
+    target_loss.backward()
+    assert model.target_head[-1].weight.grad is not None
 
 
 def test_adaptive_league_is_normalized_and_contains_current_hard_field() -> None:
