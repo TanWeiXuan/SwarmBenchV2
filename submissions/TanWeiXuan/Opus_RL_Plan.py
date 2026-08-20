@@ -1,51 +1,54 @@
-"""Opus_RL_Plan: Opus control with a tiny learned strategic planner.
+"""Opus_RL_Plan: Opus control with a tiny learned tactical planner.
 
 The geometry, flow fields, safety filter, movement, collision/projectile
 avoidance, interception, and gunnery are inherited from Luna_xHigh Opus Breaker,
 which in turn is a minimal tactical modification of renj1ete0's Opus 5 V1.
-Only the five scout-allocation caps in ``_plan`` are selected by a learned,
-centrally observed 38-48-48-24-6 MLP (5,550 actor parameters).  Inference is
-implemented with plain Python so the submitted controller has no model runtime
-or weight file.
+Only an occasional high-level SCOUT duty in ``_plan`` is selected by a learned,
+centrally observed 91-48-48-1 value MLP (6,817 parameters). Inference is plain
+Python, so the submitted controller has no model runtime or external weight
+file. Every acceleration, path, safety decision, collision resolution, target
+reservation, and gun command remains deterministic.
 
 Learned planning
 ----------------
-The fixed-size observation pools variable-sized drone sets into time/score,
-live counts by type, transport progress and time-to-goal, ammunition, home
-pressure, firing-line risk, survival fractions by type, forward speed, scout
-progress, loaded-Tank fractions, projectile pressure, and pursuit pressure.
-Counts are normalized by either the game limits or this arena's sampled initial
-counts.  Resolved drones are absent from the live pools, so deaths and scoring
-immediately change the features; requested roles are also capped by the live
-``free`` scout list.  No padding, fixed drone count, or learned per-drone action
-is assumed.
+The 38 global features pool variable-sized live drone sets into time/score,
+counts and survival fractions by type, transport progress/time-to-goal,
+ammunition, pressure, projectile risk, and pursuit geometry. Each candidate
+adds 14 features for one live scout, 32 deterministic scout/target features,
+its previous six-way role, and role duration. Dead or scored drones disappear
+from the pools and candidate lists immediately; counts are normalized by game
+limits or the sampled initial counts. No padding or fixed swarm size is
+assumed, and an empty live-scout set is valid.
 
-The six discrete actions below choose only ``transport_hunters``,
-``gun_hunters``, ``keepers``, ``guard_cap``, and ``block_cap``.  The policy is
-evaluated every two seconds to prevent role thrashing.  Opus's deterministic
-logic still selects the actual friendly drones and targets and supplies every
-low-level command.
+Once per simulated second the MLP ranks RUN, KEEP, HUNT_TRANSPORT, HUNT_TANK,
+GUARD, and BLOCK alternatives. The deterministic planner supplies the best
+feasible target for each role. At most one non-RUN override is accepted, only
+above a calibrated 0.40 softmax confidence, and it is held for five seconds to
+avoid role thrashing. A dead scout, dead target, or expired commitment cancels
+the assignment safely.
 
 Training and experimental record (2026-08-21)
 ---------------------------------------------
-Experiment 1 used whole-match counterfactual profile labels and supervised
-classification.  Its retained 32-48-48-24-6 model scored 84-0-12 on 96 held-out
-matches, versus Opus at 81-4-11, but lost the direct Opus matchup 2-0-10.  That
-was a marginal aggregate result, not sequential reinforcement learning.
+Experiments 1-2 tested allocation-profile cloning and PPO. Experiment 3 expanded
+the set-aware PPO actor to 28,432 parameters (including two extra 48-unit
+layers), but it reached only 42% against Opus on a 300-game gate and was
+rejected. Guard-only counterfactual models also failed held-out tests.
 
-Experiment 2 used stochastic decisions every two simulated seconds, terminal
-win/draw/loss reward, GAE, and clipped PPO.  The observation adds a one-hot copy
-of the current mode to the same 32 pooled state features.  The exported actor
-is the best validation checkpoint; its critic and PyTorch are not deployed.
-Across 144 unseen matches (six seeds, twelve opponents, both sides) it scored
-136-2-6 with mean differential +17.83, versus Opus at 129-10-5/+17.24 and Opus
-Breaker at 118-12-14/+10.92.  It selected aggressive scoring 92.0% of the time
-and mode 5 for 8.0%, averaging 1.85 mode changes per match.
+The retained policy instead uses approximate policy iteration: at 140 sampled
+states, authoritative simulator copies rolled several feasible tactical duties
+to match end. A listwise value MLP learned those terminal preferences with a
+source fallback. Its final source is deterministic all-RUN, demonstrating that
+the larger PPO actor is not needed for the measured gain.
 
-However, a fixed aggressive-scoring ablation produced exactly the same scores
-in all 144 matches.  PPO found a strong allocation and genuine state-dependent
-transitions, but these tests do not show that switching caused the improvement.
-The detailed reproducible record is in ``docs/OPUS_RL_PLAN_EXPERIMENTS.md``.
+On 250 new paired seeds and both sides it scored 301-49-150 against Opus:
+65.1% match points with a paired-seed 95% interval of 59.9%-70.3%. Across 600
+held-out matches against all 15 current valid community controllers it scored
+509-35-56 (87.75%), above parity against every opponent; the hardest were
+Gemini (53.75%), GPT (63.75%), and Opus (63.75%). Independent 500-game gates
+against Gemini and fixed mode 4 were 52.7% and 52.8%, respectively, so those
+small advantages remain statistically marginal. See
+``docs/OPUS_RL_PLAN_EXPERIMENTS.md`` for seeds, ablations, failures, and the
+full reproducible record.
 
 Design rationale
 ----------------
@@ -102,8 +105,11 @@ this file.
 
 from __future__ import annotations
 
+from base64 import b85decode
 from heapq import heappop, heappush
-from math import cos, hypot, sin, sqrt, tanh
+from math import cos, exp, hypot, sin, sqrt, tanh
+from struct import unpack
+from zlib import decompress
 
 from swarmbench import BaseSwarmController, CircleObstacle, DroneStatus, DroneType, Team
 
@@ -124,6 +130,363 @@ CRASH_MARGIN = 0.12        # extra metres demanded on top of the lethal radius
 FAN = (0.35, 0.7, 1.05, 1.4, 1.9, 2.5, 3.14159265)
 
 RUN, HUNT, KEEP, GUN, BLOCK = 0, 1, 2, 3, 4
+
+TACTICAL_RUN, HUNT_TRANSPORT, HUNT_TANK, GUARD_TRANSPORT, TACTICAL_KEEP, TACTICAL_BLOCK = range(6)
+TACTICAL_INTERVAL = 1.0
+TACTICAL_COMMITMENT = 5.0
+TACTICAL_CONFIDENCE = 0.4
+TACTICAL_INPUTS = 91
+POINT_VALUE = {DroneType.SCOUT: 1, DroneType.TRANSPORT: 5, DroneType.TANK: 1}
+
+# BEGIN EXPORTED TACTICAL VALUE WEIGHTS
+TACTICAL_WEIGHTS_B85 = (
+    'c-j<~hhL9x8-`0mTa!>JGnLGwzRz`$nNXobDiWfMtTNM9+Nq?WVI^cG>HAz)$Sf5pD=SLKCVoU-?|*RLpZh+K^E}2sI8VD`BOp^l'
+    'Rd91~5TE_WeD%mwy0xMTG=t}$ci0@>lb8s_=78^)WKm7mNAZmt;r%!>_6uby;AVOqdl~w@X@HDT?`eU*GDnz97Up@ZV{OO1u)IA4'
+    '(8C7upKXFcYg%B+%vI1kV>{<*rl2_V5*+b~6$>M`m1`VyMXLlq@o=U)^qQ<ivqQX~MR`7M^+^!(hD4*!+vz-3b{l0w1h@{(=FJJS'
+    'ut&H74qAVJsxOb>Nh!KiXnu+kM)|V#<-T|;c>)I=O)GckR>ge-$6>Ll4R19s6IyL`czd8McHa|<#?OzD$6T9=m)Be2^^BVsTGxwj'
+    'uWl4_WM{F7Z9Ca5N|UtMBvJT){rFy0mn+{6V%Kp4QGIio_`Zh`Z_?1kPF@B310K=tesNfpbDNb-Yhiv}KJA=8Q9O0`2zI_~79J;O'
+    'gP+DkF5cLV{jy%bvmsTO>RCvdAD!?`W)!adSxwWgtHStUO5k~79M(*6l9*_X5YDZYk~DA@HYu3!f$zOZrCbh8<o;60<r18DIu^PT'
+    '7UL|lS$NA`otG??M<?x6J~z4#b>5uJ;f|?baOXw2!<TsgOLXy&!F#%qa{_+%NvE8>zGz-n2D^6c6$jsYEgUmFLOX6$2rJ%u^O6--'
+    'JZXp$i*v4{l9OzO;I$5h?wmvme;bmw|5-RSX&F^oDsV#WVDwvGEdK23#jUza*kx!w$&^^&``qa`D|#u&Khl7)>B+oB*Mm1rcmY{m'
+    'yTKvOlCu^q#`*rr6x5u6^>06meUFUAb0xJjDgOsK)h!dv!iz||I17&M@qwV%GjP+pbQrN}CA(=F@zjfz+!FYi7kkfQkHsvynJvO<'
+    'BLg0OaRzjaXak+~gLv8~35T32lh~}xfwGc3iW~2S=N69yBc<y!VnP=bHcUd@zunmTxgC5mbb+?qbodzckwSw<gK_yvaY1ef)?erg'
+    '&unu9YrQ8>PnF_018pwKHN!B$6%PM(=Hqh<$uuYqKQ;d*&rDymigsnan%hwSVJxdC9pJHDv$#*@JWT6Z&$kMrq4Zmt<o!Mudi?kk'
+    'e0_INI=O8b5B&HVsx@v=%-0qnsxyW6yn2jJ9s97?;b(9$O;?(qu>pIX+X5d#wP@nsdDL>dJI7t0PFJq(z_`Nh7@V^QUinASl+Gif'
+    'Zmt4)n8<T6^<xc(TvSST#53C4V2bZB_80eK$H*j}k<<aTgVT6k-CJ5APNW8n2$1R?5p0soIHq3<wFGy^qTyj^uAsyBc82q`Ohr7r'
+    'bpXrH-j82w_R;8=6_D+zkH>>YiGgdQxvIS{kNMNcpXn8ao`1xXMqY-W2KlroLX$mpPxFm_U#Vt%I2>7LgAUGTrGCbv==63~GJZ6K'
+    'zlP_Md#5GzdDl)aE0l2i=ypki<x7~!T3njEAEf;&VDBjbo%Ltq<i_KoO~odN7q#%bs}GI#lS5@`3fMlI%JaXu6SQBXom2AZ+sNId'
+    'vf>5hHjd;opDuxXQzYDSS;Aif{-e6YHxx2S6%8)dh&drg*)4Jsq-39=<u`Z1sblUuOS&0-I<E+$0}AQCdDq1!1ABq4dj((eF6Q}T'
+    '7vf2qCdrPEZurL}M5w8i^08NGoOw=Gx@X2GxUl#>NB;7F?z5f6$n6h#U2=b1BD;*V7QUpopFd&4k8J)idI}#~o=zW3jCkh_9c(#0'
+    '9DOPRc+X)UjydYhRholH{&6F0__CYUY^lWo=N|A_m*-@tHVeP(d5ztUA{(w8%D#hb_>6ZE)W2E;3m5Ij`=|Xdla|t`qsPH5eE<jC'
+    'D8*B`)@*60Ot?yuA5Toh<)2!_Th1Tgeq9DOEgXjRbDZG9%tAhQ@;2OAvrpV}ri+pyBLDHZKYkr?h!*-Ma^*I_cOiDX`&0^<M=E3G'
+    'yFA+HHJRHxtN4boGW8FL<<awEY(L%3qO+kraf{Xzvgr0zh&A~rj%=~P1*I#&yD$v59V(R0^*7`1-;yvRXf02;bYBc66*&HGFpQ8+'
+    '<HT>T`9jndHtTf4Fq@+|cvrCq+0SW3R3^Uv62q_NB+*^70jT&riwus<#kw<Q_|id+dw;qJ8aKUgeeOv*ruYfZZqQ;oxgVgA+W@sy'
+    '*FfQ8pm4fy9_zQi6aRSX!M8I<$z8Ub4Da^9fRQP9Lh%f5?KuTiWbIJzRtzVtS^_qEy=ZC5EAd8|3HQ_d3qL}~k>mbI(fOr3SWUf#'
+    'Es7~D9Z*9LWlvH^=p4Q@QHwsv-4s@zDyKeaS>k!SiK2hEdpK~78#WZka^AoOSen=-Tr6G4_Z}H@KS?3V82MAly6#kXY(1~-8pL)J'
+    'j*9D>Zjp<vGG2aqh*rr>z!_sTVP8uoKQhn7V^%LDD#7#E>y#V#7au|+*^N9W;W5nqW`b8^9@4B6yCD9;0gSjcga<}-<JiSL$o5-3'
+    'XZ0R~+4ZydlcO^Hyl@YyqGt2>_(7<e5rz93hk;qyNZR>&IbJTl!ui<^^xi&BT=;Ph4X|8{>kZW?$0Cvb;8QA4e?ZS0S3^nSU3T&s'
+    '#C01>#TBEbB0N{ceTUPyuZ$ilg^8q^UJDOq<?@PN`@#FlV;W<YDqOkW4@b;NrmQ<A_($2GVs`)kgx(91#e^eaG}G?i8>Y>H@}{-a'
+    '|5h@M-nR>08Y}T(r5#*8ZZ2FG0<hfTCpoxe<L$v`P~7CihkBW#YwKI#=RP;?wP!GT9b3l6_sqE0uQn)NbptkzT*0dKH>C%sM2MY{'
+    '-lFE^e`kF?o;{{Jvf6wvu9WPDid(w4M`bL%(5VC8RhF1iAI7_9#&C9iC`R9F6_%}>0e9Xw@=Z&$ZO2Ve=$^+(M^3|gD}7GV>c&I1'
+    'm(ix#S9y7B8Wl-i3mUB%WYSH*1Jy5Konj6Qe)0m`7VV{Ot%WqdW(>Tkih+QO3KapRCY(@O0e^!=!sN6QFgqdzG!Nxa%RS(4jn?Qp'
+    'GgW%&+e!Z0SOt~StJrjPHr!}C!0Oqj$)bBZ`quUZi*p%Vcx536<bI*Ry~X&S(OKwNZOn%G=WVpyw&Sk-eZcmQA#{e%fEAgB9DlzA'
+    'Mmwu;i0f|d>=?t3x@4gsV+6?V7>KF<HP~sZi$9XoD55KkD*6FFes6^q@fz?vxEr64jlp;N*P!j98LR1(P}9cuw9_b6GT6+Oql$;4'
+    'Ufo@hH`Kz9oN(b%bql7g>&e3>&wxG62cY*+c|0oTFPv>WDGc;mz^_M6=DVTcur<7jG{0ox)R{S;n6Vk!(teQra(C`GsseV8I6!k!'
+    'ck-a3)sU1b2S=YyptGmGlbS&^XgvBzMTW*)X`jw}Kb{t5t3Kn{4CI0z4p^mJ$mdTlz=viEf^K>Rb)2zciO*o15Oj=RSe5aoW&N@1'
+    'm^G<dSJT(%G@RGlg)`0evbe+^TiU*Ye&q(tvlzf0^Zn8N=Nvlw=Ybe<x(bbFr{nObU{pQoCf)M&wXken4YVf?XZIy`*!yxgmP-Rr'
+    '&3P~u4>IA9eHy&bP>+B8x<WG_7J~hR6ljfT6SFpNA!Ri=_LJ(<iz)hi>28cL&gckUEl`KBLB@DgKS`qStS>%!<ss^1zJ{IHA9s!!'
+    '!5$mkXxZHb*zN5ZoE(%(LlpO7+D}_aU0hE#icW@?OD!OA7Lm`|pV0r08L3T(;O7e_unt}ld1@uz%TGkDi3*%(IuCn)C$PQUS6JCx'
+    'ByNx!1iM$w7l!?)Bj;<`wC<W5pIT%onzldS>b(2nh&kri7*K=_|MvB}i&?_N(#=@1S%HqGWs0*~-_lvxVmR_33hwUhfYESO@_6D;'
+    'GKjoHP7SH-duFUSeUbuOzHbzU)a&BnYn|}WH5gY6t%dB@I=s-PKwPKy5jG4p=AFUIdCv5Fe*9Vm;(99y^|ocg!M0z}eo_m=%{<w-'
+    'Bp2dG-NE1H6VYR7BMm-Kh&ztzR<zGh=a%)o@#*;i{QUScp)qzJgp5AHGG)QEPIH!EHtn^<vFxohG&Nqhc2bMS9B+l=`uBt@hGG2S'
+    '$w7>>IwJ{Horj^5Ot5;I0vj*uO+)^x5KjaS;}a(qpk2;3e)D4+hndQw!j3zz`1muB8Ge%v_R*lYj>&AD*IgKEzn1G8PQmn_@wolv'
+    'Ae`hGFZ5`zr`;!O(2q(nBxWkfdjEt!zaE2+`E${x=QK2Y_n9WXGUV^?-@yBn(O7HVn@tN<x$RFq_R$T)jn3IPbJRgNby9{uEWJk~'
+    '7w>|Dwr=2Td<A|i^<vZACn2szPqb^@!sa{ffx(#LZ1lQ}&8PIooRj~$&L@Yz^%z1jcePpOtnPU4V@&OCp*TF(RD3bEAF6S!kT$FX'
+    '3V-SH{5e@Ht^UU^hwh+U{Y`Q~uS(c+{R!>PD2A+NZybLnj#<VW^-V9}3EwtOaat^LzQ9iEb1@~cl6A|@k>cil!r&wYocDUWG(D)5'
+    'ei)@wo$C{bTyu|x%uB+j8#VEFsV{r<O`?^~0m96+Yw)hS8htIylh(KOWtn2tiiL{B^k`lm(b^<h^uHbf1#?#8wCiUi@t?HdZ%Q4E'
+    'n%0ZA#C!7ybtC>|r-Z{A7jpXOyJThji0=NhfCW>ZV(&i+!oKe^Fd<_Te>YTwd!OIY5Zin~@_sa)KeG->O!e3pld#D(M@;G%hMR+p'
+    '#?SD{DqpWO5;qBs(sjFB1m8##TyV33eLE$zvQc1-2_<y%`!t-ntAS!RJMkVJO>(`lk9?o#kzdRZJgpQ%m$Xw@Yl#DPtj&ijcfxUD'
+    'P&sxVxD-DBolIL^WRRxi3{c*=k5jH$!LXnvpvF}0dODx3_=of8=<n3$xF?h*T2RF}1J3L}c)a?y6bQ_+#eENZqO-Oq)fqOEb#EI!'
+    'S{(x4l-EGWy1k75{z>wyI<Sx5%lFh0q-XP-KzpM)Rb0tO^NfA?R^O~VNwOSARcUg<vVP+5HQGYnA{VkXzrx1rJ^6WpEYDF+7K+9j'
+    '37?&pv-FWA7w8@0L#NGP*hv>&a$1guC)L9%Ar5OtYjU_n9DRCaD4uT}OHZbpV%$<7>i^CXhT7F}*2Z@FsnmocZz8HMjFD(q2hyVD'
+    'yEwe>c)b7TF8Fs&rWUP%&?J=6_wo0*?d~W({yZB#`CX&^+bik%^Q)qK+Bxby#1po8dSYY9SnLKm7?S=**g5DI-0xq&I*ZkC`IAnt'
+    'Tz!l;9C}5+Aq6w`g@QvL2iCO=<Qr<<@HA)=HCse-S{l&vq2c0$+J{`HRs^^ERME)&>e$iS6OOyA<Kk@!9MgPFC@3n#x0f&R(0D5f'
+    '{<)r#7QTX-^yBdL>uubfYJvt$My%OwFJ$fUV}qa;LFYjaes`$=C(Q}RKH3>z>k!KE!U*it>`n6$0)+Fs66kqi1I!HEhG+NNqa;nC'
+    'qBChf4?lBO?Dn=N{)~6Sg4X}UlC|gXaN#6D`Q{s;NnQdPqxR#hG40Ya&l42%RukX7$`xZxMw5@8JzDN)Aw!#Iq+gpxdgeVb_s>DN'
+    'U2_*kY83F{6}t58Xa^jXrb?16{)2wKbI|s?Bjh_<;*772JaY0C`nqYgI5O=r-28PAdbQr-<@?L&htmd*s5=c$Pwu1X`7yX6D~L*U'
+    '?0L}qDdM;%d8qm2mBjH|5@`IH#Vyy;$@^y_$b<?wHQa<f`<nB`MTw&I+K1?<tbnC=J0QjW5iIH*DmoYX)Asy<?0I4m)qVQs`SDZO'
+    'w@(<gDohd&rd|el3r#*+kVL;Jp0o02f`$1z@kQT1LTjQMKHU|-Qv<aBaqpsV=*t<QC1xF$<etKdk>A1c*<kKzH5r<Y8KCr}7y9Wq'
+    'lIDS_JYn8vn%YaiTh{3`xOELhEKU?<16;Vqb~c;c-wDA3Lj=u=lh{vr8%$m$uuFwDCO`B=o83Eb%MAghEa}5i!*$sA$Yz?<d>A8o'
+    '4`BD8!>k?fK%Ah}3o>ThvCUn+g#8-qxu{u#{@%{!FXPLg%hM0l&m5$$e@24F_Dz^+9*UGckrl_jl*A5yEn1E*V5KxWa7s(y1F_+h'
+    'R?-Kj`P_!zch1xL2p{Z!K@H{~D1$ov=X7uEJ$yIK7T0{xMTeq%oEdctZtOOMHB(mN^{dxG)4>OajFaOv19x+HemHN`_)5LBPQtYT'
+    'cj3R@Z|PL)LAcsz35RYd;m@SiobxLcV`i;~e$Hk%bIKo@G2tZ!%>4l)r?x=!6E`lY%o7bY9)YvRE~p9i!VVV;&b}qms*Z3x)!IT%'
+    '3pR3F&(-AfEk=MltHEYLA#JX$V$EwWpt-JD+&S4v46$j4xJ~NxYxrk6s(FHbh74rA=TC*`-#RcdQh{I5Y?9xSKw@txd8c0%w&yp%'
+    'mA=FH`|61pKYs>S_tF`E|MvoLbiR$(9N&UtF7VYe<5_p7FKjsBh}pgDIBjXO&~dR2Hftgdp1Xs7-}={?`wnBBt{)aWD8e)LTM=&P'
+    'z&-CN*njmq3>?=9<F94ljBN(w>ZM9sRFv7?Wrxu7fGwHrcH>}G8_A@$Yjk7AVUz}6;4R6kap+S4mutO2r<o=2Y`7GTTH3Og%1JmQ'
+    '$rr62w$OTN5v>mzVT$zuD%^X7h9|_*t>$#fzMsI?EA>!q?ky_*aR?r+N`SPJ!+6Gn5-5F~44qHApmF1WkUGLs`Z+Lz?c#%QeIG;4'
+    'jxB-a;bHh->|1#I8_{cXC`3d#@dgz))EO$zg`c)didI%jUU(+Zrl1}CV}u-^4mPULEG^+#D;)7yz6kT*XtBvTCH!N*j8;5~6k`s('
+    'rnCWpbf(ulJhk&N>=><s0qY;~i5OqDOn*YthxoI(Fch;C{is~`H91TkgYuiw5O<8huLmxXt9LK78}$JC4v7LSi4iCDQD-MlE!_IA'
+    'KU;U4Cx`b9WU$|uoVq*1E>AD4)z!wntJh)te<o;tejF4xP2|-t(}V`K1Mv2OK<184;ymeDHuRMx6SFX`>9vXVLUX~*2=Mxusba&k'
+    'W*n~Ai}i(3@JY!GuTOsk;(b%tE*mXQ|E4Lb%Y1<IvA20clNWz~W6awYd?K;-G}H%1VK=#2(BJ0A3CrEFU~MjVZ|lo*74K7AO#;+3'
+    '>x!C^sr0dPELWC>;O&jCp{RHjZr_v%r)L_oY3MS1toWBc-f8EitH{UtU!k*KjLGi&F<4M^3SO#3;H~F-QU2eXT)4w%mofu!lM4H9'
+    'PeOHL4K6Krhe^9USUTGiC#N>TfQLsw_2+op*XJhad+(y<iRVE-yM_ne?SWh0X$p4@#^AGfU2wc($dA$^1%qEJacSf@{xHec)@@h1'
+    '&~e9;<xVQ&uiZ>1CwHqjJ;R4hLObwFPav7~>%<?~4&qdu(d@r$3cvTR2Go=lhL#u6xXFX@*3nW5G~F+R*Eqtr5o7qysckT0xDE%J'
+    '`s1n}Az)+CjyolayxLYmb^T}3ufgvq)X0Q?tIDCUM#36TLg1jGKbxL-A~d|ej4zkT;G|M-tm)MuT1QR5+So8~9zKUP&h&*tOZ(%;'
+    '=Zbuy_zJ8$;SD3I52DUQ3!JPnANzEL(XkN^!2a4WYKz;1x!ST2@x+%B7aqWZh3S;Bpjxa6*+SpD&cMjUIbu#VfMfM}T<6_`(-NXU'
+    '+20MucE3P}t)GftU##a#Q|Dp#qCup6T?rrVI*)J5Ho<}7-k2qy1!Wu4>F9<kia&WoXwIk=E80JDfX(!Zp%*Oqz>wp@tF6n)%X$P<'
+    'g#=3T7G-1Cve8sws)VCQ55)_kcF|t7g}g6l96Ei~!#hV0V|w8XJpLtyAC(rd@0Ekpjs3{UJPJR)i=+e5PsHKUJ>ssv1S|XXL1$?r'
+    '-gz^I7xs6>tXl%V@L0?l7f0guI|I;i&Q;E_GUWaT)!45l4T23_sAa_?GOJlgsn4sae2}^1xpoO!@>;mEdIkSlv;&L{03sYZz-`n|'
+    'STHjgPtR|sJGay*`nVRKpHdI)%k&`shz#0wy_Wb)@_`YFXZYZ+E8zARvD@8Gw7aMuzY~;kXR;1EE_UU^ebvygbtR`Mb_nJs>MTqs'
+    'fjc|T!|z>V#Q%(!L+bV-o0SW02o<T_@W37o9Cy3}9=!;Kk0X1c!GG!`=PSpFI!8F|{wX%Re~bEM?}gVsVN@tiCzre&Fxk|HXKcH{'
+    'Z<Yq}L!0mP{Qf;yw&x~A-k!;ax(?%*2s7|ABv9JW4joy8s9}30PbnPB^;;eZnFB_mZ?__T_s)R6pKqdJ9S3=2d#lJ7hw_(wrz!JR'
+    '9?0CeNOp^q(cy6;jkDN?EraXCbE;d}Aa^J9Raqg`Z;-=3;%(CO{6hWn`|!3-6^sc;6Lnv2{O73!m^L>MW(7^d0q1T&+vUYL%d3EX'
+    'K46$QaRdg0D)Qbi2OhiEnCi4ufJWbCo$Ll&UmgR(V;iV>+enwL=<~^Y=ea3jBA)xC&(_im_ADREm%j$!<J=U|ZmtxzC_I2hqZE9u'
+    'm_(k+qfoV220MyI^XyHj(pOeh(#h_}A=bGGgX5zxYGM&y&yu6l%H^WGfgvvFyAjWsN8k-Ld6r+@3ifW3K!{V}>#v;gy!9$bpQ^&|'
+    '&U$fI*C?FbyNsS6>;(P0f$V?fp<rX|CVKjh=1ScebZ_f@T&$KThCVi8?;h&-xaTj}Gh-^RZ^|Q?C&6qt$ABlR)=*}V4J3^lLV=b='
+    'V!T%$esQu0-PVr6K}&m6_IWqyMAJO{F+2-O=6|6Llls$=&GB%n@;vb0SG4X*H7x4ilM^56aPli9RzEh1Uzna2#&lQXeEDo%lcm9K'
+    '6YWsPs1aP(US`Ga72=?wH!<c~0`-2mAGPN`q$jhKaMh{NJYmXEb~i2HI<MUrSGj<-ruN1oNdZ(5{~P?*m6Gwrc|5jFmc*@>FI>Bk'
+    'Drj2`#TJ7D6jWFNahGESg9{as%1li>xoa@L(b<6|S%z$<<cl8bf*>k*4raEk=k(Y>-jTfFpYt4|X&wsvqO)1_x8Dt`2HE1MwEmp0'
+    'EMUGkf#q&)h5Jb$1j)`Oo3#eCsl807tXoEBzrEyZ8|AskLKdUPB%x3Fdzw9L3=TC-XN7Sa!Dx;=&0RQ!?^L<)f&TkZVsns9D#x*V'
+    'QWH*a2;<`eD>>>y4^&w+lLqR|K>vgf;+yc^qFRwMXGeD95v8TjORB-eLCg7%d!p3est}{JRQYJ}Cz@^L$@}GlDExZ}b(_5#GUEzq'
+    '!%J)Nc9a5Ud0vv<>+2}=Ih`u1zfIv!E#|mzjK+9e5DdZddV%J&6BOIUkdZq8FV79&H2YTk;SkQxcmyh}Es<*bY(uAI>tIa3^W4K='
+    'CYrv`;AbB$l491sy)JV|G_>EzQ`)z{*qhtfIdeAl($zw-xK0>)<CFM%=rmsaMTW{B+2i0iON0w^B}Vh@c|*-6R-5aEdy5~@_6&bv'
+    'j+lgv5ysrn6hQSxV}+Zmzl+JM)Un3pAjn>o$Ex}z6!cUNpM7ij#|1Y|Z#@tHwGGA3QbV@%YlQTN+fZf3TZp}Sh97B-LHD^mg_2db'
+    '1x=eW++})Pq(?0{=$kxyU;V`LcA0$ly&O*;<d0?6?a=vm46Yn96IYq65(c;HvrhSP@yW<is_T_NLuI9KMEX=%xV;<q^O(zj?^|%b'
+    'w-U?yEM@6%89tXim<xZW@$?TLK->1RBtS`lr3bE2>W<lHRh9~uR}96)PgJqXWdLk!nZ<`2ow;>In&>y;HO+n2i_Gd4Vr1TJ9CqiJ'
+    'm~$r@lfqv@`9WXk`jyI$W=!DOAD=?y_AJrccQD$@ZNoAC(R|H11#f>`gGLJ~D6FUlYHBXPA`czu@{mt3AykKAwkhF_`itU+z@1>A'
+    '5RV_Wl%dh{&$M%MI+S$D(E_^^zMZ_8V}hIib+#qR=I-ao4}%aKc7olFe&cJ5XJgZ_ZfvD`M3@=9loGE$6UN6(g=HS~q*joD^^feO'
+    '`%f<xJbF~a&5QlGTKKo$EB3&yfOvd=-kT!67)d5?DT2{Ib76&AD77!>kJIEj=){rL{OMpGsjV^Q_6J*V`B8Zenl_%ts`lq67tJx!'
+    'V<|eE3`V6tXW)HCJWpP^56T0V;<IWUGT3gwXX7O7>U~p;Y>I`~F+JE{GfnzJ68w+7IlM$uo4#Mq!-1;1MTfjhDEcv$+*<pfLw^_k'
+    'J8F7)#fvNaeEAJpq`F*UaPbh9D4gLfY9YMZH<Vwb$&bIfww5;3qFA^5FKEwCX4TwNLie7baK*z4pB#TKUie+eo$uN~w5b%ISEY)x'
+    '6;mWfugX%cW)*2m7V}d1ui}2gI{vXNgkndzLY?CxjQ`?Edrf6<Nv(uqv}SRGx-(zbS7jrmAPj0Q7Z2ZkMssaaI9{VCX8uXSa5#aM'
+    ';dZ=kW3}Xd$WdH=_p&s`M1?JNMhHPMqv@e{A*q$!Av^1_wBCJ(NK23N=lm5YYj1(=p5xf!zqkA}_knb*h8y2>x5sq%BU~9}%#}^b'
+    'd^v9=KFC~;{Y&SQao_+Pd-f<!*w{glu2bl#>su=MIgy;|Ca}-KVKgB$2i68Wz-c)}aN~ywpL*iRHg2m}GHIT0vqX+8Ey_f@D8?rj'
+    'XJW3b3aLHo!45zC#3NlXG+<gV54xJoKkV0ta<^QuD&Lmho|}PX1uncg_@yw@F`1UWNE5P;x$v3JP}uG~2(CYq@P_oUkhu}1<wN4x'
+    'P(Bhzs@#TT!};jdeh*qN*U{*{2heYu7CsGIAu6ZDah_iiG^+;EWvLqW8`voXScKwN_d;}3@#dzYA@Fj!1+6ZzK(FdGICK6Q-ri52'
+    'U7d==8<&>xqq;<hi#<W7BD>?juD)0`=?k692>f@a3*;GnjfSe<<g?Ygz&<^M%sb|Q#m@|WA8(2+yM}Y&h6()Oa|oJE$-s@bU3j^{'
+    '0A4jsgLC^0!F5C1z+w|Y=8ZUU+QKO4(2tP58qk|J-nx!^+;ga?*G`tbKNL-(<v|rE3318e__K2aeGFfWTRTFyo4pb!88kuRpQV)k'
+    'vIxwsg@TLXDae-X!?<b{ZnmAwLpGJt%qOzwX|bx@?3^+!*O`v_4i_b@HZ|PCB||(ZIY(O~_TV{74`I{vV_3Us2oAQM#D}!pxxa-T'
+    'PD@B-w{$Z!*z%Kj;~`<m{zzKbx|i(72D0ph8fuwXO*(gdV4L=O)X3V)wg&Oo&tnlc`YhzFvtQ9_PbqJRXohS1RB1evij$*13A23d'
+    'NL8l?Z+ccCO#OA4RtmpFy?Gb#?4x$>YY|VyeFyUouUOo0^Cxvvnuh1ohT{P-1V=14gSx9pygE4?HI{7TVR?sO(;pAPB+y3`zCWS0'
+    '9n<kv^$Lj)cN`P!*RWFVFz$YDBZj1O(7r7#u>J2p|E)^J7ruJv(=wf1m$nE-9Sg8?UlFHjG(qQ{=d|NfhHz@fC>Fieu;*ecT#-A4'
+    'de&US_t#Rv?Nl-tote$E4GTqYw`tV3L7ugZtuSfnS6UF_PDcg^82lzjI90BL*Y6&uw$@rG-nNk^b{V3d%o&)U{Rs9Sc7$C&e^X~K'
+    'FE;3t2-~*@z$@qJbbJk>qiBLkzxCPtzoj^`K%K8RSb(0(Y}m0yk^Wei(uONZJgMUk@YZZR{_CYUWL%eU!lw&r<hpU_10OoOMT15!'
+    'H-`+LPH2pA!?t7Df{wi+78K{xvH=FT!fXaE*}j{{C&lB~n#bU3K@fF*22M&3g6a|nIy9q!`n-t5Y4Q1(xppTew^~AG-*_HfZ~@1f'
+    '&*E#>H7e!~)576fzR})<pFF9x9i#8=<)1aNJoRu1$iDZ%^X*+U{r-BqUpG})^e^Al6CdDD&t0s2aT@RHaYzg_h@fPtHYJ6I!=9qs'
+    '&~sCYR3=iHA9y&UtjbD&?}k_v<|D=%+oHOIDm=R)hrX+osIN={+Sbc(Y<oR?`0uVHaDO)5O4P?yBmTn!m*%qZX<xMK7LVg<EyUQV'
+    'JNRMTXx7b{0IU0bA!+(aRM4C$RHxmiqs8YrvY}Wg?P-P;BU4#U<_j3SO{T4mXL!>vO}y=Yh9;j4q@#DM(7VHfzFypmBX;egQ^TWS'
+    'S8Ff)Q+AN-TX%!!++r9vF^&7k9KwdV_n~BSFAhF73-#aWqP2W79(?I3adk5n61VH&JL|KQQgNP_{&yJM_H9Om%y4Wo=*}DNWwHO~'
+    '_d=zv4D@tZOZ^q)usWm${si^LpLaJ1zk{C8yojfw!r3#Jxoa)997tg8t(Q@$`Zq~Gb&{@Io-k3rLdb}COolxLJnX-T%2MJX?w|?o'
+    'u$d-U<lccDitp*oGorjzcS(6xD)%?g!c$9+<J*nJp!T@G*zh72H@5u;9fAr(S!l7-u6*I1({MJ*jb`(;gJIBw;q2*TEct#Vmauvd'
+    '6yM1wrKfGQ<WvN$n|>J@=lJ7)b4Fp<c%p*pg<RCyo9p)IqS>rG(XlHZ{7%VY{r*t`Jqe`|onPSBrpb)k4{_9$4%!*+k0HUTG-$3S'
+    '&Xp~LjID7fSGx?pg@kcZ|2??Z4neZAOq@`#fJf&1`!mOtdEE188XIwt)8=bZ`O86A7kN)8JQ@b2?z4E1>n`^B*bNVz3NQCIKF*=<'
+    '>ml!t2^mF)lc)J^w7mOJyxywMV|S^*^QhY}$!3_~yJR}~?d^iW@n6|kD;2g&Zey*-6H=L7jhBN9=(n#GAL(8T_$!OLn)kB3=~Wo8'
+    '<S@Uvu%33w8PnO7X|zK+l62nAgMg%B(c|Y=>3H`TYQ8lRulw$#FVUJ@TXUFi<uAgz>%-}CODB6s%jj`mIokhTfaV3IqJ3Trui5Uw'
+    '2c8`j<JwMxh2<|$Xl@X?0w;?Dz1t}HxHk(*)!3$f635*ghPSZ-7WdSW6f|k^lU95DbX7uMPhZ16e^W@_sX~nMHpKl|nN-BndE(Y@'
+    'keF}`AM7yTv_WggRq~d;ZSZCcH9&{@Xnxbvh2n+j!lC&qA#JEOH(2!J-<M?ZW&LbOl+%XZabLx(fq!Z2nHW4aF$qRocu2R(Hi%A#'
+    '$MHdfbCQ8wH|X4-DwZ907C&Yib7`O!d@d}Z(f&F-`*OChuptg9&W{v(^`e<k_3*B*A-alp!K&RFPwtz9E_V{dpvNJ2msNxU-Ev#m'
+    '9(El5sTT$NL_mH>AHGuMhZmMu()xaj`Q)QzY^ZvUX_*0bTI*ukC6Z(pH$lR|@oc&%jJFpg<A^k6F1R=bVh<k_DZc?+y1s(r!$s))'
+    'cL1GA`hfN4t0gzp0V98Gp<}<jS*6zmP}w{S0&X6qiY7T&9I7EKFB*y}=kC&m@_zJ3-H?^mt8vDQzT<E93@hK4u#ul8#PhP}eqwI*'
+    '2{Ec{6(;}bh96{J(U!RRlwzrc>bV{aznp1e>lso}w8s7=*Wvu$2w}bKH1@E5&WdR$nWsNjc%l*w_1$#wTkAgRR+j)t;d|g>Qz%8<'
+    '-^k;g|I(7KB5*ZU!Y@;zxzD=weDLZkA)tE<94gS~$Jd78#JF-XuF{YXM!WH*-`3n%u%EWJ3>0T=R7V$+c=T;)0W9oCdxQ0b3+`9M'
+    'O-l8cX8x4j7c^6%&qBPnULSYG%L}k|HD%YiLv)l3Ysb5aAC1-V;@7Lvg|&NFa>kY{lup~$n%RK#DG7^&a2{||6=~so7*g<oUd#%G'
+    'C(D%azwl`KF>wTM4H?em@|C#cR$sx&%$2Mwitw^`5ubWC9Wx)?pvP4QF(5dMCnSsj)0BUli@n3vO4BG?c_TF@C~#7`5vD%efv=UG'
+    'P>=K*)NQaIu2icA?S^$+rZfPO{<Ftqe>Jl1vz})LtP%J6Sc?q}M}@CP4`SYnp<=A~g4P(ClCsSm>HX(}c;@#TSg)f>5B=;!wtETN'
+    '%IXAp=?(swy^R~Srs47SSj?Ig4c3*3D6KsUPg6G13E=^&M7cx2<`djiCPiMhoV?H-{Y--Rj(2zTREZ_OZ7QU{@eX&s3}Ct3qk@+7'
+    '3>tnef#F{aBr#Ku;My_kdBEa2uB+F<r(ci#>*6Fq_n{7M5<b&`r^rP&t0;KNNtk`;mtZ{87Bb2-`4^_qF|SpU`OS&K?_V47W68hm'
+    'HKj?=RNICgJI(mUwAm>6o=C%!X7It%kMKb%K^5y|borhYG}`XstMVQc;x?F9&e|!c*v?|}#=+v4TdGihSP66fOvLMFJH*E^Gx*tr'
+    'Gf-x-m(owju+5bemYLI=Gk5K#3f&MsvF-w``yGj4mzv;0=X8u-ok<_U<l&&S5Tr7@1i{!5PjA-5A3i^X5${K$+`OT@DSIUM(|JyZ'
+    'bMx`a!-Zng7f;+1xRb<hOX>LMU_mB*DD2#JlPouC;>kaoSm&{n%YHu)m$Ys}Mdu4b_nPyPgsL~7CFG+_%`I44xC>0QOfW1}mrdoy'
+    'q5jTr(mxx?d8dX_($G85oS}>#$AzI<iY5=<=D?0Vt8mS=e&{vUi6_je5%Uh-7Hhl^dIa_upOrWh=lpU<!*@sNzCnLs>HOzpvEY<2'
+    '{8bYBPp^Ujiy!in`Yt*d+)pg%d4Y<W)H%WP8kByjhkjQk@w1UHNz2IrZ?9X-c^<KBy}A*G4eQTyUS1ZOPK0B|>l`ZB9?y9n{J?Jf'
+    'F`@B=BTV@H2{d*`QQte)1%)rssQoFMoFYDgL{^cFSC1Cj)(7JwyZLCX^&QBNpuu(yx7BKiu48OiiT3c}jyQI0QQ?FGn=$-wDGW^Q'
+    'i(eFbvenx&oU<^MgO;3Q7sH#>^Ph_<$w#4&T{=dz`Qgc~{nYl;kjy-`P(P!QJg?7DT43D(i=1^)@w_XmuYDtx>D7}9oYTntlZ4xU'
+    '%)|{Tc@T8`y4aK(E^55=K(|W`P!e($(n8WG<L@kfVe+r`_3b%dGF_zW8hAMC2!Fr%gIx^9qr2A+n))FFR{UClt0!C+=AJvnRSQD!'
+    '&#Chy7p4j-G3RmQz+5Uf=_%$6cR<;bsj#cFPAK>Gpqy#VaMo1~tY+7smr=PeWsD7Sry@3wS&7DP=8L)p>g;NJpML0j;Oux4G=35z'
+    's@MGyw9K=pbbATDP<;X`UO7r-pZN=8*Ih<~oiE_frzkexm4eED3i!MGA-r?HhN^uO_;sriPBvH}X|77gK$8b-Z)VTS?=0kGwPQ4@'
+    'tcG5=yNPe*7vZ39zIZ)w8chga#J7G7C;Q;TqG5Fty;rNCTY3d}e%NBp&FQ4Ure^%}Lmb^6T>&2Zzl%rUJb8I2a#iAB@^?N8@>6G!'
+    '3%AqN(_5+MIA2`7>0gc;7qc*=7CL?#<JG*)TpRxdACEf0W-g6XHS{8#obM_PYzu>@+r!{=*hA^r#n~L|BgNUzy7S>1w&<OCmo7>B'
+    'V#}@D^g6PN?AL8ZU$Y&2`;0rjSk)7jrLLp)ZVGG{_Jp+k7r~p)O9V^B_h9y28<*}M1HI=Yz(jR-RN7f|;q>(|^o-Gm4?FJB(3#gU'
+    'ZT=-`<+zVfUZ}tqZ}w!ZTjijpeUF|h_u%&O6W|kcjF#QB$Kc{rsZqjpx_DoeBMlO9)x~t0=e3(70w?gDj{ea9#8$SQrYXsi1fWT+'
+    'Cd#PnC*3XKTvt>Fdmm|W#3n;{Qhf^^IA_t02b%0|;353fG)HmmK-S-23Cdtxu}01WKS!xy)B4#|*nJe<kZ&d@+XP|sKS%KTdkM}w'
+    'Z?#P^GXb;Ca2TjC6u0!A&POdrVCDN>c*vkjn0R;qEFQH|^p!~xm-RkMKMgY|;q^^kby$O6%2k5V^zOLwV?LF>NX6bau2HajCEROi'
+    '!`S2U6$ia;1AUCZwvPhoYhHllc}sZcjS{*yVF;QhCt~`g6jnS^jUF$J__c;Jl)mZ$dxbi1Yjx$h-JemCM4Jqy+i`}P9rVb$NMCCW'
+    'D^@pLgVg~G;d9^y*t;wi`W8>7#^YQ0yX;<yxfdZ;gc|Yi%?_O0W{2&!qiqIBVsX?{Ega>d%r8CX@#8n$$2)z<#kh^P`DpGAtY4GD'
+    'OG8bmp*e>AGEUHPaTQBe_Tk-8FUUhiPY7y@#h)8a!2vFlth(%jlbVv@;mv%|US>ww&a${}zAn1Q2VuwKJmi0lwb<Vc_od3h{Dqa^'
+    'lss2(PyHnfIO_rfp3H(1Dyzs}XcxE6wT9dMed*;Dc{X&BW9#N<hUCZiq~b0cg~rpABS!4_$%g)33uQUckVfwLM2ZK#Q;N4K813)H'
+    'Z(0&iq`#mS=MJhxZJZZ=2Hph~(vAy`=%y0IbxR_#Y*8StP7Nhlbv<Es^Gspb&iC~4_(;4xW(c@YAw0I1NL638(`ArH2dNEr%)XAZ'
+    'J{<@DFG2XpXbW#j*vDVu_fgv3@f5c$2Fiwn@qpPfqEa7UcrzmGU#?e^!+jH;6Hci2yctfYPQ!>T5^lMj#7&c~QSA?9^p?*iAFDJR'
+    'H~)&Dnj1*9fBN#6UVq@v(nmt8yB*GTT1;>EBW-y&h3sBuiw|!-hqrr{am?;CTxorbd(BIMPaRUw3w=$t*;<?-?&QtG`ol!oTV(Ur'
+    '1!k0L;~2er;+#z`7~fY9reAD?C4*-0C_Q&JlMN8EBq^AaV?y(-I%wioJ>hb2lW4Tp2lm)bhORw&g7w~T6iSQeMoAy+hdX%GHy?1#'
+    'enXB8x#BrU#LdTN&;j$qxEy}4!pECf?rk&P>HS_X#aLEo+Yi<^sv%&{2w`(*rcKkYkHYfNS$N_7aB;?iq1fn|#((@J_~u*!UViP%'
+    'y?(hugL;-YV_6Q#yf=ogWf5q6#SIgeO~r*%e&U0%hWIl$72H=P(pDue`n2rG1uNGv=w_D(X)jE0_>o>5`TIE3e!oaM0j@mf(HIOV'
+    'yaQuK#o^rBddRbhL!H%FrRpH8IXMTctS@r!I&};*JAl#oAY}gdC}svK(w5E?z9G!Qs)jUafXO<3TyzD0g`A+V2L$Y>w4^(>3S8T-'
+    'nf=|Y*<r&T*khFe>))AUZ=YmZsWFgGsG9K}Q*AUJNRn5VdSdIrM0y!91e4mW`C|PTyp)<NE(u!6$@kZ>URozD^E?Rec^d_-74h4m'
+    'b@=^QB=pTZK$}AQ^S58O1dIQ?$#;7_rpjvIluK7>U9}w~UQl3-&xk(`WwO%81$@kN99i01iARSIpaDjHw9{ZVJFn`+wU2%SPIM-T'
+    't1_$ou;Nqc<~Y@%8`lRcg%1uEEbJ(PvHCATj3^cVZcyZR$9nSPei>}5`h=?HU!$~fsqnm;rTF~7GrAesC1h_<fEEYh8@)dY{lE4m'
+    'wvB~n3kGp>paqY)jl#Ra>!hm}E*jRwp`WiguHP{R733<&Z24NgGSYx+6)J_6hCGyy9RfX4hvI$RICM9CD;Rf+ET36!ga?kvv%|2d'
+    '=%pRN-?kp)Jx<7xsuMYU`x;c=p9L=Y-O#B#iN{(zhhMrk#jVG-h;hqQ@vz-6mXH$Xo|l3Dj!&fZ5ywdO%Oo1QTo=9!a3@K(%JP>M'
+    'B`CG_q3$cA*z(&&IA9*ekCk0;#5HpkBO|%XJ&6)k`ZBfl<IvMaoIUa+hxV+MypJ2kXKfb!<NYH1uvd0`RPZk{$#aBiw?1THHJc7f'
+    'PvUXANHW}73CCwF6_afS;Faasoc2=*`#s!?F$>?rbsJAU(DG3n|J9LqH0x5fsR~|-ek}H0auJI27Kp!>FGKhFk>sbWM_UylafxS!'
+    '*sJ{`O*9SS_{oP@D{U64*H2~5@6WL5Qasx>EW#M`U^wRgh7Erx;>O}USgD!!uN%g3^p67+l)VFe9e3iL=b0QcIZQZl<hP(O?kU|V'
+    '+ylLhBJrb~A||TGiV8Muq+GR#KgVw)r*Y<Fm~Fvrqg;5Mbul}bF5;>4$8xAkF?j#IKr#seULW?A&J;PpluUgdJ;npxB{Ye?!VKto'
+    'wgP8<dj$c96|j9lr+E1GQZ8-G!9nWL7+`m}Tz1UAZP|X7LNiOn-9Lu%`pjG&e0L?k`m2jodKS>~=P<sO8diAKe5G#pGQ_g&auvQw'
+    'gM@X1LLjp!9Tv!Z5PwK+!H?!RZnjD%>v2n9p3Z&@T-yv6zifcbW#ufW26OGQWq4$XF^*IWg%#%c;=tw8`CM!++ZCT<o3B?e?PPEI'
+    'Yc7imqqMl?9}~~F?d4qGan$3B4Xsum%im3+;lv~tKIUt~xxux<<8~L^rewlNTS7U`<PJ=s2wv2CE>1^H$hk8bS04`I^Y7j9@5MHl'
+    '7IR)SJ?@5ax7|toOgN;pJ9A0qN@}gmK-FQVs4C?)B=y-uBX1hB{LVJou%_7d#Ag?plPu4+<>8X*G8uF$d;medJ@9m|1-zhg1f6uq'
+    '6OV3RMo#}adihpYo_B94p8on-EKJg)|8maIi*cK|exVsp9sWU>-m!z{$Vi~2K?@dWSK-|w=cH4!E5#(&%h<DYD|n{vCjISyU~<t8'
+    'o@f<=`5kH4>+3?eb>0>2M<M$qD6;96wYaEz3!K1jq-mnWb&XHKT5d4Nt%=~P=jLJ6h4p0eU7K&z=<ufAL-^)*MLao94aJGbX^*CJ'
+    'W8y@<6h$a=T#ZeBdeQ=$H8|;Vrl9cqEZzTX!K0>zLFwIQF;zDZRpZprPir6sl}w;l_tfEdvJ>y<{tNs^ONEgg4`^}pCsBIw9}@yk'
+    '!C{kraH-r0jdrg`O)U)^7#~iXO3NT@%1Er3s=+h0mGG-^DP1w%N0qUnxPCxi4!SnLw$G%?kYFDxBu{%lGfEmk=cFwAgq`Not!DVQ'
+    'Oo<1YsIxfZ0yIj3QRl85_MiWkO6mrJX607a3mpyb4liIUy$g_kOGB7^x|$Y@Ur+J6Pho#uh9Et*T6h?0K&RJg@{zymNUv`KHihmJ'
+    'yBAuM)vs=BRiw|GPg(I0+28cRM*{1Ij>I!wek{3=$^i>K(0R*ns^Q_tM#&JD8$y2uhw{^%3s66G45~GEQb6S(@#g$0KH@(Yw#7}y'
+    '3zI*RM@a}+S>B@6)1Pu0D~u1lbe;ZtWsc)`7Zk5q$d+5yNlo`of#)MHh$=n)@8z1fZA}`6cGtwWKc>*cj4NF8vzE;g9>Jpn7eVir'
+    'CuUS-@w{zgF;8z5syyqY=pBA&sDXHE&IQW;;sJ{Dw1uj7XZhy45(t^Dj>GG+>4dr;1`k?>L`THHY**g@GD=$afbqs>eSG?H7tVAx'
+    '<Iy#M1yj3^cfMlF0TFim-}@1~*iQ<Y8VY!C^GEs`GE1CgI*ZozQ04<phVZAV6S7qcV8Gm+@SijvhWCqv2i_X&t#S}*fA?dH9WhkW'
+    '%N8})jpDlA$}Dk<z~3gPL?5NwV)WgC@X4T#cC2is%a;+SeZ9?#ch13%glZgEFoU&1risa3R#?=02X>Sn6IyzlgXyr3ns=KCqsJn4'
+    'k1OM}f7$EIX@IVogJ_Z0K8`otjn|jgf}P=XJnaiyed4OrXnz=M-}waYd+KSa;vVF!H^{o*Ou=m201p513)22hqHT`5@ypp1nAf8K'
+    'RexC1;Hh1Zud)ZvIYx5!l&j+J^*NxGHyYdhBzU3Jm2&1^73<uMc<9VO&^2o_DJVsY=cc}<H6e~@u~&wR7kr}nU9)N7D+PR|_Xd(b'
+    '9fanOLxmE5FYc!hMq#4_ZYwC|_Zi8!Z~ih-K_OS@KEj(e4Lbr)zJ{a0aBVzLcM$4)CSqKBrBtRxoAzGm#pCBXV`@YyHT~PIcbhzM'
+    'XIU7pe>W9xP6M9dFqP*%pU-X*sj#L!K@4xSVyF2byu2j~hhA4^nbHP$`5=S6E?U3~uc>Gus<QOwd`Os`0lC|=#97W$pwTdm108P('
+    'FDIRVWr3G4!_<_gwYJd$oqcSXs=_a3z7s7?j-$akMYMN(Mtvi;lBc#0+U_k7)D2=ds<O}cthuRp{ryS4SyzrZGVfrC@d`mpxryrr'
+    '{)81XM{u#<zZ}UP2R&skd_AXuKR>X?>K+?7T5}a!C5K>di+b9~X4v*l0P}^O;;fwQy!Q1H*ruV2>TeyeXRsp-csZI~RF?88`7xq;'
+    '@H7lNTnlpp>OnRjnFp+%j7PS(;^Vr$aCS@;eLfrq$1>tMICdWA40;TH3Iq8a-i5xat+>!Kf@Bre;Y1^C`d<a-{g?Cm1z^$8(v%8C'
+    'X_2HwJ@5NGB_+yMsFXxy7LtrenkpLFqN$Y7R6XzeJW7MMC@Mtp37Hv1;p_V^+^=)4>%M+DTaPKDS`HFXM=ovr*v9;+bAxiJFkGhD'
+    'Ng@XI=zDtsZgGkQrpS4K=8PAR)1yGI=bb0T!xca-I-p2i2#QtKPy_kHczkCfsK+WWecgm-<$09oImR&W??1;ef%zb{evqy`I>^3S'
+    'T0}fP{iP@F7m<?3QAFgSHgFw<0FJ6+|Jn1zYI7ou{4ksTl}V+$Z|dQzfB&7I@hP+-SPG{3IuoC_dq{$-CS<J;hXa>~NpYb+iUx_$'
+    'w^cHDDbpMGp4Ox0u_AawKZE|-Yk+eHWw0s80)M=8g-<G8?BO9*5dCckhmV)zFP}6d_AgoCgEwK@+Vx<f+C)W`$dh-vO4aUat1xwI'
+    'Fz&h{4u{J_@%fx^dikU&-R)OHxp7}1cv2!HOY<=<%#-*TtKs>BzNBHxJ+jK%fx_JdIC3eO=Z1pJz8!T~mMcuXy>{T=z4NHjB6GOn'
+    'Ifd-qRD@<bBbenq=_C}^keYwoqniq$aFHYN`w>T7#TF1zn;qm4bB#Pymq*XLl(jy(0Mj17CC|VDk`1bfy_y<~)=0t9?s4QF-H%xN'
+    'fb|mc0qFx85VcVsw2f8a?LI-GIa!@d@z(&6#58hh#aB9^GfsD!@23ZDZNM)g2kEA3*`(4(68n`Sh<~dDp0>MB-`W19K1;k|fpQ2F'
+    '+&n>y-ICd(Qv1M?l_I<)kLjL<Yvi8e%YWVb77o5y4i4f)gme{=nje)^RmGb2oRR`{@eZt9!2y5QaypiL+-!97YbImuRU8?fO!|3u'
+    '*?!MkH0$<l;?VDmP4<4|bE72OzED9+mYhI|Dn)Ypg&VG3778zYuM#RW1IDx@AjfM96`Z#hmny1*d)zlhu_%o4mh6NpUClHwV>V_w'
+    '-(qA9obiuuGg+u`f)1^}K>E5>AmY(x$j~qXmAScQ;*Iy{@rj3^KO+tg=&Z$0G7O{t*AFaoWH3m;fe5dRp_=kRu)TH;_@9r&`*YGr'
+    'eSHGNhHS^8=pG^!co$YJ&&Q;n>dcO64YI3Bn8>na?Bw6R@P0Ui#8C&VKUhq+tczx@O<6=664D{_&_5?^x<_{j>SICgW?U^3j+0Mb'
+    'VQ#QXxDl)EK_+_*-MuoKePzifb_t41{FO?w#rFxxM=Pj#+DFskY&iACsi5L(ilt&NsmxNF>dw?VJcE4$bf=dH=HDzpPs!<IZ}1t2'
+    '6;lR(eN*UG_}7z1^l^b*4k<C1f=Z2k^r?UZv%K&&%fuEiB?_NeeNkV=PEVJaIlqk2u1sevSI%X|B_|Wr`=6LO6ONo0T^~$Yp(e(~'
+    'Q=aV4zsoA*i*l-pyx6}D^Ju!kLUwz!1zEv=$2&W_fyrWCvi1HYW|4}LR7tLo7`i6&L=<O|;8{u}Ogn^?IFQ0bZfavP6|2~5I=wto'
+    '_dxdA9#yiWViUW0C$f*FHZqAEJNCaxnyhBPd-j3OQPv|wmB$>K#I}vdlGI)ySdrPwj9v8vXWJJ{YSt9gRlCaYO|HSW(+45LJPVs|'
+    'm(U==FOdBw4r~@%QME&HXy7OdZ$?$o-S8ZZ(6oe3ja>Rt@E&2>Lty>qVKQ^^PPAIkz<#c_uWk)pNo`Y?!1nbEs=Un%_`BG8d|n3R'
+    'ui`8A-qO=#YfTX^AXE=Bvagbv+XFE8>n?aW&4dVdSHMl#MierNhG%{v;2Sd^KfgBTTT9kc#bry-FxZpox_P0X#|_%?@*5+y?kf|Z'
+    '_!UF?_k;P+89MSx0{$Fch!>xB;!}YkNZ;`TJlGsK*A)$!+w$3#pGpvGP6>ZJ3OhyPiQSJQ(A@eOVkSvLS8pcGEas84c7Mp-k^&9G'
+    'XNZNmFqZD#PNU^4$Q{EJuul6)Pqw{gHibT=c5^QhV_6HF(;-Y(pRz&iFfJ4vDK~S$^AL9=hi<-DO1_+`py&EG<A~=N_!sWR?3Z;='
+    'Q?vvY1p-L@E=9|?#;|7G2~YmYr_&~q$?<Qm*}%Sja=E7+Oyrcvyf2{yc}L0AmC@LB-xk-#1k?QLC=9qbN@lt}W|G?kVE$oS=6dik'
+    'GCD1hdK8FreZ<~T37ck`{NOe&DtHZtHWFH_atwvzrJ?7+WaM8G!*_xQs9>7~oLjmYfBJqT^TO}p$(sjYr^sh){#65q9e!c5BZG}8'
+    '-^j}!?$l3V8B}=RA;&BW@y2;E>=vE@GYr<l{M8N|o=Yy2H56c(col5?)r4Y!GMHzs20L}4{xMq#-4(kqUS=P>I`4t)8C7`wzaXqL'
+    '{7vf9HbJEv!1?FbiKWRd_<M!n(hha*98M}#5YtC^6N&N?@#xu`0_pqQu%UyGH>c{dk@k!6luH1dFp&qPE4SE~oCcnCP93<Kv_tt;'
+    'DZclOmCQZmZ!|u7gtlySCZTV#nIl)$g8Ah?ywH`JV4nI1s(tTql-4Fu!=6@{zbOR7q5xb^r$KE(IfP0|fR73fyUTAug~4m`9pmWA'
+    '?_tC{{1ylqIndI)<uKJZ7w?JdV}n5wGkc<gFsF;j?uVQCGn041Gtc?V!C8~(LD>h8d2cNSN-I;Nrh{buu@L$$b|L;Z)1EdJtiqoB'
+    '2(*5d29op?9eZU7zfa$R_hVMfvZHb+8*j(Vj<+N3CDMdvX$zN>L+EeY1(;msLu70SevCEY=hU`gy~iTB;jaj*e@TJOpJ5Q$I8Mbb'
+    'Eu&fq2WZfoJ~CsG1dVV>1TQ^pTyr>`zHdZY6{HVtX;qk3mk!S~&f>9~4?upc5`-L-L&qygOxpz`!s|_jlyFDz|KbM;DL=`j$3o!c'
+    'um|G5MZu5c*RYXWO4>UMIfvs!Vd3&T{1YsKhbOF{Ptb|PP4T5g$!+WnwHUY-A3`*#7FyLC;l37ivij!*y6?e$qI2DizVm#FxqEf!'
+    'oQL+9TPDPBO)Dh=CS}l75{kutpAr3M{dCK+W*BZ0;M!R_puD*-dbhd|@bx6GgID7$(QsB#ECl+Ed2qWw9&Ep~<E)mwRLUS2hhy(j'
+    'sq7heL@)<xtd7G;;bSm=o)*V@=rx#_1k*Fa1#p7NAzyCVfZNvN*tW40p6G`21cS$`WVI;r_<Atpr%g6wYhi7`R=T%%Etrj_u%zQ5'
+    '$bB!y-1U?3V2c#?A4$fF2|>ok!5GH^$8hLmI8@np(C{6f$PWJ;y8nO(mRB`nN|6fpRZ=Iz5mDgF)JIT|G^FwNju1aP2#h9W(dA~('
+    'NWjv6er${+8|TeL^-mG_;O0$cA|n%KnRe2UzdxwvvM{)DRu{CRSEH|6H+yfJ1m2U_L`web1;=CO==8j`D5t*_pYYSbu!MsypQW(F'
+    '$rH08)ak`NQE2ON5f6L#&?h^dP>IjlkYIKd3sQV=Xr%?L7!Cq5Dh3UoR*|U<2RZ4hUCG?FDd=iGM3<*trr!E$G^foEr+L3%l;<YH'
+    'A4zez6V(l^9cyTJVl?JGDZsQs8{k%7r-IRZ_QyX?I~kuQ<r)j9bHzo_sJnvoYEi^zu`w<TQsr+F5U0oNu49jwEBf5L3r>r@(bVK6'
+    'l<`Ao-*Iz@un^|XIsJ{(Q<p*o{A2N_)-#sIjgoT#3Fxus6{Kb~L-3*-WaX))aPb?L>{+t|ALb>K9Y-%<+RPIC)%%3DD`tRW#YOhb'
+    'pbstadPZti%D{o(Kh${IA^1^UkBv|7kSE#p<kxT`PRnovd4q-AP=l-V{lFE>RyE;&S3i$$62;(cXawl!L_*h-x13cb74)PLkBr?a'
+    'geD7REId?4N91pkqFo}Cdc1_BC7~E8bOd<KXE5@{AYF2#lEOd%vn%5*dAd^ocG^nuH%B}s)|=N6&b$G-A(E0Q<QMsBe2=b^3WhqT'
+    'LzETUPWDA-lD=_cu5pGnbzNn_NL0&#7B`nUx9<uJ!9yHusG-G*(p;U`Xx#jI6}HDd;8lJ=3?9oN+;SiKD5eRzJm-So+g9?EnFYJD'
+    'GN3Yi5IaU+vmHE3G<bQ22_MrS-5$HKU0jqOy!sm)OQa~R{+EpPJHn0RkDPUF4fI!IC5CUyAa$-<Y~lDDhBm99eOVHW<&P6h6?^(b'
+    '=nTq6KQ^m&jbJ@rJYqZ4KI4gw1c-Q$f_D3Raf<mioZOp<@1vaH*RgzD7p01)!!`r`WdQ&Enaj+!E(K|s9SHLk(d=>rdvkalF`jY>'
+    '=CnEBOE+OKS{ILYRUzOSyc|jNMcnW~jt150!UdfV^vxkIG=?eiPwbI~9ivGo!94{NE5AYE>`1a~hdvv5bO9fa_tDZtcc@TLHSTLX'
+    'jFuq5KiYBxoSAv(<ll@+HZ7QB`4$o^uY-EwDC@B>AC`5M(%%9~FnCt3dVJOiFj1b0lIh_nQFxbeHwlKI7sD{|U?$dowZTO*HsY2u'
+    'ToAB&LVQ(~=+3zf#POgq1RN@5_DSA?pM_U2U-==LK6?(k-uQs3*9;tQ(S_?DF5xT}fE&HNoV4~pG(0dHRyQi}1z-+5kC;SdwlZLS'
+    '*B@Vd`*SX@dyKv|@lgBo23=lo2}Vz@#aAhz=&hxJpOqq^xZ(-cZQBO7S~Y2elQPFB+y#A~P36D+DN82BJfsmmJ>=&)Us}^+4+eKD'
+    'q3wDt*&lzLEj}_#+iwb?#`Wi*b!jOK58kK!&qHCvGXpLLN1^L@CKyVIp{=DNzy7x|Y}gzPYVwtI!74reiTwwGSs@HJe&(>**$dFr'
+    '<v19GC!(|N9Wo_SfUo3K1B*7rV)I8^*tS>%?`p~6fY)BK`-KEuzao=_9n*q}{unqh91AHs#~`J48MZHOMro@gxJHHHrK28vR{w^-'
+    'h4M%Tdxu=xcO6EYe6WPCNNc`JLY1XB)ZTat`|C|%Xk-<2zV{tZXo``ty>BsxJ;{caZbpFwU7A=f!S62&z>`x{sr~a81Qu?=jR($B'
+    'dBF?R_wy}~>*__O?;0b%Mh0{b&w+wjrgVb=3u807n1I?5x?@fhV<#>M7X#%;S-UXjM_n%#3YY`he8ASM*_6Lc9RrqK!%^`wRK0nK'
+    '&K|f#x{pSo=lM7EVecd0D6Yh7!M{oNsyApNwT^5M&St9bMl<%`BC){m7<ixXfuV*J<o*)Gp^5Vt<sJ<S3O(TY`ZFk*I7~EUk0F|N'
+    'P|<_5+C{j7^FVZjY~&|HQO<d`Gp(KB9bE?T>wcqV%0&#@@QfrFoxtwJ=V^Iw9>j7DVg4QiSdc#*G(%&+$+wi;ntl?F`u+#mMjO#@'
+    'bu9a>`x>Kv=nM&~{EvP1r~&WApT%#_258MX88qEj1NAOn>Hb~^d{A_YhW(kvy!JYbhGTiS{ZTFvI5a?ohcx(UtsjZDcP)rLZ9;kF'
+    'X8gK(7PC%C8KzF&f{QkCv8pnZ2u5xo2Q+T7PQBB(n|}7w6LN1@;bmRS73$0?)h~hLn!?-yWjA7ICWvaGS>U9-5ghg_K$gQ^Dmf~M'
+    'O=k1yKHYmn`DGW4)U9DpM-@=r$8p4Y&j_70kHdb?@}ss(S3`4xIff+$!mQb0czo&t=nI>Mp>>UPr1m)xG~SHbr9%ADs>RT3ML=-v'
+    'ePVrM1|EybLe-*Z?9jXhX_xir#sA__X8U_OH0dk7B+~#vof#w~auq(z+C`d~AmVbohE}Ha5}wBeIvmGfO{Oimn$-z8CQIP{aaG`6'
+    'TS#-ejd26V7DX=wlZD&5;D!7)?lbdd)>Q5#yG(R~j9lG-^OaSgw%|KSR?cE4H&kFq>LOGs9ieBA3=;2{c6jvbE^RrylJb+L@}KS2'
+    'fS>!4ksBJuhKAmRL6cEfu>BT@{nCYT_8Y#kHvo~MK8Ptl1*6yQ(96rp$=#|q_|D7CZ1wY6@Z4(&byip4!nxyUP@ajxHW4HWG;!hO'
+    'L|kUQA7s`>5tolPP|+#{T3hGhk|Gv4tLwq+!Cg9XPZzuuE9huI6z)DLLCqWHVypdA<bH1_sm_nVLg^FbCRl<;`6V{XO^d5M8iPqM'
+    '%ZPE!BUm+MG6<_b<us%s*2yg<Zf#%58eya_*39K689v6H3tb^v)spgDlIc1S#l>;%aN+oFI3$@4ZBy1lh`2sHO5F<6&pZOB%snV^'
+    'Sf9Hx_d2^QF%N{6PLMLYTTs(7MnwCQ$u0voI)0&!NS;xF1#g<Fi)|?QUj9qvTrMGR*Cg(R{$=oUT?T4=R3IxFMPcUG7w~zXEi|d6'
+    'gGQ+tEFDbZEp(g=Q_~H(<$A|i_r#mDJYo^<Tl$eTuzm!%r2*f!@oDi|gr+e~HidTzw&+&Vz<0*zdan?4ExE9LWd`+-e+V@VdFWT('
+    'fk(6)z-YECsXf|>bM8ptO%g*^n$M?JVaoiIJ(=XQ*&iC7q5*4u-^F1IB|`g!@#Lyjy5n6VIDPHFb<a&eYH<)VDYXFC>)6BD1!|~#'
+    'po}dY>tQrDOhe82Vf10!ZT4?oBJ6qakh+$a6C;U2uzuOhoEve57q4GI%+-T*A%{cPO-h7|H!JX}yfAzl%qJ%Dt5HBUk~SK@CS_ZL'
+    '2=~ids&Z~2c8MK?tfwlR;UkN|@WTdd=yrmm62^EZA)H3--i)Rib5M4j0(T?fF@eWrV4?DC{y@JT`cKtBDa|REIUI@0-#+3!mfML#'
+    'Dn77OQVFk3y2-BpxSmFhM&a*}UmOXIYY-UIMC*$ra5Q9uajA2q8TTjiU7wPFyEzBP*9N0i**kV1?IB#wze4hdqKTmO71Sd0!To3h'
+    '`=l?By^_hn{0-;vLEd$k6lB18;vtChByW@A+A3K6xtSPT-OL@<ttZ26?`XH&8Bh&zqdZdwGM0La>W@FcuR*&|;Nw@)Xwi#mCth-_'
+    'W}d*LM^{0)JOi}{XG2r{7??%Z!-fxMaKH9!qV;GFh^DNAje&c><fjO%|I&m;#|<D{tPRg}J%*viX=L`c&2*wA5BT@Gz&^hfTyHM{'
+    'PRlg*(N-^3rBW3<%%dS*^#vaOuNCjhe4@W*JSS29E5PVWWA*w~jYQp08@}uj0{H5VCkpdn^rHdTBp6}HW_Q{$b_RC6ybDWjo&{`5'
+    'gT{_wqCfo|$s4l91?fUur-8LhpHm>|57EK!6((T$dlc-ZE8%ud4^fbx#z=>W;n1BgpuI8<yNyG@;L;~t_A3W2e2ayemm?V4o<ny^'
+    '?*#tmtsq?ai!erE@aM^T>`Rd3KHi$f-dn6g_MNdnu|qskwuwVE4v$d5{SPsJ*;O9lMv>MHK^X8ok~l9cflpxoC62GbdXp00dd*#Y'
+    '5#P?L)l>4}1D6pLFaVctCCq!fIM5NAV65uO$g35x=>G63^LxfSnCZHR&eoA9wrP2c)a^Z>d`29<mtUj0Z|>8CqE@Jq48&blhp?6t'
+    'LqgV6LcIkAr+WureAa8~k!XuDH+gt0@dqQSLBIk8xgQoT1#SHk)dl)m+}HtiQhX?zE^3njXRF_g;xrrRbEsegVpE9D{c=2I5DJSd'
+    'W`Mi;Gz<{Zgt%lr=rO;kn&&s7kUf|5J(J;j)_kVx-&ulzsXmsuy+?JE2W*7MMe@w1n7X`q$`%y`qQ<!(s&>R4f&{)$Yeioiv8;!q'
+    '(-*<VfFYQ-ZH)drvK3;~9+9?%Q*mU=LFA1UlJqwfu*x9<M$#9N0C{Cn&#%E|*~9o}*9AQDa|X>hzYA8i7SqKmec60fBOHB}1ozt`'
+    'QAR5rYy4+Iu;N})c)yok%l(Cm&#9nn%`&_}9I;++4tL0A7OG77Kw5sD1EZIs_+2ssGu8-kcmF8Di-8+h+m-34I6r}edbDwtB*=r1'
+    '`)|DL7!8MH&XEs_-$?P75%P#Ol8>7%(SchN;KSKTtp<yMY&M35fN<P!bp@n98>6`@Vz5R00%W$N(J7PX5(~Wpupsq5$TUdsO;xr*'
+    'p8f<)EQtoQ30LN}=6!H%T1vy(ro#-YOwf8ON&8<$v5_SVyUM*EI%dx2k|q}_{d^71ewqpMR`{ZNY#D6roJ(V(2Iz_1z04HT1UM$I'
+    'fp6TC$zWtP3HFmF_a!x8(Tp-O@l$}YsY@cc$~T#ePjR%$rIgl4N7FalCR*6k$5zZ&;KSSt(9~do22)-!AL%;!bBzP&H)SI`B1Io}'
+    'yx|$_F@y}0t?<`60-rZ0fzoac9lrmCy|vwr{VH++ad$k)D_5Z7uBlKcYY9Au2BNZ48}d^UAoI-`5Scg14hFfPzn(Py7rubAW0DB{'
+    'G5soxZ12J=`WMIvO$D&sTZ0m{S4mjJWKe5i>6Sk&s4Zgv&PN0w@6vR>qh%$mezg#;Y8-$oO3JA8Ujw~hw-hA%0P?^8Vx}D2gI_KQ'
+    'fkkf^oOdzD*iXk89(J%X#hPf~vX4~ns(_KbQP?=^KcZJYjK#JG@a2E|aLmLCKj|xzux>51>b$_oo4y;b6`6xh?PPAUaUF3y^N#(b'
+    'bcZe0PbU5|DTsQ1gUkDZ*$b<@7>C@e_(Ss|ep(tp66MnI$r(BBpq&-=nu)Uw%kNWNeJ(iEETnM~(d6XnQe5>+64e|}V{u_4t(%?%'
+    'rwjnSR;h!{Kp$K^=*CJ<bwQ02#&9m<Fbc#);(&1-9d{6BcUwtvPnXVv8UHx^IMtHr9QR`ueY}8gqI~~#X%7Z*!!i9uE4z1mCt8U8'
+    'pfXmWaPfO8&9O=$@BNoUDnx=^YXuJa%!c6WF|c}DJEWFAN9jfTK}SIse78R%_n8P>;Mk0=EAOMjge3M23DM(ED3phJgP{8qzSdGl'
+    'j8S|Aw(p8ik+%r;>b<9Nz2dahQUOYgC*iKYCd51aJXGHMz^sfP1iQc0G@`tSthgEhN3O|1?!_GFR2@Un_cu{tvmpe2amVzur5F&L'
+    'hn(>#*d09?MDJ8W-R+Z@*mRH1++s@FvYh{QN+C=d<)L2dNBq0w2f0yR!&`bc2TEr5(s`>yLG<BVKIG)03MU+urr)RMF4xdal}S`i'
+    'td(-ht}`o<kc^mMOsaE(!1ud|XjCUACsxxXQ90NpDgtIlZc#h;OU&(ut+ZnPepC(X#dSJuxNx^D92GSKUy)OIedjf@Q^(V+Vk8<4'
+    'C)LqYZIf_(&NAYcvl!#nse#}AQnK@i8ZLMLO_kdhLSI!G{0ZL3-<&6g*PnXfK2=!^z$H{Q-v?(K?Z<Nm!qBmQ1DNT{vZtq{(<CKZ'
+    'G<y37b}eruRYoCb+SQK1<GuK9dL8jq(1I3~`7qy95>K^sk|(DuP=@D$8&>~-F41F{+-ylZduBoS#0zS>s|Rq+Ez+5tLMLpaFv$UM'
+    ';|DLatYYwHWi1rNL=wfIB``2;E!>XC!Y;W?UZ#Ny2#bs0$9@~yl#~ebd<#i1%_e@y=_K>54<=2&fl*@D$;{j!qBi3$YG0A&pZBmO'
+    'vt2m6so_P;lZ)OsOG|_Mrz4H_)ocg<8!>SGQv`h5&_Z^bUqb21R+4ha8Hi^j%_zQ03?oJPF<YW=`j{k9<m+N$gCF5+l}Do>XUwy?'
+    'f%Dl^c)F+@CHAZY3nvk7*}fU{T6_?ehnPXj%8$hSwLHprte`1X!ramX72G2(jWcq+ptJctEl3r>fx|nX&4`kQJH_af!>4ZFk6>+>'
+    'CVulufWZD1%vA_NXU)SP{z)6-O}z2U#mQ(tDvIqdAJgxr9ig`RHJf7flR}p{cfQ{YzD#5mL`&_ZDqVc&ikgovcTeX&FNnj1cEu$6'
+    '<Q)E|tOIbntQ^|Fo6gI>ijrxOs3c$w9lOL~>%3HaZej<ljs&;7%Nyn-F2R1EpP+v(g>8H^ng7l0Gtc>>E%JX|!lD;ea8<H_eX#W%'
+    '*^^ib=7A36{W^Jm>y6ux4F=G#&lyS%UZxY-J#5uW9h6&agpJ%hq9ZSePdkn<B`1<ugCa2)Xj_aql?E_X@*AVIJ`CuHI1SU3;%iIE'
+    '@ZCH!K*M%F#%s32pT&y6+v1Od7zy)YEI>$e10A#Vh6Q=b=y5#}9yxxYfgiVE&5=-Wat?ymVfx@zD+Q%Kq3Er47qY^9u+?@7+|CKW'
+    '<QR9H<)qH9?Y3m%+k#L}Y7ZRfd5?Y<?ZLt<06e(%yxh7*Qr~!iNJU%1hhPcrpTCa?@pXXNB~l=k>p+D5p2hc>??K{LCUkvsMS+5^'
+    'WHCL2+nSDG+slRcSELLjbB!@hISKN}D`F&c6=U1v;74i)c;!Wqt~>b<ksOAKX}>UZ&kYRJsie1Gp90MxcUIT_1qN2u;j&jIC_6Mv'
+    'YoE-7qg&oV#_ke4uRTf(+-JhT<N>mOX(4V*GbRn)SJ7|aFSQ?x1aD^x(5pNRjV|%<Og9!ANg9xY0;v5m9<5yx@bcn)P$D6PuxAa%'
+    'PY<Ui2R(>$^IA5-#S5ix+2OA3xA2aU2-VvwNw{XOnZdw#+$S6Wr!z8nS%W3)G{e1ERlXEe{<Z&(njo^(-+_9>ZYPFrmtnt|2!GFm'
+    'Xl9@PQ95Y-j%}`yKvxV$0jX@dCsU7EH;+e5D`fD4qYAg^K^eX>4M!q13SrgHkb7q*{tdoF>8&aZ&R4|yzHd0^N08(Mn4%m{hTf``'
+    '<a_?;LYqckP~YN%cY~yf!O5$*k#!;oz8`4V^+sYXdyaN*>nC1+yWsQBCiZ+BAK8b8@$G46+$GvfB_+>6OUYY$c$F^nfG%~Djr+Iv'
+    '?VQKOGg13P6f|i)#PjVD7#|mg3taMPnyou7))>Vzso!a8xiB{)u!6JRG9F~6+yFx_KMa{T%2=zNXFF<pa7yhUy!e)iAGB^#tF<}k'
+    'D3nd#F9>11ZY$#~`B>a~=L)^1&Sx*hKc}N&JXkLOn+O<|p|0>$^i>SR9a08pYSn~wLgH|4=pHtOe8jb`1H`$skAPl1(ThAuhR=Cn'
+    '+&ekYef|^+#OKqPgVreiWCNMHV==wmrUe&GCUMuKH_<7Rim^ag0wi8F!Y^%q!rE4%i19<R>r@y0)uF=iocqta(p@z5%31W3a)8ds'
+    '!R%eW5G(BakL&&Yba`wHC|lnqA|*HB$DPNR7Hy9sWqz2p$&oJIcoz<4yuq#Nd~lB0LluQ*a$PDuqxjx1EEf3>{aOv6Cx(kl${ZPI'
+    '^*-i~qA@t6>T@FN<7mMR4t8iqz+&llY<OA#go?$Y-=zH@H19F$JUa`jZv}Wq?+jC^yma#6d=~Y)SP8dqGpZ)uB@g?8aAkEJFa^S-'
+    '!bl1tz8*rWffsOoMl!izJA^7d@5#^HJRE%12v8x#%-xd<(jQXru%r)Mom7sh+bdcAs4=d(6$ghlcF@3{x!mcu&r#XmOQ=gsBIYh!'
+    '#HPESW4f&f-mp0UFHW12S4gQd`Aqu-pX2AVdQ9i4R^q6<1VW!Jp?{kS;pkR-?y2j(sHppw`X|r9&w2*<XK4u4eap~u+VKz;HU&R@'
+    'TFhVfUVwjR;x|v^U<;{}76x^*Y}j@<n0>9G4`lr{wshkdG3&HO(~n`;XQzNRa_6z)S1|Y`WzjMHvvg0@1Xg}6#iRNXSdujYl1F9X'
+    '!lV{Rj(Ce%I;-jQoE{L_{+>*>(V=PQW}`BnrSYPtV9W9XY+Zd8e%HsK?~XDeVcJKHq?)PB)0r@BK{2uPOrq;Gm*V-s82IF`0P<&y'
+    'S?Qo|eDiTC8h-i7MruW}{uA5iX$=KTtXz)ibR2&r#NtvV75HJK$hZb~!=J}Rc>M$yPsJ}I3E5S!E?%5lR*_2gDvR)EEa)L$eWmDw'
+    '^HTgZ4@Ze_!(q5nb($)Tv1lb)hxS*b>A*Av>@O>U@k>r*Tg($kowop%dD%i+WhoZE7lXR9*P+OA5IS>oxZ_r-<idpsvLKaUztbMb'
+    'OE^MJx5?AQvNU2Xun`7=M5*cCfA8rsneTIP8GN271{H{Ari_l$u0UJ7nVe6wy}cl%l>?4K_lbtS7K-Gxfs^DkRN1XUrKC&YKT%!!'
+    '_t+CW`sx<gPfNmsu@}IeRmKMQ?Yz9bMO5lt3??54$3)#gu&Izokr7`!`}YEQv>_hvAN0YEH=9s@gaa1Km2e_J1eFY<z`$)k#;T~H'
+    '>xbK<_V5-mW5-Xzoe@l@MqUQdOHNp4smIi~CqVd;$*A1(Zze=q@VGyp*ojNBZ_Z7F(rIZRI9nAr>Ai;cR~F+6Lx1?H@&Pvf|2Cj;'
+    'DBk|4KzxL(aD!PBt<U@Chbu!AR%-JkOrL{m+XiSk;0inM#*vsHdrTQvhjD$4aPD~}cDe<imYpm~5x5NV95&&Wwhky6v?1lImf+`7'
+    'ibmtPFi%kyRl;m=<Y)k%XWr7U?b*1aFAFB0O~<h?16Z>(5)|rH@fj0E#lpS;YaWeZk7LQE@gRJC>n0K8oc-5<SCMQTB1N9=oDKK-'
+    'i1ao-{9vNlGhVjHK1l){e+j;g;s$y)<sv$yjMA_`C#-FBW4Z=yAg(eDJ4Fo9O(22RS;_KSSJ`9I>$C9wq7#h$HsA}qnh9e?M$q!n'
+    '3%gf~<4lF$7(3@VXeZRO%enK&oxR<}FWVIUdP{*)z)V=V#tdcjLqTo&4D8v-!sRu3@b;Avthtnq9__lY?_(PsKWED?UwekUu((W~'
+    'Dc?pR*UP9ia}w7_OqwgB{e=DaVmS$#_({G5?M7@j1UD^;ALnKeS=-<LoO6YoYVBjCs=DFspg65I--W$Tc(}3C1@`>w|3<cu@N>d('
+    '>$pE%AkV?Rfs05~EphQ14)jzDLjsr+rl|z%<!yLx2l8-ZauRyiPojZ4YdAkvNzu+n)pXeRPxbx7VXVCB6*4hBkZpQ*k~&IlqFvkO'
+    'GT(koXIq;0GnbBJah$AKW}xvpv%h67yQ%vU(LQ;I78vg*;(E4hjcqUcw(}VAwy!07pC&THwsE`%hrH>Pz$5JAY0lItx01c>=t;hd'
+    '8PWlr$ZB^x4>oOk8uf7PW%VO>5DISejx3jySLcvZtL%u}DQWsiEQ0<G$fS$>S>o2w!fI?<L&FcXlRle3f=g^5&~FQIElQ?em#jgP'
+    'Wd~rPg*6!7w}osI4Sf8c0Zt8=gTKnB!zHI6qysZxn});xZ~vp(P$%iK$tHu10{A1x9<S$WK>m(th>k~yQL_RpoU|4~9zQ47w=RSE'
+    'j3IuOH-+}{QL=WP2rS>b0c=0*hpzq^_)5qe)W4p^uErbixqCMJPMn~7Arh}EspIFWC@eTBgG~8)?0pW<mEwRo8bWYT#tAo9|Dh@S'
+    'OxXVcT*)IK'
+)
+# END EXPORTED TACTICAL VALUE WEIGHTS
+
+
+def _decode_tactical_weights():
+    values = iter(unpack("<6817f", decompress(b85decode(TACTICAL_WEIGHTS_B85))))
+
+    def matrix(rows, columns):
+        return tuple(
+            tuple(next(values) for _column in range(columns))
+            for _row in range(rows)
+        )
+
+    def vector(size):
+        return tuple(next(values) for _index in range(size))
+
+    weights = (
+        matrix(48, TACTICAL_INPUTS),
+        vector(48),
+        matrix(48, 48),
+        vector(48),
+        matrix(1, 48),
+        vector(1),
+    )
+    return weights
+
+
+# Filled by the dependency-free exporter from the selected local checkpoint.
+# Tuple unpacking happens once at module import; inference allocates no tensors.
+TACTICAL_W1, TACTICAL_B1, TACTICAL_W2, TACTICAL_B2, TACTICAL_W3, TACTICAL_B3 = _decode_tactical_weights()
 
 TUNE = {
     "gun_hunters": 1,        # SCOUTs sent to ram loaded enemy TANKs
@@ -155,36 +518,7 @@ TUNE = {
     "block_stand": 2.6,      # metres up the firing line the blocker sits
 }
 
-# Each discrete action is (transport hunters, gun hunters, keepers, guards,
-# blockers).  Actual drone/target selection remains the deterministic Opus
-# assignment logic below.  The profiles include both original Opus (action 0)
-# and Opus Breaker (action 1), keeping every learned choice near a proven policy.
-PLAN_ACTIONS = (
-    (0, 1, 2, 2, 2),
-    (2, 1, 2, 2, 2),
-    (4, 1, 1, 1, 1),
-    (1, 1, 4, 3, 3),
-    (0, 0, 0, 1, 0),
-    (1, 1, 2, 2, 1),
-)
-
-# Experiment 2 PPO actor (training seed 82002, replayed validation update 10).
-# Sequential two-second decisions used terminal match reward, GAE, and clipped
-# PPO.  The critic/optimizer are deliberately absent; these fixed actor literals
-# are the only learned state in the submission.  See the module record and
-# docs/OPUS_RL_PLAN_EXPERIMENTS.md for Experiment 1's separate supervised study.
-# BEGIN EXPORTED PPO ACTOR
-POLICY_SOURCE = 'validation-0010.pt'
-POLICY_PARAMETER_COUNT = 5550
-POLICY_W1 = ((0.232490674, 0.159715682, 0.0381896235, -0.208509654, 0.140812263, -0.0980458036, 0.165119678, 0.195858389, 0.203758433, 0.0950988829, 0.0648156777, 0.241403863, -0.239898682, -0.144498497, 0.297451466, -0.247851238, 0.26088348, 0.0828051344, 0.164824277, -0.133681014, 0.37379086, -0.0110929301, -0.211862028, 0.0112557644, 0.178765282, -0.110918522, 0.175040901, 0.504873097, 0.119648151, -0.152476147, 0.353286505, 0.0704206526, -0.0454958379, -0.0862551033, -0.0819781199, -0.0635204241, 0.26166141, 0.0944743976), (-0.0931899175, 0.0352136083, 0.420687854, 0.254321754, -0.211447835, 0.161324233, -0.136517137, 0.0819003582, -0.45200038, -0.31408751, -0.162336558, 0.0706828684, 0.301110119, 0.0711002201, -0.192001477, -0.200462252, -0.0928532258, -0.104181387, 0.0176672004, 0.081064932, 0.30058974, 0.276073426, -0.0283403303, 0.12528497, -0.0969971716, 0.170005009, 0.121909082, -0.17347084, 0.239054337, -0.281814486, 0.379734159, 0.137015224, -0.143238917, 0.0182865113, 0.0637052283, 0.26615271, 0.119901262, 0.243229732), (-0.0406082459, 0.0932564437, 0.048444096, 0.107688248, 0.0731478557, -0.102553047, 0.334650367, 0.139248863, -0.00523814373, -0.179597527, -0.324220657, 0.297091693, 0.245986149, -0.264172077, -0.223494202, 0.37183103, -0.359306931, 0.21868147, 0.192881778, -0.0721633509, 0.102175497, -0.188534856, 0.295932889, 0.262668312, 0.0768461525, -0.394181997, -0.11019814, 0.241730258, -0.177228928, -0.399873316, 0.0140044522, -0.147539034, -0.0267211162, 0.0553128198, 0.441809148, -0.0175115429, -0.0391602106, 0.0178396124), (-0.0989419818, 0.0360354297, -0.143575832, 0.0397341102, -0.0200653896, 0.0496858656, 0.30103001, -0.0786042437, 0.0815047026, -0.587064803, 0.206194699, 0.194463208, -0.177054226, 0.0425677262, 0.145363659, -0.305052578, -0.319019586, -0.265335351, 0.467857838, 0.0587800778, 0.353057891, 0.165258139, 0.221785694, 0.0223925076, 0.192627072, 0.371484339, -0.0654865876, -0.00242026546, -0.293988258, 0.0560059994, -0.024377916, -0.036565572, 0.164139554, 0.0923648924, -0.23937805, 0.0846389011, 0.0271012802, -0.293979794), (0.0462012812, 0.0899946615, 0.205395922, -0.0373456776, -0.0230116211, 0.0107705547, 0.108728975, 0.130555257, 0.177131265, -0.00850289408, 0.110330418, 0.228418782, -0.17804715, 0.084923245, -0.0887002647, 0.0375265405, 0.325725824, 0.073834464, -0.180014744, 0.108264484, -0.0525629744, 0.0689007565, -0.314267725, 0.0668965876, 0.187244117, 0.00939684175, 0.0121381441, -0.409766674, -0.321732461, 0.118705489, 0.346850336, -0.436403364, -0.220684618, 0.115072429, 0.104475275, 0.499464035, -0.13691093, -0.077117905), (0.0540570952, -0.143249154, -0.209162846, 0.42290768, -0.45413354, -0.0419199876, -0.0816892982, -0.0305228401, 0.102813408, -0.132717133, -0.166758284, 0.0786687434, 0.0540098473, 0.0635084137, -0.0198769849, -0.063332051, 0.559194088, -0.374131471, -0.167143464, 0.225813493, 0.289539725, -0.130220503, 0.135110646, 0.196133316, 0.201605275, -0.127174556, 0.0973778218, 0.362775058, -0.00613329001, 0.0494114384, -0.0833452046, -0.175082937, -0.0773234889, -0.148530632, -0.0684534013, -0.0336888544, -0.140143529, -0.00741043221), (0.0369914696, -0.119876422, 0.0278974865, 0.311921149, 0.135046542, 0.401811928, 0.0097956406, 0.349525094, 0.25947082, -0.251606017, -0.230378777, -0.433577299, -0.0206875149, 0.243830532, 0.512449086, 0.0330199115, -0.0149767874, 0.186079517, -0.308178186, 0.0953336805, 0.179281846, -0.0911206752, 0.143272236, 0.00343090319, -0.0667011291, -0.133243725, 0.0793486089, 0.178518385, -0.0783003345, -0.06840837, 0.394466609, 0.143507302, 0.280524194, 0.162927911, 0.156667426, -0.0617312007, -0.00460358756, -0.0985423028), (0.341729581, 0.15740867, 0.00925137475, -0.165345818, -0.0140939271, 0.0234738626, -0.191895112, -0.118847623, 0.208033994, -0.174579993, -0.291581184, -0.177660093, 0.019539766, -0.0805971399, -0.0725438595, 0.145668238, 0.0387826003, -0.181093916, 0.353571534, 0.161400959, -0.212710246, 0.265775442, 0.245648146, -0.354037166, -0.0321670398, 0.491594911, 0.232463837, 0.400097758, 0.188782245, -0.00102141406, -0.190583736, -0.218777955, 0.00632497156, 0.00370304589, 0.274382383, 0.23119913, -0.334039152, 0.00488446187), (-0.115270935, 0.0240090564, -0.0949446335, -0.00750754541, -0.22598961, 0.614422023, 0.0240924079, 0.378858685, -0.00790480524, 0.199675843, 0.271396399, -0.366224587, -0.0532889217, 0.0942524225, -0.0799680427, -0.106363975, -0.149049953, -0.139101639, 0.317981154, -0.165179506, -0.00859140698, 0.154890731, -0.0811271966, 0.0630129948, 0.250817835, -0.0915843621, 0.041062545, 0.0684480742, -0.224417388, 0.23399888, -0.0391194187, -0.158544123, 0.117246032, -0.341060579, 0.424403518, 0.154026598, 0.179609135, 0.285723388), (0.0385562144, 0.114817157, 0.0917323306, 0.0646291003, 0.0354944356, 0.361769021, -0.315378636, -0.092513904, -0.228394553, 0.0435352325, -0.0813143253, 0.321123302, -0.218930468, -0.102863654, 0.0410656817, 0.36734727, -0.088894181, -0.229275197, -0.122138046, 0.310351789, -0.194857791, 0.272772044, 0.0588019677, 0.129735708, 0.0194765534, -0.165487036, -0.119779639, 0.198707476, -0.164877489, 0.208239749, 0.220761895, -0.178679615, -0.246093675, 0.287077069, 0.0170506742, -0.152457252, -0.105787322, -0.0673948601), (-0.0396606252, 0.00205268594, 0.0603208132, -0.0221717712, 0.0397624597, -0.0496069975, -0.0154835219, 0.120177597, 0.276862532, -0.0547447279, -0.0718955696, 0.0523685589, 0.238978207, 0.11271932, 0.157708451, -0.243560538, -0.331201106, 0.112035803, -0.195917234, -0.454776376, 0.129322901, 0.22104229, -0.145424649, 0.141606018, 0.223028377, 0.21907118, 0.015169221, -0.0894790068, 0.536580861, 0.144017592, -0.166779071, -0.0567231514, -0.346842349, 0.29617542, 0.3828426, -0.193473279, -0.188644215, -0.112685315), (0.240025148, -0.223003358, 0.514598966, 0.00890840869, 0.137488201, 0.03923513, 0.242251739, -0.277724415, 0.168919832, -0.0286241472, -0.176944062, 0.146166563, -0.132740498, -0.149130672, 0.0761238411, -0.0337324068, -0.17743066, -0.31145224, -0.0838005021, -0.0911852047, -0.0435008705, -0.198087379, -0.168556854, -0.326621085, 0.333464891, -0.145821407, -0.232880726, 0.143990099, 0.237658069, 0.161489546, 0.0472621657, -0.036972113, 0.235898957, 0.287433833, -0.146051586, 0.241018325, 0.302518576, 0.338627189), (-0.476786375, 0.124973655, -0.197274253, 0.0663351417, 0.159168497, 0.146358907, -0.147609308, -0.166525185, -0.0755751505, -0.184344828, 0.0961999074, 0.170688942, -0.217054382, 0.228214949, -0.0448036753, 0.366416752, 0.025339514, 0.300970376, -0.0614777207, -0.0328083523, 0.212579831, 0.00877560303, -0.0789615735, -0.421990335, -0.0475654379, 0.248316124, -0.0135808578, 0.161932945, 0.243948936, 0.182278156, 0.356295913, -0.0959886834, -0.109228536, 0.0933746323, -0.0341036059, 0.0339817479, 0.173706919, -0.111880995), (0.175714955, 0.196778268, 0.0284179375, 0.101225361, -0.12688832, 0.442275226, 0.226382658, -0.0679129139, -0.046197962, 0.188202634, 0.179196894, -0.159897506, -0.0181465913, -0.146030903, 0.0365221016, -0.0277752466, 0.284337729, 0.0183224436, -0.0460223034, -0.0903902724, 0.282550782, 0.132528037, 0.300335735, -0.544052422, 0.0928229094, -0.0787063316, -0.560405254, -0.273673147, 0.145851672, -0.211480811, -0.198005915, 0.0347073339, -0.0919180661, 0.159206107, 0.00443711132, -0.0456754752, -0.209721521, 0.172427431), (-0.173290282, 0.0515051596, -0.156784609, -0.240695298, -0.0911850408, -0.111182496, 0.211458266, 0.368553668, -0.0382487215, 0.159667209, -0.0631346479, 0.041445408, -0.0985311791, 0.0691159964, -0.306365132, -0.140491128, -0.0662962496, -0.30085972, -0.213178307, -0.148805305, -0.190543637, -0.111510545, 0.251717627, -0.157252505, 0.0766175613, 0.0220251568, 0.23209767, -0.0678020492, 0.407693535, 0.00240543392, 0.477056623, -0.156120688, 0.308585912, -0.224314436, 0.00389174372, 0.0697615594, -0.113663055, -0.0367658511), (-0.190669313, -0.323367149, 0.0110956738, 0.114965133, -0.0703784898, -0.0978498235, 0.202274859, 0.170271754, -0.104264237, -0.027090285, 0.15170072, -0.141166896, -0.338189244, 0.10302756, -0.121666662, 0.280265808, -0.137210459, 0.206286401, -0.068271175, 0.196359903, -0.29411757, 0.0427638106, 0.213389546, -0.126979113, 0.127644867, 0.151693866, 0.0086923968, 0.15522635, 0.166019022, -0.152247056, -0.211794451, 0.0342446268, -0.280783474, -0.116848662, 0.0341200791, 0.237700507, 0.640013754, -0.0486656055), (0.5076527, -0.107606754, -0.103691168, -0.201617405, 0.0568750426, 0.181960568, -0.0948325247, 0.199841708, -0.11194063, -0.0688362122, -0.109555788, -0.193812221, 0.319053173, -0.0153534301, -0.171012715, 0.238289446, -0.103226244, -0.27890569, 0.103576653, -0.078826569, -0.0884484574, -0.18447946, -0.0574605465, -0.370529443, -0.00185192667, -0.0234173108, 0.124415271, -0.0392452963, -0.0163886324, 0.171425059, 0.25878039, 0.0225464031, -0.259588748, 0.00574041065, -0.276965976, -0.397398025, 0.25319171, -0.410223275), (-0.164050147, 0.397265196, 0.205739304, 0.248989597, 0.170961648, 0.023363037, 0.030767601, -0.00494020386, 0.032696899, -0.166160077, 0.516254127, -0.169664308, -0.00030777551, -0.478022099, -0.150060266, 0.163845062, -0.0277902596, -0.00480890134, -0.334077895, -0.223413721, 0.0974986851, -0.270843148, -0.00234823744, -0.307240605, -0.199582577, 0.0245605856, 0.215742424, 0.272267967, -0.109798372, 0.0944399163, -0.163061157, 0.230548412, 0.0865130499, -0.105531983, -0.0391502865, 0.149922535, -0.251362562, -0.269176334), (-0.013885458, -0.0785756633, -0.0830092728, -0.0683554783, -0.611248136, -0.142827332, -0.0560835116, 0.242985651, -0.138735533, 0.0969190076, -0.189946428, 0.146673843, -0.217534795, -0.110055387, -0.107425459, 0.178054601, -0.160143465, 0.12775673, -0.127609283, -0.0658517107, 0.305193007, 0.191533402, -0.431517273, -0.383869678, 0.342051625, 0.0561498851, 0.231904939, -0.00959704258, -0.338464558, -0.282929152, -0.158063516, 0.237645626, -0.00528456783, 0.17996119, 0.0124081448, -0.240387052, -0.0731852204, -0.00418763608), (-0.208109021, -0.0549789257, 0.228525475, -0.282054245, -0.0322990492, -0.0965466201, 0.397257268, -0.0330286101, 0.256554753, -0.10245993, -0.250243753, -0.272129387, -0.125468805, 0.205458298, -0.283409595, 0.164010361, -0.121155262, 0.0130620189, -0.033557266, 0.591189027, 0.18578814, -0.164304629, -0.154727563, -0.0178159196, 0.100872189, -0.0571237057, -0.240942404, -0.0363164246, 0.152959168, 0.152149767, 0.022772437, 0.199287236, -0.0827915892, -0.352702439, -0.0820213705, -0.0560267493, -0.478678048, -0.0725819319), (0.0405632891, -0.064146921, 0.0884525925, -0.0427213386, 0.0204619355, 0.0813981816, -0.203129023, -0.33206436, -0.175716981, -0.27098754, -0.138261616, -0.119549133, 0.0260425471, 0.0264921635, 0.0830283687, 9.11349925e-05, 0.0210870095, 0.409690678, 0.195959374, 0.00179850368, -0.180550143, 0.281395376, -0.411509365, -0.143210486, 0.10480506, -0.228056163, -0.125001356, 0.212535799, 0.110016137, 0.0907656848, -0.0699193552, 0.121157698, 0.246660128, -0.475238383, 0.0306156054, -0.0169045851, -0.00853941217, 0.122869454), (0.0971993953, -0.228795275, -0.123278439, 0.399141371, 0.105365805, -0.380752951, 0.0776532143, 0.0911365077, 0.102572329, 0.0565013178, 0.28891629, 0.0425375625, 0.188052356, 0.454272568, 0.211771101, 0.113956995, -0.0683311, -0.17600365, 0.123700805, -0.00401937263, 0.0128463265, 0.145399675, -0.167940497, -0.145528495, 0.155541629, -0.336108983, 0.0465504006, 0.0515371114, 0.0374290757, 0.235669479, -0.221274316, 0.125412062, -0.285543054, 0.0330187343, 0.103201121, 0.298432112, -0.0568515956, -0.216644347), (0.20432663, 0.351131976, -0.330591559, -0.120922059, 0.0622201003, 0.293582797, 0.444491357, -0.183220744, -0.229033709, -0.00887430366, -0.156552598, 0.168815747, 0.105054431, -0.0135660674, 0.0983043388, -0.0537828729, -0.172162235, -0.255381107, -0.250586927, 0.203654349, 0.0938005894, 0.198446155, -0.320685595, 0.054277759, -0.426927865, -0.274374574, 0.139900804, -0.0868524462, 0.141883478, -0.144423604, -0.250963748, -0.00185052631, -0.0284169819, -0.194200322, 0.0209630039, 0.319275767, 0.25361383, -0.289421171), (-0.298189551, -0.219807893, -0.0679940656, 0.0273497496, -0.278528482, 0.0714314803, 0.261433303, -0.349235415, -0.139107674, 0.432285517, 0.0476319976, -0.0300282538, 0.156654194, -0.151447475, 0.234331772, -0.107475773, -0.260119438, -0.0359190628, 0.0409542993, 0.246627957, 0.222720638, -0.0866159126, -0.0131526589, -0.0601001605, -0.00338009349, 0.0943594873, -0.156811416, 0.112705305, 0.0601755232, 0.102134429, 0.124288052, -0.436614364, -0.0130189806, -0.0257979203, 0.133684993, -0.371166587, 0.123452641, -0.24473767), (-0.239420563, -0.216153294, 0.149845794, 0.0101173585, 0.343178213, 0.124107808, 0.00128846196, -0.241901562, -0.0466568768, 0.181598648, 0.257440805, 0.13673678, -0.0691294447, 0.353580028, -0.121718891, 0.00564136449, 0.0505172275, -0.359414369, -0.26078245, -0.0828586221, -0.122238643, 0.443782836, 0.172335103, 0.0478315093, 0.217664629, -0.16193746, 0.257612109, 0.23878935, 0.0771171823, -0.494873554, -0.113277629, 0.0614900701, 0.167040274, -0.0232856814, -0.107399441, -0.284848005, -0.192842633, 0.0142569048), (0.0832318813, -0.193869606, 0.141246021, -0.249102265, -0.164879873, 0.0819001421, -0.0482664928, 0.00386896543, 0.302765727, -0.0670341551, 0.236003727, -0.21851863, 0.153548211, -0.109592453, -0.375810772, 0.27799198, 0.221809223, -0.0309435613, 0.0758434013, 0.0932231173, 0.574635208, 0.164764777, 0.0819705203, 0.196397945, -0.179232419, -0.208362699, 0.191452235, -0.0309099574, 0.332570881, 0.0446981452, -0.104701132, 0.0652546287, -0.0429862887, 0.166556627, 0.00287679886, 0.0737279505, 0.351088792, -0.0171419773), (0.0785600916, 0.253360033, -0.0824326947, 0.381547689, 0.316562593, -0.00692527322, 0.138947442, -0.273182869, -0.0168741476, -0.140114933, 0.0842031986, -0.304524869, 0.401250571, -0.102626286, -0.234111741, 0.0782434121, 0.00845625531, 0.0951766595, 0.039996177, 0.0334367752, -0.0974689275, -0.0285090599, -0.189620316, -0.0524717048, 0.691393733, 0.0546161011, 0.248983428, -0.214290276, -0.0842660815, -0.150475189, 0.192750096, -0.180413708, -0.133565158, -0.208609805, -0.240929037, -0.205737367, 0.0160560962, 0.0897694975), (-0.0894216895, -0.0115380194, 0.166409612, 0.363894254, -0.145033389, -0.207138792, 0.0112929232, 0.292382002, 0.31980896, 0.247706652, 0.228176177, 0.0763348863, 0.114581779, -0.497907043, 0.121168636, -0.0476916172, -0.187292352, 0.000496242719, 0.176564828, 0.416648358, -0.0981910825, 0.453959644, -0.258766502, 0.0535516702, -0.357962102, 0.0849890187, 0.0875330716, -0.00464496436, 0.159350947, -0.0304669142, 0.197169155, -0.0836944059, 0.212168321, -0.0305932127, -0.178958505, -0.182988018, -0.0280066766, 0.12037614), (0.158041477, -0.121988669, -0.0884410664, 0.324550301, 0.276029766, 0.313974679, -0.0809624866, -0.0106639815, 0.274195671, -0.088147521, -0.0942243561, 0.148888066, -0.519438803, 0.0731125474, -0.310141951, -0.0295629874, -0.0523591861, 0.00724838208, 0.0612407364, -0.00263177231, 0.14562501, -0.362229735, -0.282187939, 0.17411299, -0.236745581, 0.243858039, 0.187689438, -0.213430941, 0.130818203, -0.172901854, -0.357634485, -0.302289099, -0.0848275647, -0.10668698, -0.00224237982, -0.332296193, 0.0847114846, 0.241932198), (0.0218074881, -0.0606219731, -0.129078761, 0.21484673, 0.115287021, -0.10053058, -0.365932703, -0.193658412, 0.15680927, 0.166081488, -0.197100267, -0.0205609761, 0.219676122, 0.0279815085, -0.358063549, -0.562509179, -0.189267591, 0.0516108572, -0.441655397, 0.313958049, 0.0739307925, -0.150000677, -0.0388557389, -0.376121312, -0.0184395015, 0.0929622501, -0.0326160155, 0.133895114, -0.249521002, 0.0460235551, -0.0610039122, 0.0639254451, 0.110484831, 0.0505731888, 0.295077741, 0.202046379, 0.252490371, -0.0333742499), (0.161602125, -0.272589207, -0.026963653, 0.220615089, 0.235243991, -0.0299247764, 0.262791157, 0.355300903, -0.21085079, 0.164299339, -0.21521987, -0.143819228, 0.034514226, -0.183360651, 0.102400087, -0.0942530334, 0.368491799, 0.242830336, -0.0461632162, 0.121252306, -0.150796339, 0.182623088, 0.0515277348, 0.101685032, 0.0935486928, 0.369596303, -0.232254326, -0.0259606838, 0.0698138475, -0.283763766, -0.124747403, -0.104261227, -0.00146233139, 0.101680063, -0.137614116, 0.105590597, 0.0634762347, -0.310094595), (0.219734833, -0.0303169433, -0.330272853, 0.109842084, -0.304465294, 0.206146091, 0.242561951, -0.237038627, 0.443163663, -0.0696059763, 0.0860056356, 0.266208768, -0.0263393, 0.0225821175, -0.0241873823, 0.155750901, -0.0391610004, 0.127549186, 0.0127246967, 0.133779079, -0.337144315, 0.0532156974, 0.131035, -0.0824903026, 0.0982474983, -0.0371039249, 0.268540353, -0.398530364, 0.0639625192, -0.0260447059, 0.176290378, 0.387945533, 0.408129632, 0.234757751, 0.240961477, -0.0418025739, 0.054332532, -0.0278646592), (-0.250977337, -0.604546189, -0.00761148194, -0.0373770669, 0.308408201, 0.116202354, -0.13182652, 0.229395807, 0.0098694535, 0.0389545038, -0.367775291, 0.0633892342, 0.0294640344, -0.227087826, 0.14428398, 0.0733462423, -0.222808465, -0.197181106, 0.0513513945, -0.0250621755, 0.266238779, 0.19447881, 0.125168651, -0.0550036281, -0.0893164054, -0.0888159126, 0.184232995, -0.389538944, -0.2703017, 0.110868931, -0.110809527, 0.137417227, 0.0289649088, -0.0753979459, -0.314041764, 0.128863618, -0.126134828, 0.127080008), (-0.323317677, -0.200763762, -0.256643653, 0.0064104367, 0.0632044747, 0.176416129, 0.14563863, 0.183352694, -0.0363815539, -0.217081964, 0.130217865, 0.463952601, 0.558752298, -0.0534485541, -0.0259898398, 0.0579436868, 0.38528803, -0.0331980027, 0.154817507, 0.095260933, -0.133848116, -0.250127733, -0.0504601188, -0.0942555144, -0.044309292, 0.126576826, -0.142878339, 0.0931671709, 0.10425742, 0.280733943, -0.0705086589, 0.168444082, 0.0271090362, 0.0736141428, 0.0681895614, -0.147681311, 0.0343495272, 0.403202981), (0.307242393, -0.361525118, 0.136030793, 0.0818075612, 0.0974428356, -0.03905835, -0.0290084425, 0.221644416, -0.369167835, -0.255494058, 0.490619481, -0.097495541, -0.14643912, -0.106387369, -0.155559465, -0.0540381558, -0.240058273, -0.173528105, -0.0345492586, 0.194087252, -0.0621214844, -0.213329718, -0.215133622, 0.0270752218, -0.00763565581, -0.0969345793, -0.14113912, 0.0216187574, 0.0969096944, 0.0283813756, 0.0427023731, -0.153634325, 0.158187822, 0.175843075, 0.342535436, -0.118408054, -0.258097619, -0.055237595), (0.0902336761, 0.108209036, 0.0370119326, -0.0485025644, 0.0605311841, -0.455251187, 0.0815513954, -0.184025019, -0.355463654, -0.080149658, 0.116396956, -0.297241122, -0.0477856547, 0.30889231, 0.141625509, -0.0173030067, 0.139379576, 0.15705356, 0.17998603, 0.189752087, 0.178407282, -0.0789274648, 0.208132401, -0.25903362, -0.183407038, -0.204979792, 0.418482482, -0.210830778, -0.0495758876, 0.0200388022, -0.0117851645, -0.333878547, 0.238676101, 0.352317721, 0.126120836, -0.144263402, 0.062402036, 0.305002391), (-0.219679609, -0.188154891, -0.0686953291, 0.0840362981, 0.0075183548, 0.0350944921, 0.44691062, 0.178933173, -0.121814325, -0.164913744, -0.293880463, -0.0146632306, 0.00995002687, -0.0805501416, 0.0500429533, 0.024874825, 0.197277099, -0.0660443828, -0.0493569113, -0.256142259, -0.130855739, 0.134869635, -0.366312444, -0.332906932, -0.251779318, -0.0999955237, 0.275712192, 0.138452336, -0.0456888489, 0.0755978748, -0.143634766, -0.328952104, -0.00207584584, 0.115177535, 0.0561098047, 0.0372719169, -0.187322319, 0.144686624), (0.151391789, 0.0785036683, -0.142075583, -0.354345679, 0.367284834, -0.121917985, 0.0718947127, 0.350132316, 0.0430163145, -0.183899283, 0.125595912, 0.170360118, 0.0631854311, 0.199846894, -0.186410233, -0.0277751796, 0.114185497, -0.0276436713, -0.202534497, 0.232900411, 0.206378087, 0.422226489, -0.118283793, -0.0569843128, -0.0739176422, 0.144298911, -0.389975727, 0.0416609757, -0.260137081, -0.021966029, -0.00604763068, 0.00653586863, 0.179947346, -0.0737923011, 0.238918886, -0.364416569, 0.124902606, 0.0676408187), (-0.0639121383, 0.42357558, 0.10460858, 0.255972087, -0.104245506, -0.325776666, -0.041705735, 0.254319996, 0.023546122, -0.331231296, -0.174734071, -0.00655687321, -0.255816132, -0.150112197, 0.22244902, 0.0157756358, -0.00689341174, -0.335656404, -0.229624957, 0.0493351817, -0.166816443, 0.174473897, 0.248936787, -0.0842189267, 0.0902384371, -0.1465538, -0.133828133, -0.266565323, 0.109227218, 0.257860959, -0.169161841, 0.0557687655, -0.163741037, -0.259895355, 0.0973005146, -0.349060655, 0.34236449, 0.18340373), (0.162511051, -0.152863115, -0.328604072, -0.022264041, -0.163965553, -0.022599848, -0.311793238, 0.246161804, -0.155090272, -0.126300141, 0.198823079, 0.253828526, -0.0410913229, -0.00252373749, 0.357955277, 0.0242798869, -0.192621633, -0.0677144676, 0.051043056, 0.205758661, 0.037110094, -0.282124937, -0.129122257, -0.15416275, 0.0341979414, -0.0396953747, -0.15218237, -0.0941853821, 0.321423471, -0.566108465, 0.0872396305, 0.0536162965, -0.0857529342, -0.224213108, -0.0590580814, 0.196556941, -0.244217798, 0.136089727), (0.201811686, -0.475406826, -0.32155633, -0.102615319, -0.220908433, -0.229764894, 0.164512917, -0.303811878, -0.154139414, -0.347388297, 0.108500965, -0.175906315, -0.0577516444, -0.323269069, -0.0173135102, 0.109349482, -0.0343746319, -0.0784681886, -0.505740345, -0.308331966, -0.00512022991, 0.224733502, -0.0162656438, 0.331474215, -0.0884080902, 0.274432898, -0.175520554, 0.0630743057, -0.164670736, 0.0205890946, 0.2188932, 0.00408866024, -0.0129982848, -0.11667116, 0.0128278825, 0.0667001978, 0.0104917772, 0.256985098), (0.0186217986, -0.110531583, -0.154735923, 0.136403665, -0.094944194, -0.0834082067, -0.34112525, -0.00982510857, 0.185554698, -0.210471377, -0.0538794138, 0.0880984664, 0.00653196685, -0.0129988566, -0.212983027, 0.0226426795, -0.0232357774, 0.237840965, -0.01434414, -0.309741825, 0.032804437, 0.227674216, 0.111643843, -0.126490414, -0.0597988404, -0.425796807, -0.308648705, -0.122770846, 0.193302706, 0.0311482158, -0.0362742357, -0.582542598, 0.397706836, -0.210965723, -0.204481229, 0.0387527011, 0.00298053585, -0.352621704), (0.110674962, 0.0708027259, 0.393907666, -0.0249315165, -0.180966794, 0.114069909, -0.0434846096, 0.180605724, -0.357491046, -0.0061971955, -0.0399429202, 0.253770053, 0.120625518, 0.152342781, 0.157974213, 0.170264632, 0.105273589, 0.106037229, -0.185826004, 0.0415669791, 0.0426254645, -0.175623775, -0.0572006144, 0.257207185, 0.290731013, 0.293347716, 0.182114288, -0.0294284634, 0.12554504, 0.254591942, -0.412721425, -0.038997151, 0.588019788, -0.0211866926, -0.0392466336, -0.0240092222, 0.0899474695, -0.293076903), (-0.449626505, -0.031868916, -0.068825081, -0.0375017598, 0.101562157, -0.110626765, -0.180256918, -0.19048816, 0.0330766179, -0.133630306, -0.165806711, -0.308881104, -0.121105522, -0.238027945, 0.142598793, 0.133912891, 0.332541764, -0.522683799, 0.224343434, -0.0503659211, -0.0790920928, -0.0799711049, -0.418215722, 0.0868522599, 0.0411713161, 0.0205237642, -0.177719563, -0.244747728, 0.0739485398, -0.359551847, 0.0764456764, 0.126050681, 0.189419404, 0.11828842, 0.454434782, -0.0356007628, 0.175318927, -0.388767779), (0.0229356326, 0.276225567, -0.252764672, 0.393178374, -0.0772531852, -0.100653566, 0.0865648761, 0.0830570757, -0.192301154, 0.117434219, -0.164797977, -0.225325704, -0.17497021, 0.280094147, -0.49605751, -0.0561541691, -0.0665555894, -0.0505374558, 0.23664999, -0.170271024, -0.0861949921, 0.0186887309, -0.21205242, 0.162636548, -0.0866947398, -0.0586436912, -0.324326575, 0.23967354, 0.132048428, 0.143986344, 0.0774793252, 0.291620404, 0.194385111, 0.471854836, -0.342564821, 0.0193183441, -0.0629364103, 0.0216607973), (-0.271507263, 0.210826263, -0.24914062, -0.366835862, -0.0909360051, 0.0392362475, -0.162923992, 0.216741711, 0.229836717, -0.180995047, 0.0613891892, -0.256318092, 0.272240192, -0.00886143837, 0.219895288, 0.130330995, -0.249133706, -0.111261852, -0.305763215, 0.228259638, -0.0983758494, -0.0188771002, -0.201636925, 0.216201156, 0.163548991, 0.00377975008, -0.0938727111, 0.0806754902, -0.00428377837, -0.272608221, -0.282352895, -0.364840716, 0.103175841, 0.390637666, -0.421547294, 0.161290377, 0.0934813321, 0.311597019), (-0.143861294, -0.0920122042, -0.156410471, -0.222397864, 0.0627292767, 0.182474136, -0.0375222079, 0.026645612, -0.159862056, -0.302678794, 0.0205495525, -0.0479804836, -0.230428845, -0.411744833, -0.181173012, -0.579136908, 0.129703373, 0.319670022, 0.00182491599, 0.295240015, -0.209872097, 0.0766385645, 0.104507178, 0.0139257414, 0.276159883, -0.417948008, 0.268107921, 0.0319197997, 0.210492387, 0.150498182, -0.116863973, 0.106126323, -0.209307164, 0.306559801, -0.0335647278, -0.0620466471, -0.0577479899, -0.209815413), (-0.0865903869, -0.0998517871, 0.486793399, -0.0498139039, -0.394524634, 0.102584526, 0.101257071, -0.0561962649, 0.223332942, -0.348703325, 0.0921886191, -0.00827539992, 0.139965385, 0.34263733, -0.0581420101, -0.298302114, 0.0612718984, 0.0301316231, -0.00190513988, -0.137292594, -0.469708145, -0.0895627439, -0.0705892444, -0.159410223, -0.367989004, -0.0593710802, -0.100625135, 0.0867432579, -0.297892183, -0.328892261, -0.0290048625, -0.0928262398, -0.21864973, -0.0116640171, -0.195986316, -0.223301828, 0.0849312916, -0.19555071))
-POLICY_B1 = (0.0135458233, 0.0132755162, -0.0046204282, -0.00652501639, -0.0063212784, 0.000597795821, 0.00976983365, 0.00639217719, 0.012960718, -0.0146454852, 0.00810723752, 0.00107944012, 0.0148478448, 0.0151583217, 0.0181477554, -0.0139458915, -0.0103087649, 0.0132093849, -0.00924255326, -0.00301815616, -0.00200211559, 0.00972647499, -0.00371476798, 0.0162943862, -0.010876108, 0.0143696694, -0.00389419612, -0.0176148135, 0.00705146696, -0.00529081887, -0.0120922448, 0.00834297948, 0.0106658507, -0.00544828176, -0.0150067853, 0.0143203922, -0.0014395318, -0.00871499348, 0.0138540156, 0.00702201668, -0.0110696936, -0.011327873, 0.0222397111, -0.0135459732, 0.00841124263, -0.00844356418, 0.0170993507, 0.0032442254)
-POLICY_W2 = ((-0.116469733, -0.0250916481, 0.233615756, 0.0925331935, 0.150297269, 0.0821888968, 0.085060291, -0.145175144, -0.098544158, 0.409274191, -0.317547143, 0.0743037462, -0.360416919, -0.0374730229, -0.161239088, -0.0798474327, 0.299539477, -0.212124005, -0.349418402, 0.042385295, 0.117035285, -0.106520809, 0.253092915, -0.0978144407, -0.0880694464, 0.0611464642, -0.344382107, -0.402826309, 0.100559011, -0.159275204, -0.322985023, 0.307406634, -0.173293695, 0.326094687, -0.303975821, 0.0359708034, -0.111186706, 0.271533966, 0.0523318797, 0.21872355, 0.148426354, 0.0553537048, 0.307652414, 0.0347114652, -0.133384779, 0.0359821431, -0.183512524, 0.11710079), (-0.0597759597, -0.0353055708, -0.203032404, -0.381058633, -0.328458309, -0.379807711, 0.363648206, -0.426937193, 0.0654975027, 0.0384849943, 0.12488874, 0.219557747, 0.124747895, -0.0190047659, -0.0106693869, -0.136839613, -0.0111898389, -0.138302892, 0.070845373, -0.131282315, 0.299693376, -0.0316472724, 0.0858648866, 0.0450179167, 0.101485819, 0.156422362, -0.090648219, -0.268706024, -0.0258723795, 0.110355653, 0.0916364342, 0.0635246634, -0.123996019, 0.0233143568, 0.159285203, -0.198995456, 0.479945362, 0.016784301, -0.0958913788, 0.371940464, 0.0661057457, -0.275791138, 0.147723436, -0.0495464765, 0.206646174, -0.441505402, 0.154987574, -0.0594116896), (-0.0487280972, -0.152342379, 0.140485436, 0.0814641491, -0.0246275682, 0.200443, 0.110590786, 0.0674646869, 0.434930772, -0.198215798, 0.208507881, -0.223257512, 0.230549023, 0.199704275, 0.237835974, -0.167597145, -0.0436662324, 0.0565653592, -0.192860067, -0.258807868, -0.109734736, -0.405144691, 0.170317069, 0.159683958, -0.142710641, 0.159400091, -0.179234102, 0.169483453, 0.176257417, -0.0149349235, -0.338187635, -0.172470376, -0.235712171, -0.195608824, -0.0493290946, -0.0732945502, 0.173588738, 0.511375606, -0.412749112, -0.0597779229, -0.363611221, -0.0263394676, 0.0723750591, 0.173985347, 0.0107410522, -0.0298529714, -0.0247326382, 0.202302963), (0.100467227, -0.0857711509, -0.0540419444, -0.00793909281, -0.117402107, 0.267895371, -0.113530017, 0.253374219, 0.220277995, 0.0337124802, -0.405374497, 0.248638853, 0.176825821, 0.194487333, -0.394032449, -0.0716674104, -0.121582747, 0.0364177637, 0.0772992447, -0.181359589, -0.266539544, -0.223001823, 0.0619882569, 0.518817723, -0.452932745, 0.216521129, 0.0233919919, -0.207905307, 0.150555104, 0.0492670387, 0.307667345, 0.126394555, 0.0925091431, -0.165147245, -0.160097986, 0.0457613878, -0.0293266866, -0.110316984, 0.236510783, 0.0321064033, 0.0583658703, 0.201580361, 0.0589347333, -0.328589648, -0.0227964837, -0.351841003, 0.127872154, 0.0610901453), (0.0699172765, -0.0471032411, -0.12602219, 0.165178865, -0.0102904486, -0.217549771, -0.0778858364, 0.327969819, -0.292004168, 0.229444981, 0.0219904426, 0.154583752, 0.317107588, 0.238379255, 0.272073507, -0.0167827327, -0.0475060903, -0.131980762, -0.489319205, -0.483094513, 0.208269998, 0.161331758, -0.206808493, 0.184673741, -0.291648448, -0.327297837, 0.118725598, -0.0960970744, -0.0361733288, -0.0994697064, 0.00536375958, 0.0338325351, 0.230131119, 0.291482449, 0.0939505994, -0.167503849, 0.344045222, 0.0215428323, 0.23601529, -0.0919667855, -0.141693965, -0.0719343945, 0.0618700422, 0.235730112, -0.105612434, 0.200547382, -0.0390810519, 0.0991216451), (0.11216639, 0.170323193, -0.148617074, 0.150770113, 0.111826189, 0.0196191818, -0.447998434, -0.249427572, 0.408994198, 0.350227982, 0.249696329, 0.147068098, 0.158520818, 0.108697034, -0.118750319, -0.297925025, -0.338966429, -0.283802211, 0.152430296, -0.00898004975, 0.164964199, -0.0407273583, 0.240289509, -0.222079828, 0.197689489, 0.180303574, 0.345623434, -0.00208532158, 0.0942196026, 0.110031217, -0.0237133317, 0.353724003, 0.267365575, 0.149371922, 0.032855615, 0.307910085, 0.165025637, 0.0798511729, -0.185908183, -0.118444629, 0.000634288532, 0.0671337098, -0.0197531283, -0.163930297, -0.126797795, 0.234091967, -0.188642189, 0.262210846), (0.148711622, 0.175570071, 0.261758208, -0.131100103, 0.461843163, -0.167869657, 0.0896264464, 0.0967376307, 0.0686424971, 0.085292846, 0.208317339, -0.234645262, 0.0681296065, 0.0838886574, -0.139704049, 0.188715294, -0.188486636, 0.0884410739, 0.0972257927, -0.211151674, -0.135098755, 0.447210044, -0.0123188067, 0.367836088, 0.0483175702, 0.0753866211, -0.197828531, -0.39034611, 0.0667531192, -0.127560109, -0.00829011947, 0.33282885, -0.475475639, 0.113527864, 0.0943972766, 0.0641285926, 0.0360329039, 0.0490947627, -0.0895509943, -0.232084051, -0.145526469, -0.148412451, -0.375302047, -0.172251537, 0.103690021, 0.0452352576, -0.00883643981, -0.327006787), (0.211725593, 0.142772615, 0.159248859, -0.0628838167, 0.0934572816, -0.0240280554, -0.000581779808, 0.327822208, 0.150158077, -0.0698915869, -0.0703637227, -0.175252914, 0.117260776, -0.132113799, 0.00614734273, -0.0163679421, -0.221480295, 0.0876900703, -0.122445032, 0.351237059, 0.17752777, 0.0733833164, 0.369221926, 0.108100906, 0.221526936, -0.139272198, -0.0932810754, 0.030910369, -0.113359742, -0.49158743, -0.183952987, -0.1711445, 0.179919392, -0.0353489704, -0.217458412, -0.0878829882, 0.398125291, -0.463382035, -0.24873586, 0.231078506, -0.0865520313, 0.137937143, 0.214943767, -0.129368261, -0.456065089, -0.1502572, 0.0186200254, -0.104444131), (-0.27076143, 0.00202377071, 0.245177105, 0.0633834675, -0.255565971, -0.406209856, -0.441216797, 0.0937083215, 0.206712931, 0.00592787331, -0.218274817, 0.00750067458, -0.135300681, -0.238862082, 0.391257524, -0.218002737, -0.26484865, 0.0932933018, 0.071809113, -0.112366326, -0.0376503393, 0.115919359, -0.339585155, 0.264376193, 0.287026882, 0.285719186, -0.151720688, -0.061735712, -0.229530826, 0.0133064818, 0.195265159, 0.130045146, 0.0607110262, 0.056675382, -0.467534453, 0.0958554968, -0.0773887709, 0.0223273318, 0.00652930187, 0.103541747, -0.232974991, -0.0782943442, 0.185993046, 0.136895254, 0.115474053, 0.0475617535, 0.14157255, -0.0876319855), (-0.329462886, 0.0959939808, -0.0899585262, -0.119858272, -0.272898614, 0.148685738, 0.161059141, 0.397939175, 0.386787176, -0.228437513, -0.154395446, 0.303055346, -0.292788774, 0.0339950435, 0.26125145, 0.165713936, -0.223188996, -0.0979225412, 0.352577776, -0.0916814953, 0.307940334, 0.0204574894, 0.143515959, 0.0368340015, -0.00502071436, -0.14933683, -0.484538585, -0.0476687923, 0.13435787, 0.22557795, -0.156065449, 0.0334270932, -0.00120319345, 0.107109882, 0.324408472, 0.188314065, -0.0130318245, -0.114165194, 0.106159672, 0.000386183499, 0.113957725, 0.0407124162, -0.195151314, 0.126271665, -0.257756621, 0.262165874, -0.245057434, 0.00443225866), (0.318998635, -0.0728287697, 0.0671024323, 0.357231587, 0.13649492, 0.220609501, 0.184207082, 0.190294817, -0.187872797, 0.37392202, -0.0597404838, 0.452225626, -0.0668594539, -0.251354843, 0.170636237, 0.00964961573, -0.221241906, -0.0903414264, 0.0181425232, 0.135381266, 0.128384382, -0.12804611, -0.0121195782, 0.134141833, 0.0608068816, 0.128758892, 0.0414028168, 0.367087424, 0.250523746, 0.179209664, 0.0929871649, -0.0232725274, -0.4512586, 0.196926191, -0.0403830372, -0.0523407944, 0.159650669, -0.21553044, -0.231674865, 0.0279721115, 0.0698338002, 0.174256414, 0.0219935384, 0.263798416, 0.401240945, 0.0401001312, 0.291998416, -0.165542752), (0.012531396, -0.384401083, -0.181117415, -0.500944972, 0.054454226, -0.159553602, 0.270122677, 0.0617486723, -0.102041245, -0.0383601785, 0.0448562503, -0.111733079, -0.142551109, 0.133654237, -0.221542895, -0.0799929798, -0.240088269, -0.186838821, -0.0948761553, -0.133826345, 0.194300175, -0.271650881, -0.30357796, -0.36187315, -0.140946478, 0.297678828, -0.0278662629, 0.122248873, -0.135145411, 0.00944602955, -0.0654500499, 0.0733838081, -0.291362673, -0.0910215452, -0.318359494, 0.0845460445, 0.0703455135, -0.364334881, 0.187883005, -0.269056201, -0.278529763, 0.228650898, 0.0409236364, -0.0611993, -0.25320968, 0.301635802, 0.100180335, -0.0732548088), (-0.00331368996, -0.256699562, 0.468428373, 0.0137147177, 0.2521559, -0.185039476, -0.121169753, 0.0885512009, -0.0322212577, -0.336693197, -0.159360588, 0.0192625467, 0.0337003879, 0.108029924, 0.140813693, 0.0869650543, 0.0361704119, -0.303228617, -0.0425101481, 0.0322515517, -0.0332548618, -0.0223048069, 0.15302752, -0.0451283306, 0.176278919, -0.114272423, 0.309425324, 0.101654202, 0.0512964539, 0.322342038, -0.288021445, -0.189804837, -0.157837346, 0.125888243, 0.103900701, 0.451045275, 0.241239741, 0.0986730903, 0.538958669, 0.224478424, -0.136641771, 0.0263052434, 0.0773987025, -0.416132629, 0.230947018, -0.113169469, 0.175687864, -0.0517488718), (-0.0797865167, -0.273358107, -0.054160893, 0.0358136371, -0.0200885441, -0.0113837207, -0.285474539, -0.294398993, 0.00452035433, 0.177514747, -0.516925097, 0.0762796625, -0.00422973698, 0.428843379, 0.0357474014, 0.537581801, 0.143870205, -0.101414032, 0.305275798, -0.092699118, -0.0647566393, 0.0793874785, -0.0715180188, -0.00528896926, 0.00659531495, 0.11955566, 0.0360884406, 0.0992496684, -0.159824118, -0.277592421, -0.388233364, -0.0323831625, 0.0954322368, -0.0913967192, -0.0560417138, -0.0977000073, 0.372595906, -0.192131981, -0.257068664, 0.00162997958, -0.0291341096, 0.0930369645, -0.32083261, 0.134181783, 0.225945294, -0.0453953408, -0.203382388, 0.0161515474), (0.360425174, -0.0433545411, 0.0941989124, -0.113146752, -0.223451942, 0.387826115, -0.3072294, 0.0242981892, -0.241737098, -0.177394211, 0.14961192, -0.183485255, -0.229390383, -0.141968489, -0.107455313, -0.0918975249, 0.288225323, -0.266780555, 0.122196451, -0.185088947, 0.41466561, -0.0325079858, 0.00214876398, 0.113436863, 0.181794181, -0.222747624, -0.390008211, 0.0135006486, 0.0256991331, -0.0361370146, 0.180955514, 0.130413339, 0.249628678, -0.275442481, -0.186319768, -0.00654550036, 0.419358194, 0.281377643, 0.00107454869, -0.245895118, 0.115034111, 0.0892231017, -0.0966412798, -0.19273597, 0.191562012, 0.165510938, 0.121862672, -0.13456513), (0.243174762, 0.336947501, 0.0532390401, -0.25641188, 0.0222424529, -0.0674231797, 0.105856284, 0.235430777, 0.351810783, -0.185221091, -0.264978915, -0.00696513848, -0.0269311368, 0.283549398, 0.0817957893, -0.102580562, 0.466504067, -0.366659284, -0.111953698, -0.103096023, -0.306661934, -0.173684895, -0.285729557, -0.230092451, 0.144316629, -0.0945683941, 0.221018463, 0.0759326443, 0.237003729, -0.221411422, 0.342285901, 0.178177938, -0.0372529142, 0.129158333, 0.0198960975, 0.214941502, 0.0589471683, -0.0567034855, -0.274662286, 0.165231034, 0.244568065, -0.206781909, -0.0742798597, 0.223811135, -0.115607917, 0.0540995821, 0.200978935, -0.208000168), (-0.276759267, 0.160328791, 0.115325667, 0.385121971, -0.0394394286, -0.0388934202, 0.0948936269, 0.19461143, 0.156750813, 0.224648654, -0.147772431, -0.168112695, 0.243486643, 0.278648227, -0.509573281, -0.365363061, 0.0516397208, 0.226724789, -0.116211072, -0.112548679, 0.227565438, -0.0907663554, -0.403969675, -0.0956783742, 0.350222766, -0.174640328, -0.245179057, 0.276128501, -0.254711717, 0.0330726691, -0.263691872, 0.136892244, -0.175567448, -0.108005919, 0.307932228, 0.0780595317, 0.0119571816, -0.176524431, 0.121124193, -0.0999480113, 0.161594301, 0.0538358763, 0.0896275118, -0.052798938, 0.236404493, -0.215603918, 0.103171982, -0.0604842231), (-0.297950029, -0.185934424, 0.00866234489, -0.22821252, 0.206643492, 0.00571021624, -0.0391357727, -0.158963174, -0.210776925, -0.0937899724, 0.045515731, 0.0476042926, 0.000980278128, -0.0898633301, -0.192902759, -0.150479212, -0.249600589, -0.0357413515, 0.0702762455, 0.0873281211, -0.201181665, -0.205881998, -0.299301028, 0.071633704, 0.127578095, -0.282385111, -0.230778337, -0.12189246, 0.384906381, -0.0274910741, -0.0824215636, -0.201745942, 0.395573288, 0.629355252, -0.00990943331, 0.156510994, 0.0835528746, 0.0303584803, -0.335702538, -0.251979411, 0.000720306183, 0.235751808, -0.205947161, 0.0667574406, -0.0319657512, -0.323967725, 0.210531607, 0.141433924), (0.158224657, -0.385028362, -0.0118813887, 0.0133888787, 0.118653677, -0.221143156, 0.0383231528, -0.221616164, 0.354573667, -0.162024125, -0.102250017, 0.138021186, -0.202427417, -0.322754741, -0.186320633, -0.298586935, -0.0300707109, 8.92553944e-05, -0.420675039, 0.186769828, -0.162794724, -0.0350397415, 0.057320796, 0.309972495, -0.0350796171, -0.0284848846, -0.0704812184, 0.239555538, 0.227635935, -0.0971511379, -0.200923294, 0.236748457, 0.343130827, -0.159695148, 0.235107064, -0.218070507, 0.0194352623, -0.213809147, 0.192536905, -0.0114936903, 0.0151467388, -0.393332571, -0.328318238, 0.0330986455, 0.119946294, 0.271600604, -0.122564644, -0.100971252), (-0.0227981266, 0.0395337977, -0.136201933, 0.153565496, -0.439985931, -0.0684874579, -0.0128539223, -0.212503657, -0.0533629507, 0.0897061005, -0.171516806, -0.236390084, 0.149519086, 0.166267246, 0.259589106, -0.0145975444, -0.0533743165, -0.0940491408, -0.110439628, 0.250613421, -0.286033183, -0.108104609, 0.147907138, -0.0252478048, 0.0630933568, -0.166065782, -0.358342379, 0.267877758, 0.0478218906, -0.158490509, 0.312001646, -0.00842983183, -0.362695068, 0.3822442, -0.103441082, -0.128393039, 0.0209149104, -0.10352464, 0.0789272636, -0.19159086, -0.0399293974, -0.188969806, -0.163045421, -0.587821126, 0.0547313578, 0.212225229, -0.0246876329, 0.31169048), (0.162152782, 0.179869592, -0.225577995, -0.0672099143, -0.0618111342, 0.0507568568, 0.283263087, 0.050599739, 0.0192939192, -0.0504117757, -0.103784464, -0.112706639, 0.12705119, -0.0282526202, -0.171488121, 0.112568647, 0.233923763, -0.018100081, 0.0850849152, 0.422178596, -0.234468251, 0.124259323, -0.103704259, 0.289285153, -0.169800416, 0.297007263, -0.135810599, 0.022544425, -0.34100467, 0.384484321, -0.183635265, 0.0286432412, 0.370448411, 0.304198653, 0.0983621851, 0.242094755, 0.276252925, 0.147253647, -0.233742535, -0.102554195, -0.120780937, -0.0666949302, 0.397063434, -0.0492294766, 0.0761465952, 0.49559322, 0.0881759003, -0.14018558), (-0.0820222273, 0.0718487799, -0.329979688, 0.10817463, 0.297038078, 0.315358967, 0.092457369, -0.208917543, 0.0798661262, -0.0126282116, -0.189108193, -0.181947991, -0.378993779, 0.0952879786, -0.0380917639, 0.0695333779, -0.0320695452, 0.0246999711, -0.111235082, 0.0453280732, -0.0629811287, 0.114637673, -0.17395556, 0.21332173, 0.47345531, 0.00897317939, 0.0681210384, -0.0551389158, 0.178627372, 0.244591445, 0.311689198, -0.218150556, -0.106876925, -0.124867238, -0.0901690871, 0.014445778, 0.432027161, -0.00361950858, 0.279940456, -0.258527577, -0.151552483, -0.252140194, 0.27758193, 0.273354501, -0.261329681, -0.181922421, -0.339445353, 0.136692539), (-0.00312028197, 0.0995749161, 0.210039109, 0.121637002, -0.281573981, 0.0105878189, 0.0569187775, -0.302283853, 0.226094559, 0.0523901694, -0.0124797998, 0.027237013, 0.325040549, -0.389704138, -0.454875678, 0.387162656, -0.00468692882, 0.024290042, 0.149928778, -0.342517436, -0.00608592015, 0.27706489, -0.10043668, -0.122304209, -0.0761923045, -0.0220431592, -0.00596686499, 0.366700828, 0.39692831, 0.0201776121, -0.0797534212, -0.204933271, -0.015986694, 0.17781499, -0.27450034, -0.0537927635, 0.102565825, 0.19112286, 0.204208866, 0.0787705332, 0.038678132, -0.133722872, 0.0438647494, 0.0513092875, -0.459839076, 0.150383532, 0.156603992, -0.17833209), (-0.186282247, 0.0597817674, 0.0976905748, 0.131908789, 0.0887801722, 0.0247742813, -0.147143111, -0.422011346, 0.102125123, -0.183854863, 0.163578838, 0.0705062449, -0.119602151, 0.629526973, 0.0186722148, 0.0594777092, -0.132631049, -0.011719021, -0.308159411, 0.0781700686, 0.144130051, 0.209889367, -0.116079018, 0.0448152944, -0.115030035, -0.151214913, -0.165281594, -0.0284203831, 0.329096437, 0.217326477, 0.157293528, -0.100307755, 0.0793229863, -0.151629627, -0.0858165845, -0.182238907, -0.178132027, -0.186584935, -0.235230669, 0.267703801, -4.09233326e-06, 0.28884995, 0.279983789, -0.136598408, 0.107434265, 0.317865402, 0.144759625, -0.43372792), (-0.474896193, 0.300803363, 0.0750983432, -0.0157498363, 0.0961357951, -0.0189483613, 0.296394318, -0.0339242257, -0.403580219, -0.0245533474, -0.146678343, -0.280223638, 0.0669742599, -0.121078812, 0.137867078, -0.148467764, -0.0694006607, -0.469906062, 0.266606003, -0.189969555, -0.0532780215, 0.0275757872, 0.186463356, 0.247309372, -0.107131951, 0.110961348, 0.103396922, 0.413729966, 0.300641209, -0.130855843, -0.156840935, 0.295618206, 0.307789922, -0.278282344, -0.156852156, 0.0589300394, -0.145581961, -0.125347957, -0.0972529501, -0.12927711, -0.0107848607, -0.195302233, 0.187861383, -0.00117102673, 0.130851999, -0.0238149464, -0.122875683, -0.0613328889), (0.127159357, 0.145384148, 0.0490684845, 0.47433424, -0.052200634, 0.269146323, 0.186428756, -0.365725666, -0.336975455, -0.237257898, -0.0103606554, 0.340251029, -0.0612280518, -0.0140489079, 0.0931527093, -0.323320597, -0.00315527408, -0.11502742, 0.076108709, -0.10029152, -0.149178445, 0.02222782, -0.200909972, -0.0231831856, -0.118982404, -0.0230367538, -0.123345591, -0.0547935925, -0.272893667, -0.0460280441, -0.0430872589, 0.160991013, -0.0464328565, -0.123044632, 0.107764423, 0.308855683, 0.0897588879, -0.12147405, -0.119848847, 0.257158935, -0.487309694, -0.0719730183, -0.300721228, -0.1352292, -0.486731797, -0.125178456, -0.00508269761, -0.123104364), (0.206670895, 0.31904757, 0.22872299, -0.164375603, -0.225418851, -0.228074118, -0.116116226, -0.197280243, -0.0313757174, 0.134045899, 0.190817505, 0.122475132, -0.334204555, 0.137536243, 0.00717628375, 0.0910296291, 0.176473305, -0.0195216537, 0.155643776, 0.0048268931, -0.171598509, -0.158929169, 0.142137453, 0.205144003, 0.122694045, 0.12119244, -0.0415069014, 0.245909572, 0.13546972, -0.242211089, -0.0197484847, 0.133730471, 0.036273472, 0.112127736, 0.526122689, -0.234064639, -0.0445227772, -0.0103766341, 0.310926229, -0.267328411, -0.40340665, 0.463909298, 0.315175772, 0.169708118, -0.161003187, -0.126445532, 0.0689854994, 0.000553327787), (-0.335340351, 0.0223467182, -0.208952099, 0.00825403631, 0.190786242, 0.149442002, -0.288264036, -0.0995269492, 0.144883528, -0.0630673841, -0.160973474, -0.344653904, 0.291098416, -0.240859687, 0.0723312497, 0.133626372, 0.135121852, -0.157761261, -0.0935000256, 0.344653428, 0.147523686, 0.0280289296, 0.234579206, -0.187491819, -0.270269811, -0.0989162996, -0.12770547, 0.0233661775, -0.01695152, 0.222514361, 0.215485498, 0.519354105, -0.0961637646, 0.0120322816, 0.109083861, -0.126949325, 0.164979145, -0.0171265751, 0.151828885, 0.0390595123, -0.315475494, 0.225458756, -0.205698952, 0.402516633, -0.0830380172, -0.179533064, 0.395202905, -0.0665550381), (-0.390552998, -0.0135457665, -0.0654527843, 0.233162776, 0.02297155, -0.223558024, -0.0759192109, 0.248114869, 0.0985305086, -0.0663177744, 0.329068422, 0.0433212593, -0.229621097, -0.100428984, -0.180061981, -0.279775083, 0.495275378, 0.0297480412, -0.059548486, -0.184864745, -0.169607341, 0.18379426, 0.248669907, -0.0940771326, -0.289381891, 0.162788004, 0.030003814, 0.172801048, -0.031164417, 0.0922442153, 0.226392403, -0.210564658, -0.068557322, 0.291333169, -0.128670648, -0.000374275318, 0.361143172, -0.235335112, -0.114649609, -0.0481013171, -0.0209531616, 0.241163999, -0.116799831, -0.156958997, 0.150631443, -0.153868333, -0.415517777, -0.261339515), (-0.066631794, 0.1249469, -0.0390306525, -0.206925556, -0.356235713, 0.151003554, -0.292645991, 0.271101058, -0.180290565, -0.113390908, 0.423786551, 0.212452039, 0.0351996794, 0.281901836, -0.3865394, 0.188468248, 0.0149246631, -0.236910388, -0.319053859, 0.346265972, 0.102368064, 0.0925052315, -0.0692572147, 0.297672153, 0.10483586, 0.0524252281, 0.0537065342, 0.236160427, -0.0284132436, 0.0392619483, -0.199527428, 0.0637842938, -0.187973484, 0.118638597, -0.271706969, 0.131977707, -0.252990276, -0.0535510853, 0.0279703084, 0.241613254, -0.201765135, -0.327154696, -0.211419612, 0.208197713, 0.112075932, -0.276497602, -0.154479787, 0.0914117247), (-0.0826437548, 0.371179104, -0.539940596, -0.313865572, 0.292952269, -0.0397582613, -0.19987902, 0.0204248745, -0.107895277, 0.285645843, -0.231159732, 0.204029188, 0.111868888, -0.141876519, -0.0807081088, -0.00575476373, -0.133253366, -0.0617270879, -0.111700773, -0.209909141, -0.135676339, -0.346705139, 0.231416821, 0.00581433531, 0.238359049, -0.192115948, -0.195618942, 0.147320718, -0.135179773, 0.0125896698, -0.0208327658, -0.339289516, -0.0142432693, -0.0951338932, 0.00126465003, -0.0607531331, -0.112677574, 0.316559076, 0.0674265102, 0.227045998, -0.262229174, 0.0571668707, -0.11529211, -0.150611416, 0.06296473, 0.155898154, -0.115045182, -0.484017789), (-0.160540596, -0.0155410543, -0.42735675, 0.0500591956, -0.31584537, -0.0851092488, -0.0107137254, 0.0611437224, 0.00943945441, -0.350857884, -0.137492955, 0.23132284, -0.0642611831, -0.225750983, 0.0181804858, 0.00880346727, -0.0921559408, -0.00404516561, -0.30143401, 0.0914674923, -0.154467881, 0.319244057, -0.17237483, 0.0894698948, 0.110816158, -0.188170865, 0.40538314, -0.0694773346, 0.0724528655, -0.231732816, -0.331371248, 0.294704854, -0.395857394, -0.165690213, 0.00951755047, 0.0380021185, 0.0831223801, 0.321907848, -0.181500927, -0.264086366, 0.189876065, 0.423426062, 0.162412137, -0.222370058, 0.00179398374, -0.0521300323, 0.0458965749, -0.133470833), (0.141596049, 0.23060739, -0.0295040719, -0.237467319, 0.268520206, -0.135031313, -0.187232271, -0.135910735, 0.200968519, 0.0222402066, -0.0313408077, 0.332107633, 0.344882429, -0.184715092, 0.143165603, -0.214648217, 0.439504176, 0.0297003482, 0.160734877, 0.152670413, 0.237993583, 0.193395898, -0.351326883, 0.0840893462, -0.297437072, -0.296154439, -0.142155379, -0.033352524, 0.208263859, -0.0122494968, -0.191558257, -0.207302377, -0.338494927, -0.204186916, -0.16613242, 0.165902689, -0.0969685614, -0.316949815, 0.0241351798, -0.150113136, -0.179280236, 0.0135055603, 0.198378727, -0.109926984, 0.209739447, -0.0304643903, -0.166635022, 0.370033175), (-0.259222656, -0.0882168859, -0.13854371, -0.0765190125, 0.0529928394, 0.376719981, -0.162684441, -0.0194586087, 0.00416251319, 0.0729689896, 0.418625593, 0.107414789, -0.0139373923, 0.10688132, 0.0414646007, -0.314122587, -0.0474559516, 0.0558109097, 0.476809055, 0.143335953, -0.485761851, -0.0120975664, 0.0183194708, -0.0646873787, -0.0364088342, -0.0420486443, -0.0131565994, -0.0839576572, 0.00238606078, -0.42002812, -0.169303223, 0.0484493114, -0.0985191539, 0.00682660332, -0.11765831, -0.0757163391, 0.380353659, 0.028572714, 0.389237225, 0.177852899, 0.221943066, -0.166623399, 0.146651775, 0.261334896, 0.00980605651, 0.363140523, 0.203096643, -0.161590517), (-0.025864454, -0.112906799, 0.131522551, -0.0145737948, 0.157597557, -0.265248179, -0.0682244226, -0.13282676, -0.157552004, -0.245076805, 0.0519457534, 0.130349666, 0.120569237, 0.0568068549, -0.168423757, 0.0519836918, 0.0589983165, -0.0109471567, 0.261078268, -0.137645856, -0.104175262, -0.344550669, 0.285001814, 0.378712863, 0.163887262, -0.500197947, 0.0891603827, 0.0713985637, -0.349385202, 0.422192752, 0.0752246678, 0.287656069, -0.257392645, 0.0192663781, -0.198598877, -0.262697458, 7.318813e-07, -0.130572051, -0.205981195, -0.0572069623, 0.293974072, 0.00513339974, 0.144845709, 0.167583197, -0.33970654, 0.205531731, -0.104852155, 0.137791827), (-0.278942317, -0.318734199, 0.422422111, -0.218083695, -0.363945961, 0.163311586, 0.138258874, 0.0749095976, 0.0965378657, 0.658348143, -0.07295876, 0.0681967661, 0.0952970311, 0.0380099528, 0.019013172, -0.160451606, 0.105999149, -0.122671299, -0.0525867827, 0.244687811, -0.0955355018, 0.131097034, 0.0568922795, -0.0154144736, 0.000535742613, -0.499896377, 0.321113467, -0.225426003, -0.0740841404, 0.193785459, 0.0528094471, -0.136694327, -0.0361157022, -0.204944208, 0.0865034908, 0.0250765849, -0.0986289307, -0.0353063978, -0.154330969, -0.249025613, -0.341135144, -0.0810631886, 0.0140570235, -0.0505745709, -0.0620189868, -0.0569791496, -0.0223373361, -0.29407537), (-0.149748772, 0.229058757, -0.0984407812, 0.197838232, -0.0215545185, -0.290989488, -0.228420407, -0.126837313, 0.0704401881, 0.297360212, 0.164542198, -0.203146875, -0.509283304, -0.0927857235, 0.0169596206, 0.258582771, -0.00878993236, 0.0187788159, -0.0523861758, 0.0970017686, 0.197150305, -0.470645607, -0.0849435478, 0.250853896, -0.466258109, -0.14195016, 0.168111011, -0.0156004606, -0.0712413639, -0.04352751, -0.106824562, -0.212021574, -0.112462305, -0.157421365, 0.0386634059, 0.35499835, 0.150362805, -0.0195496064, -0.113272145, -0.130922928, 0.204728633, -0.26675415, -0.112888269, -0.0822251439, -0.189413026, -0.0490697324, 0.361197919, -0.0840841532), (0.282927305, -0.0352021381, -0.198475018, 0.120556019, -0.143402755, -0.113036342, 0.335220695, -0.213173732, 0.263820171, 0.206560895, 0.315754145, -0.331556678, 0.0778021142, -0.119392812, 0.121773876, 0.125479147, -0.0978054702, -0.432082504, -0.0462723114, -0.0828770623, -0.327306479, 0.044835683, -0.0215461049, 0.173127308, 0.0695655122, -0.22696206, -0.20192875, -0.0452451445, -0.13517563, 0.0332495496, -0.000656775024, -0.0431043804, 0.125123948, -0.150923535, -0.233051762, 0.341916174, -0.0747466981, -0.0945814401, 0.222850606, 0.187756896, 0.215748623, 0.530157208, -0.114956282, 0.303307474, 0.138616562, -0.110689566, -0.225460678, -0.00724821538), (-0.0213375967, 0.430535346, 0.224260569, -0.00227590441, 0.097922273, 0.106353864, 0.303425282, -0.152325764, 0.28369835, -0.159976766, -0.160550475, 0.0901813135, -0.158492282, 0.148865491, -0.0480320305, -0.252963454, -0.231590256, -0.292653531, 0.110328905, 0.238404468, 0.263177305, 0.0661538988, -0.0417401232, 0.096069023, -0.228285506, -0.0508655347, 0.277566433, 0.0386376418, -0.3933478, -0.100253254, -0.00550549896, -0.248297513, 0.0391222239, 0.221372813, -0.280892998, -0.48762241, 0.0382948667, 0.29657197, 0.217514217, -0.215749919, 0.0668970495, 0.112554133, -0.337334365, 0.0571527779, 0.122978844, -0.0185415205, 0.0319594368, 0.0106362542), (0.00236682966, 0.0600752123, -0.132063717, 0.449774742, -0.0332573988, -0.155177414, -0.108766027, 0.294052273, 0.0260680299, -0.0705137178, 0.117463559, -0.155168414, -0.0131899035, -0.199190617, -0.212307423, 0.137395322, 0.0129840439, -0.631659806, 0.264699131, 0.102654807, -0.142986432, -0.260085195, -0.269344121, -0.112285905, 0.126209125, 0.0316586345, -0.0389081575, -0.53616631, 0.193873063, 0.0812790394, -0.153410435, -0.168603867, 0.00922113005, -0.0973144844, 0.115065135, -0.575882256, -0.0269164462, -0.104299068, -0.0324097015, 0.118663765, -0.224733308, -0.0448874161, 0.0721575096, -0.105996788, 0.00437094457, 0.146291435, 0.0134991957, 0.0867178366), (-0.134357363, -0.11623878, 0.0571706742, 0.0958396122, -0.126294151, 0.0720590577, 0.0730769709, -0.160730988, -0.0623094477, -0.113409467, -0.0619440116, -0.22264865, 0.274280965, -0.0984558091, -0.105763689, -0.00418982236, 0.0678869113, 0.181388542, 0.16480583, 0.186980739, 0.451816052, -0.449406981, -0.121652216, 0.303145528, 0.0208851397, -0.0251270719, 0.356345206, -0.195644528, 0.20208469, -0.409001768, 0.287011236, 0.00751554267, -0.123288594, 0.249136344, 0.154311791, 0.203912675, -0.00150042481, 0.0486866497, 0.0623177141, 0.240326941, -0.170972168, 0.172492459, -0.0299047139, 0.0892581716, 0.144746289, 0.312994301, -0.482705265, -0.23243089), (-0.335104018, -0.038486056, 0.201950625, 0.00889534131, 0.300298721, 0.212269649, 0.194140494, -0.0159792341, 0.251398116, -0.0632461831, 0.324426115, 0.41089195, 0.0549006313, -0.236335725, 0.0033646184, 0.600403011, -0.0749244094, -0.204094172, -0.178861216, -0.00627836725, -0.0937190875, -0.194793686, -0.197948113, -0.0694462657, 0.0156436544, -0.0588549152, -0.188557789, 0.127355561, -0.368201643, -0.379954726, 0.391508043, 0.179335862, 0.180008158, -0.0829047635, 0.0917139873, 0.0486531928, 0.122274302, 0.0695504397, 0.000689649431, -0.0585001484, 0.00160644797, -0.0794375166, 0.285776824, -0.220991328, 0.145625547, 0.0137086948, -0.0520806089, 0.13950935), (0.184838474, 0.0735338926, -0.0578777827, -0.210118458, -0.0252753254, 0.293332368, -0.041503299, 0.031031467, 0.14606145, 0.0512937084, -0.00688579865, -0.370861232, -0.432930261, -0.139298916, -0.0187700801, 0.0114763314, -0.279216558, 0.172139376, 0.142710596, -0.256588042, -0.108783901, 0.0298185572, -0.265801311, -0.0915342122, -0.305729002, -0.446296126, 0.198872358, 0.221652061, -0.0501425155, 0.127895504, -0.136545181, 0.330929905, -0.00368241011, 0.300340146, 0.0549389832, -0.170469493, 0.068297483, -0.0728723034, -0.106768474, 0.46759522, -0.224665418, -0.0574888065, 0.235312417, -0.194655538, 0.244807422, -0.122692928, -0.199870557, 0.113851331), (0.152794525, -0.523384094, -0.163019881, 0.0106612034, 0.199812934, -0.0212853886, -0.236656368, 0.018603107, 0.0857091993, 0.0557287484, -0.00757758925, -0.15155898, 0.0346247219, 0.0365762934, 0.0644835532, -0.192915693, -0.0326725394, -0.452170581, 0.242683589, 0.134749293, 0.128716305, 0.230324239, -0.21426037, 0.203436702, -0.171007439, 0.10914278, -0.194830239, 0.363605917, -0.166359857, -0.170320153, 0.128313482, -0.131788731, -0.155156285, 0.16441451, 0.328335851, -0.0450896136, -0.239665389, 0.311761975, -0.0981269479, 0.0745897889, 0.237708449, -0.0995177329, 0.255530447, -0.0471630096, -0.371343404, -0.235985816, -0.170709744, -0.266228348), (0.136601582, 0.0937428921, 0.0199755933, 0.0163267478, -0.180676207, 0.344996542, -0.258539587, -0.225453138, 0.0600597635, -0.30174917, -0.0632979497, -0.0551515855, 0.167907014, -0.118352562, 0.0435882807, 0.0244361758, -0.212306306, -0.186331615, -0.195858747, -0.272479415, -0.030225886, -0.0987529233, 0.243563429, -0.140932724, -0.112577781, 0.0589791946, 0.00593729038, -0.26343599, -0.170375869, -0.0484716631, -0.174861565, -0.16578801, -0.127381951, 0.269848287, 0.134774715, 0.0807402283, -0.160791278, -0.469252557, 0.00959915482, -0.473194927, 0.138195992, -0.297116637, 0.338662922, 0.154208601, 0.22430861, -0.171304509, -0.0857818648, -0.390083909), (0.0881995335, 0.274858534, 0.399386257, -0.155185789, -0.0841034427, -0.168112904, -0.229212403, 0.0237424131, -0.279137433, -0.00652679475, -0.0765579641, 0.01254592, 0.139949441, -0.0633448288, -0.00802793726, -0.0379261076, -0.380101502, 0.0116023803, -0.103033446, 0.337928146, -0.250187039, -0.163138941, -0.245845065, -0.305277526, -0.329531342, 0.0997861922, -0.197810397, 0.0249366108, 0.119571283, 0.207268611, 0.0718154982, 0.0685515702, -0.0367816985, -0.263687581, 0.142251462, -0.0583565757, 0.416153193, 0.204408348, 0.00355559355, -0.00843832176, 0.3033382, 0.0329652987, -0.000519174268, 0.130493939, -0.0617715567, -0.0739695877, -0.566767633, -0.124833778), (0.0207351092, 0.0430982038, -0.027318228, -0.0327308141, 0.0654033944, 0.221237063, 0.0552817769, -0.0248632431, 0.1399398, 0.087747328, 0.253594995, 0.0138133429, 0.194370046, -0.0179861803, 0.530361831, 0.123800486, 0.306644201, 0.155396149, -0.041590821, 0.0522169694, 0.0245827846, -0.326102197, -0.359055549, 0.110385619, 0.176720574, 0.233160987, 0.0864702538, 0.0350952744, 0.0712469667, 0.254986107, -0.336610734, 0.303234518, 0.19415459, 0.185637906, -0.25409472, -0.295234799, -0.0617961362, -0.0754661709, 0.197048992, -0.108970851, 0.194580793, 0.00496016722, -0.151177034, -0.350042462, -0.251544774, -0.265874445, -0.155680254, -0.421927363), (0.296331555, -0.149419203, -0.191993713, 0.362180084, 0.00638712849, -0.375406533, 0.159140676, 0.144958228, 0.103597842, -0.145669401, 0.00488365628, 0.197119504, -0.00549873197, 0.293419838, -0.064685747, 0.0849443227, -0.0422470309, 0.228626594, 0.30783999, 0.222996011, 0.0434944071, -0.0973717272, 0.131425887, -0.306507021, -0.133213162, -0.350925565, -0.119300611, 0.0238815323, 0.138699472, -0.116759501, 0.00100915041, 0.26190716, 0.168882638, 0.0375924185, -0.382638365, 0.127250761, -0.104199469, 0.239978015, 0.0987413228, -0.261609316, -0.2729882, -0.286639959, 0.200153157, 0.0847504511, 0.219627976, -0.326410979, -0.0909970328, -0.378087312))
-POLICY_B2 = (-0.013180011, 0.00883788336, 0.000827969343, 0.0122588146, 0.0125965811, -0.0262801275, 0.00964550395, 0.011024789, -0.000978212804, 0.000968122913, -0.0145603148, -0.0104509629, 0.0130474623, -0.013587526, -0.00952513609, -0.000108047629, 0.0132395318, -0.00742173893, 0.00283490331, 0.00609485712, 0.0120508336, -0.00558906887, -0.00765331415, 0.0133428276, 0.00904229097, -0.00415954832, -0.00924041588, -0.011864786, -0.00984307658, 0.00345984567, -0.0100763571, 0.00731632719, 0.00845888909, 0.0261376593, -0.0084556099, -0.0304928124, -0.00332962186, 0.0107138054, -0.00491446815, -0.0153681897, -0.0153049082, -0.00671308255, -0.00296661863, 0.00686364435, 0.00466373097, -0.00552810729, 0.0168486852, 0.00777075347)
-POLICY_W3 = ((-0.159318984, -0.345932275, -0.111984, -0.0884046927, -0.59881103, 0.0607927777, -0.231118187, 0.00211651903, -0.0846647546, 0.119971916, 0.0898691267, -0.29471004, -0.106830724, -0.240258694, -0.250798255, -0.0337186158, -0.0318336934, -0.225803494, 0.256698817, 0.144493863, 0.0917559639, 0.136400521, 0.165541917, 0.128203526, -0.159356728, -0.19952704, -0.160209358, 0.0937999487, -0.321827829, -0.0343924798, 0.146822095, -0.199862525, -0.10663493, 0.441923618, -0.206172511, -0.203445747, -0.143007636, 0.421644509, -0.0617908575, 0.0842312798, -0.208307773, 0.25702399, 0.312906921, -0.0231833309, 0.00825878046, -0.0889768377, -0.208818495, 0.0137391761), (-0.131351501, -0.02337531, 0.0950980932, 0.164717183, 0.338228703, -0.0378176644, 0.113658875, -0.10880243, 0.0731383115, 0.0583644919, 0.060520377, -0.586062491, -0.277038932, 0.238718048, 0.183418483, 0.0609093942, -0.109666117, 0.0260734856, 0.180637732, 0.0688827708, 0.296253115, 0.090824917, 0.299634188, -0.186585665, 0.0742874667, 0.277061373, 0.144100636, -0.00847732183, 0.033301238, -0.222196668, 0.0724627376, -0.326781571, -0.0524940751, 0.179271802, -0.200729325, 0.187875479, 0.00541043514, 0.250463516, 0.493380815, -0.251641899, 0.252885371, -0.0870592594, 0.194937065, -0.0829509571, 0.241142109, 0.139994666, 0.240096018, -0.155234084), (0.0181206763, 0.192314804, 0.0978935808, 0.153241962, -0.20749329, -0.153699353, -0.320201397, 0.210461706, -0.0088672759, -0.108813077, -0.264169514, 0.142341584, -0.091966562, 0.207169712, -0.0483822189, 0.342479736, 0.0841471329, -0.0132281035, 0.341766059, -0.177665532, 0.149739593, 0.0637513772, -0.0289235786, 0.0971964747, -0.283199042, 0.411413163, 0.273474991, -0.272259951, -0.218937799, -0.138818711, -0.574567437, 0.196004868, -0.135393381, -0.147734344, 0.0860940889, -0.0379899554, -0.125445247, 0.0403711572, 0.118949302, 0.0384827852, -0.342739701, -0.0803968608, 0.222266942, 0.228268325, 0.273098022, 0.0466230661, -0.0374581702, 0.163794219), (-0.154055059, -0.114232935, -0.23070249, 0.128172711, 0.287068099, 0.197731838, 0.0893933326, -0.19079496, -0.0408954844, 0.11522121, 0.203129232, -0.371307552, -0.271712095, 0.0475890301, 0.0346003883, -0.0205988623, 0.255425483, 0.0675946325, 0.0264122821, -0.0227584224, -0.112933867, -0.154569015, -0.26978004, -0.481139928, 0.150816783, 0.193733767, -0.0454597473, 0.330998719, -0.217623621, 0.273314446, -0.206771448, 0.00503023202, -0.111833453, -0.177515343, 0.304313928, -0.102241717, -0.119819604, 0.088053368, -0.147182792, 0.200376242, -0.534719884, -0.276464552, 0.0478235744, -0.17940937, -0.120619193, 0.0936570466, -0.240103483, 0.109263211), (0.303854167, 0.040275868, 0.0177765153, 0.342834085, -0.0442634635, 0.0440397635, -0.21804674, -0.0697438344, 0.102984034, 0.0536197536, -0.0286500473, -0.0838544071, -0.253985167, 0.0888372511, -0.11711093, -0.0542464182, -0.24608402, -0.0965288207, 0.237769082, 0.315376103, 0.048087649, -0.055223316, 0.201939151, -0.105867811, 0.0382711887, 0.302828729, -0.44541654, -0.111805759, -0.211869046, 0.0598692074, 0.248726025, 0.227278188, -0.188058063, -0.256344885, -9.57237935e-05, 0.20466198, 0.363510638, 0.223693222, 0.0277508516, 0.304749846, 0.0789803341, 0.284625918, -0.450538546, 0.348174334, -0.272007525, 0.0277682468, 0.0823568031, 0.173217461), (-0.253349513, -0.223148882, 0.191759303, 0.432441711, -0.264093935, 0.13160938, -0.0231092051, -0.000372146518, -0.133499712, 0.0772652254, 0.314387381, -0.0142781762, 0.197087854, -0.401587903, 0.268179923, 0.140333235, 0.020294182, -0.0242426246, -0.0231671687, -0.397658974, 0.170348302, -0.380032092, 0.444092423, 0.0520144664, 0.105550803, 0.161364853, -0.00210324535, 0.00590154296, 0.00345810782, -0.0934316441, -0.108618848, 0.0652570277, 0.114113726, -0.06087818, 0.171252146, 0.279900432, -0.0340936743, 0.0683908612, -0.243285626, -0.0268213432, 0.0826030225, -0.24274677, -0.275655478, -0.11018917, 0.0747034475, -0.435887605, 0.0291442107, 0.0225639679), (-0.42137441, -0.12920177, 0.276453733, -0.303068221, -0.0555415936, 0.188385919, 0.0865764469, 0.296160787, 0.196864307, -0.191760913, 0.234789833, -0.210928932, -0.155373663, 0.229352489, -0.0519345738, 0.110037595, -0.120554201, -0.14711608, -0.0379409268, 0.137100875, 0.216500416, 0.0627308786, 0.0575427972, -0.156493574, 0.0310122855, 0.0702345073, -0.189111426, -0.0195710976, 0.294631243, -0.407648355, -0.353449464, 0.0662455112, 0.289081722, -0.0423004366, 0.151682839, 0.10531462, 0.0969755277, -0.309222788, -0.18448706, 0.14173685, 0.0157105103, 0.352718413, 0.197448552, 0.138833001, -0.42406252, -0.00819285028, -0.129319802, 0.0297446642), (-0.0202331226, -0.169847831, 0.0257660896, -0.0659219176, -0.0463109612, 0.179738268, -0.120281689, 0.218276069, 0.315428734, 0.119973898, 0.397071391, 0.255885839, -0.0284119453, 0.252117932, 0.0272973031, 0.401054651, -0.120215274, -0.128081068, 0.0185724571, 0.355264038, 0.169452503, -0.184877664, -0.435546786, 0.24969767, 0.305171192, -0.175940961, 0.191171065, 0.0538943596, -0.424483359, 0.0559950359, -0.122256406, -0.0306204855, 0.00700545404, 0.0842741802, 0.127698913, -0.0594193414, 0.155003652, 0.238494962, 0.207768887, -0.0530892126, 0.0231498219, -0.0977411121, -0.168478817, 0.00763322273, -0.0891859084, -0.168027163, 0.280262083, -0.457612514), (0.0663249195, -0.120869242, -0.0393097885, -0.336454004, 0.145437777, 0.345209181, -0.413849443, -0.135307699, -0.207150325, 0.00114678731, 0.0917361602, 0.0650390983, 0.230630383, 0.0354105979, -0.172383279, -0.0308791716, -0.0258989632, -0.0391300879, -0.0313270316, -0.229953647, -0.137686402, -0.162791371, -0.218307704, -0.0625508204, -0.28283149, 0.247895837, -0.267335474, -0.218837187, 0.0480321497, -0.0813552737, 0.187329486, -0.576806724, -0.0847465098, -0.0863866135, -0.0240952354, 0.254266113, -0.0422970392, -0.255191177, 0.37408337, 0.250637472, -0.0837799162, -0.173376739, -0.00781369023, 0.129601911, -0.0232633669, -0.119566619, -0.205627888, -0.331545025), (-0.148266286, 0.0852950737, 0.157056883, -0.0682421401, 0.00943986047, -0.0210856907, 0.0237998273, 0.535219669, -0.40674001, 0.258222878, -0.248353675, 0.14219597, -0.287679732, -0.0748505518, 0.0487876125, -0.458266944, 0.0849961564, -0.140807703, -0.0251995791, 0.28150636, 0.164295226, -0.0846163705, 0.04206926, -0.124149278, -0.170832112, -0.220240757, -0.0735406503, 0.163637072, -0.121443547, -0.0835138634, -0.234163851, 0.0889437646, -0.225396469, -0.303048611, -0.245078787, 0.187906116, 0.00520399073, 0.0455481447, 0.205515534, 0.0708418414, 0.225970685, -0.382186323, 0.0379890203, -0.0870047063, -0.0827352554, -0.275943756, -0.161190316, -0.161701962), (-0.31291762, 0.138673916, -0.261592388, -0.00913638435, 0.282906145, -0.0186830349, -0.0987778381, 0.061937321, -0.367268234, 0.159394681, 0.201610282, 0.0183442514, 0.0852919221, -0.102167703, -0.0154305976, 0.145034671, -0.403646976, -0.18660222, 0.0144840609, -0.0683011264, 0.261900842, -0.00210437085, -0.0946102887, 0.00631955313, -0.3023175, -0.109226421, -0.169396892, -0.529929638, 0.0777102932, 0.334698349, -0.192792371, -0.11504937, -0.167391926, 0.000408833672, 0.286909074, -0.161063492, 0.0564921759, 0.11965508, 0.0313597471, -0.32368055, 0.116900541, 0.15170151, -0.0835063383, -0.313741982, -0.180541277, 0.0630225614, 0.151118875, 0.390903264), (0.0368866883, -0.228412479, -0.118957557, -0.143651918, 0.331362277, -0.38649106, 0.109081656, -0.0562954918, 0.0580065064, 0.0703214034, 0.194820508, 0.21813716, 0.0753766, 0.0112499017, 0.154164806, -0.12711516, -0.0917193741, 0.0402088463, -0.0233489275, -0.387730718, 0.242736042, -0.321718246, 0.0548343137, 0.192557812, -0.00478991121, -0.00867917947, 0.237007186, 0.29101494, -0.130921498, -0.00481807766, -0.0871422216, -0.0029419614, -0.0354853086, 0.0776668563, -0.196811751, -0.130509108, -0.0709180981, 0.237634957, 0.302014351, 0.267071694, 0.165463582, 0.104543582, 0.158081099, 0.441899836, -0.482322723, 0.0492929369, -0.23926878, 0.359136522), (-0.0644819438, -0.378023773, 0.251966089, 0.15090996, -0.167079747, -0.134456292, 0.0102762785, 0.107872538, -0.243398845, -0.423723161, -0.278716624, 0.173016086, -0.325701833, 0.0353444591, -0.164093763, -0.212365642, -0.307150364, 0.338490844, 0.248218969, -0.0754205212, 0.101352118, -0.0982360169, -0.0927997828, -0.04676814, 0.331691623, -0.0665225238, -0.0270493291, 0.0447943509, 0.139692247, 0.432643473, 0.0376660675, -0.218228623, 0.0553803109, -0.100534238, 0.404334396, -0.0473023802, -0.375300139, 0.00885842554, 0.171822548, 0.145090833, 0.100235425, 0.19285433, 0.0775467381, -0.0571563169, 0.00663817441, -0.0251676012, 0.23320356, -0.124025874), (-0.189400151, 0.364958525, -0.355402142, 0.205351427, 0.0341048837, 0.151357442, -0.165551648, 0.119117722, 0.100890681, 0.00571271637, 0.242971584, -0.100573219, -0.151538461, -0.245556131, 0.00300554605, -0.301615864, -0.344725817, 0.208017126, -0.0926996693, 0.0687241927, -0.0824867636, 0.0537505783, 0.0591824092, 0.321132421, 0.297356963, -0.00418875879, 0.0185511652, 0.136644989, 0.125244245, -0.30657959, -0.0981633142, -0.207144201, -0.4324359, -0.115608856, 0.313834429, -0.295384347, 0.0774597973, -0.0640672594, -0.0795012936, 0.00640179496, 0.0477657169, 0.0893984586, 0.225234419, 0.52118361, 0.266313314, -0.18283388, -0.000825266063, -0.129383594), (0.206740364, 0.429072857, 0.161601171, -0.275670171, -0.130458668, 0.0119945956, -0.232828096, -0.100760862, -0.167218596, 0.416725695, 0.0613630302, 0.0636609122, -0.193654373, 0.0167561583, 0.151734993, -0.155625507, 0.00488333637, 0.177326113, 0.0484993756, -0.0476550981, 0.11927025, 0.0426118709, 0.116311587, -0.300535798, 0.365289599, 0.223630711, 0.188276812, -0.0278901309, -0.159501359, 0.339062721, -0.157910183, -0.0352607891, 0.189808905, 0.358539075, 0.0031342681, -0.0850261897, 0.135140181, -0.221271157, 0.0518852025, -0.2357364, 0.0422130674, 0.445928186, -0.0525800064, 0.00501137692, -0.0468580984, -0.349916726, -0.342687517, -0.120809592), (0.190428436, -0.278024614, -0.274434477, -0.107898191, 0.14930819, 0.0342492796, -0.20035629, 0.304851472, -0.00071043655, -0.0878472701, 0.089428246, -0.213788554, 0.0662403032, 0.305600792, -0.420442462, 0.100065477, -0.0410961322, 0.142527357, 0.0599961579, 0.140283719, -0.222267225, -0.36512512, 0.230253905, -0.355359584, -0.324196994, -0.183445871, 0.335368991, 0.177388743, 0.149006546, 0.271791816, -0.137123406, 0.0938451737, -0.143859997, 0.193806544, -0.0195437409, 0.116440453, 0.0642495006, -0.0616907626, -0.34116289, -0.160692602, 0.336813569, -0.021592563, -0.0625574961, 0.250407875, 0.238125265, -0.156380981, 0.0160620324, 0.0607047379), (-0.11959172, 0.301216662, -0.12204615, 0.108499296, -0.0163466204, -0.117769122, -0.302917004, -0.00875880755, -0.27130422, -0.137973458, 0.305824697, -0.0101364953, -0.0227774922, -0.187303215, 0.209994435, 0.0423843674, -0.13652581, -0.294707209, 0.0546728224, 0.0506789163, -0.213551313, 0.00524864579, -0.16637747, -0.134919226, -0.299136192, -0.0214774534, 0.105136685, 0.348865956, -0.279731452, 0.0935222507, 0.180974007, 0.128101885, 0.742925882, -0.285940737, 0.066864565, 0.176960066, -0.192843825, -0.0998260528, 0.0323150195, 0.0242599119, 0.2887398, 0.085826762, 0.192284673, 0.104222506, 0.201453924, 0.329808772, 0.040523082, -0.048967842), (-0.0589867756, -0.015302876, -0.286437988, 0.177142486, -0.0704756603, -0.0971111059, 0.0622738823, 0.00307653076, 0.371939152, 0.2046749, -0.362110704, 0.0692373067, 0.168252394, -0.194689512, 0.102320589, -0.104608789, -0.0985177606, -0.273206234, -0.0400027409, 0.428741634, -0.0936049819, -0.337168217, 0.281508774, -0.122254521, -0.0828425288, 0.0216009691, 0.364000946, -0.0140248351, 0.0815101191, 0.0707998276, -0.196483821, -0.498729765, 0.193264917, -0.217809528, -0.0358309411, -0.0518279858, 0.110702671, -0.185538232, 0.16650261, 0.228621289, -0.324507385, 0.289832413, 0.0528771132, -0.20006977, -0.0848379359, -0.146117419, 0.264846653, 0.0770322829), (-0.2158034, 0.190475583, 0.364537299, -0.0647562146, 0.425801575, -0.253928602, -0.0299473442, 0.0686878189, -0.103935443, 0.163530275, 0.0433010571, 0.170555219, 0.321439892, 0.0843354613, -0.0905900449, 0.0211036503, -0.237824455, 0.345077038, 0.0192520302, 0.330366164, -0.00074359111, -0.101177841, 0.251991779, 0.0965131074, -0.0803291574, -0.0116323931, -0.346168876, 0.127986014, 0.00693661766, 0.0219239965, -0.0552505255, -0.00185375428, 0.300327808, 0.424636275, 0.0921601355, 0.0123954015, 0.00511715142, 0.143818304, -0.105132677, 0.444540143, -0.340862185, -0.156831399, -0.0656850412, -0.0307239499, 0.395874023, 0.0817864761, -0.0113412822, 0.0328444578), (0.00644854177, 0.0921388045, 0.0327540077, 0.353098005, 0.149859726, 0.0463392138, 0.175332174, -0.105254985, -0.286943227, -0.238408312, 0.0707317516, -0.293862522, 0.0591401719, -0.0264734291, -0.183585897, 0.00480257301, 0.214770317, -0.041370932, 0.0832242072, 0.132282212, -0.103806466, -0.340872765, -0.258299619, 0.279529721, 0.252394617, -0.161253586, -0.263784379, -0.264914125, 0.00986215938, 0.208613575, -0.315947294, 0.00832746085, 0.335711032, 0.0501290038, -0.59450841, 0.119606972, -0.095787771, -0.190178871, 0.0794753432, -0.206618771, -0.190702021, 0.0460510477, 0.120535985, 0.356487632, 0.00257519772, -0.266965687, 0.147361591, 0.161214441), (-0.13494803, -0.151164159, -0.274975389, 0.244724497, -0.21094425, -0.108967029, -0.160188451, 0.172911882, 0.0519824475, 0.172211096, -0.423481137, -0.13981241, 0.258637458, 0.32608217, -0.0318718962, -0.0437530316, -0.538523138, -0.029111458, -0.119385913, -0.299331069, -0.198132306, 0.169979185, -0.369411409, -0.0187278073, 0.334817827, 0.121068597, -0.106287174, 0.167573318, 0.0997845456, -0.0409635082, -0.2326556, -0.127217576, 0.28664273, 0.0722483099, -0.220275894, 0.209756434, 0.204408348, 0.161456019, -0.0915706381, -0.0676903501, 0.114965327, -0.191557974, -0.137752339, -0.133081451, 0.00792247336, 0.0869966149, -0.34708339, 0.0797188431), (-0.221330673, -0.0142788757, -0.361955613, -0.0991249606, -0.044030793, -0.0373632982, 0.0833213553, -0.0733541399, 0.0149164861, 0.258381695, -0.0806771591, -0.0950298309, 0.0542634763, -0.102646723, -0.413030386, 0.105826497, 0.149710134, 0.349104762, -0.0495951138, -0.0359026119, -0.27165255, 0.344124109, 0.466443002, 0.283853292, -0.0174652189, 0.0853899866, 0.00124315789, -0.0204493199, -0.243019253, 0.151097402, -0.254088104, 0.146748081, 0.183290884, 0.000416347466, 0.202680588, 0.329982162, -0.245543078, -0.112019598, 0.271835268, -0.0491013862, 0.0883098394, -0.110609151, -0.112740584, 0.0965952724, -0.432958633, 0.13203381, 0.148600623, -0.284931302), (0.100933239, -0.0100183347, 0.418974191, 0.372883022, -0.0996069536, 0.333136678, 0.156533137, 0.115860231, 0.243316486, 0.385828525, -0.0137032373, -0.161672831, -0.11760354, 0.0449096486, 0.224905029, 0.0715043768, -0.0126956068, 0.233888507, -0.00890078675, -0.179353416, -0.505372345, -0.050042849, -0.164617792, 0.0262810048, -0.43862766, -0.317995667, -0.20996511, 0.0767970085, -0.0714143515, -0.0386426263, -0.25639227, -0.0622284636, -0.0807790458, 0.161425725, 0.124886952, -0.251135856, -0.0748466104, -0.0946933329, 0.354609668, 0.0976506099, 0.27016902, 0.258617252, -0.0666282997, -0.0204717219, 0.00511072576, 0.0537654161, -0.0300804824, 0.1368687), (0.220920563, 0.0123926559, 0.0515715554, 0.385696232, 0.141692638, -0.0833774582, -0.0384990387, -0.347817719, 0.201261044, 0.0539257377, 0.444560319, 0.211959258, -0.130959794, 0.320439637, -0.180136651, -0.168738738, -0.130703405, -0.126650378, 0.0524448678, -0.0908356011, -0.026297396, 0.383687943, 0.163851619, 0.175287098, -0.0887912512, -0.192151099, 0.108863704, -0.232431591, 0.0675657839, 0.259259939, -0.167474806, -0.0509634688, 0.0499665625, -0.176542282, -0.166819155, 0.152081192, -0.00388879213, -0.0788632631, -0.244314268, 0.353599936, 0.131744534, -0.169770747, 0.385447949, -0.361429602, 0.0239859149, -0.191151202, -0.24635686, -0.138694361))
-POLICY_B3 = (-0.00706413761, -0.00466778502, 0.00821744744, 0.00358207803, -0.0014657462, 0.00922442228, -0.0109182876, -0.00281753833, -0.014738895, 0.00418735156, 0.0113002108, -0.00511235744, -0.00299129332, 0.00841881614, -0.00216892315, -0.0126643283, 0.0122070182, -0.00027098073, 0.0111078331, 0.00852408167, 0.00789360981, -0.00160051312, -0.00515383668, -0.00898506306)
-POLICY_W4 = ((0.0245904215, 0.0141004063, -0.00868937466, 0.00296556624, 0.0209129732, -0.0100892801, -0.00706695113, 0.0124771427, 0.000159525007, 0.00332689704, -0.00473733293, -0.0126084713, 0.00521388603, 0.00108843693, -0.00319989538, -0.016493177, -0.00999542698, 0.006223673, 0.0126522221, -0.0178329106, 0.0103249727, -0.00239102519, 0.00730328169, 0.00325559266), (0.00653506583, 0.0107290102, -0.0195015259, 0.0118376343, -0.0167090762, -0.0137644475, -0.00771043915, 0.0021372214, 0.0113698142, -0.00498187356, -0.0101118498, 0.0114312209, -0.00941059086, 0.00930167176, 0.0149901342, 0.00917857606, -0.0172044095, -0.0114224581, 0.0104008364, -0.00673022075, 0.0149969198, 0.0123072946, 0.00931853242, -0.0155168679), (-0.0076976493, 0.00173347164, 0.00159676466, -0.0134216268, -0.0188878216, -0.00681437366, -0.00617517484, -0.00181937241, 0.00237919972, 0.00850604009, -0.00219020178, 0.0103959795, -0.0121418778, 6.72484894e-05, 0.00399272703, 0.0076746135, 0.0147403944, -0.00643317075, -0.00351685495, 0.00656862743, 0.00288254721, 0.0103208274, 0.00179854163, -0.00891883112), (0.00651124772, 0.000268958654, -0.00767312059, 0.0109420568, 0.0101347761, -0.00095776032, -0.00420767674, -0.00145265879, 0.0113802617, -0.00400143536, -0.00625561317, -0.0106135653, 0.00106984249, -0.00197199825, 0.00829427037, -0.00189642329, -0.00229265122, -0.00397611083, 0.00567716872, -0.00915526226, 0.0117080007, -0.00643821387, -0.00973889045, 0.00349306175), (-0.0255707819, -0.0133215385, 0.0142796701, -0.00675656833, -0.0153671382, 0.0160017107, 0.0146509772, -0.0144285411, -0.00849602558, -0.0189809185, 0.0191520471, 0.0179555509, 0.00437965058, -0.0106723262, -0.000375457108, 0.00536186807, 0.0177386813, 0.00453982595, -0.0102794347, 0.0306772441, -0.0183105357, -0.00755273085, -0.0179530624, 0.0115986038), (-0.00215049786, -0.0139298625, 0.0207824577, -0.0111384336, 0.0154533312, 0.0097507704, 0.00939196534, -0.00488688145, -0.0137844067, 0.0125951786, 0.0159513094, -0.00621134555, 0.0127616664, -0.000427860941, -0.0145651754, -0.0145113524, -0.000294882047, 0.00763230491, -0.00624779006, 0.00407627737, -0.0149313137, -0.011877913, 0.0011606717, 0.00832785387))
-POLICY_B4 = (-0.0075515816, -0.0137931155, -0.00399047509, -0.00602859212, 0.0160842836, 0.0159020051)
-# END EXPORTED PPO ACTOR
+# Experiment 2 actor omitted: the accepted policy uses only the tactical value MLP.
 
 
 
@@ -289,8 +623,9 @@ class SwarmController(BaseSwarmController):
         self.side = {drone.id: 1.0 if (drone.id % 2) == 0 else -1.0 for drone in own}
         self.lane = self._assign_lanes(own)
         self._last_command = {}
-        self._plan_action = 1
-        self._next_policy_time = 0.0
+        self._tactical_assignments = {}
+        self._tactical_overrides = {}
+        self._next_tactical_time = 0.0
 
     def _assign_lanes(self, own):
         """Spread each class across the 14 m goal mouth so arrivals do not collide."""
@@ -756,93 +1091,241 @@ class SwarmController(BaseSwarmController):
             pursued / max(1, len(own_transports)),
         )
 
-    def _policy(self, features):
-        values = features
-        for weights, biases in ((POLICY_W1, POLICY_B1), (POLICY_W2, POLICY_B2), (POLICY_W3, POLICY_B3)):
-            values = tuple(
-                tanh(bias + sum(weight * value for weight, value in zip(row, values)))
-                for row, bias in zip(weights, biases)
-            )
-        logits = [bias + sum(weight * value for weight, value in zip(row, values)) for row, bias in zip(POLICY_W4, POLICY_B4)]
-        return max(range(len(logits)), key=lambda index: (logits[index], -index))
+    def _entity_features(self, drone, friendly):
+        kind = drone.drone_type
+        spec = self.specs[kind]
+        field = self.attack if friendly else self.defend
+        cost = self._cost_to_go(field, drone.position)
+        speed = hypot(*drone.velocity)
+        max_speed = max(spec.max_speed, TINY)
+        max_acceleration = max(spec.max_acceleration, TINY)
+        return (
+            float(kind is DroneType.SCOUT),
+            float(kind is DroneType.TRANSPORT),
+            float(kind is DroneType.TANK),
+            _clamp(self.forward * (drone.position[0] - self.width / 2.0) / (self.width / 2.0), -1.0, 1.0),
+            _clamp((drone.position[1] - self.height / 2.0) / (self.height / 2.0), -1.0, 1.0),
+            _clamp(self.forward * drone.velocity[0] / max_speed, -1.0, 1.0),
+            _clamp(drone.velocity[1] / max_speed, -1.0, 1.0),
+            _clamp(self.forward * drone.acceleration[0] / max_acceleration, -1.0, 1.0),
+            _clamp(drone.acceleration[1] / max_acceleration, -1.0, 1.0),
+            1.0 - _clamp(cost / self.width, 0.0, 1.0),
+            (drone.shots_remaining or 0) / 5.0,
+            POINT_VALUE[kind] / 5.0,
+            _clamp(speed / max_speed, 0.0, 1.5),
+            _clamp(cost / max_speed / self.duration, 0.0, 1.0),
+        )
 
-    def _allocation(self, state, own, foes):
-        # High-level decisions are intentionally sticky: reassignment every
-        # control tick destroys useful pursuits even when logits barely move.
-        if state.time + TINY >= self._next_policy_time:
-            previous = self._plan_action
-            features = tuple(self._policy_features(state, own, foes)) + tuple(
-                1.0 if index == previous else 0.0 for index in range(len(PLAN_ACTIONS))
-            )
-            self._plan_action = self._policy(features)
-            self._next_policy_time = state.time + 2.0
-        return PLAN_ACTIONS[self._plan_action]
+    def _pair_features(self, scout, role, candidate):
+        _key, target, ward = candidate
+        target_entity = self._entity_features(target, False)
+        dx = self.forward * (target.position[0] - scout.position[0]) / self.width
+        dy = (target.position[1] - scout.position[1]) / self.height
+        scout_speed = max(self.specs[DroneType.SCOUT].max_speed, TINY)
+        dvx = self.forward * (target.velocity[0] - scout.velocity[0]) / scout_speed
+        dvy = (target.velocity[1] - scout.velocity[1]) / scout_speed
+        distance = _dist(target.position, scout.position)
+        if ward is None:
+            ward_dx = ward_dy = ward_progress = 0.0
+        else:
+            ward_dx = self.forward * (ward.position[0] - scout.position[0]) / self.width
+            ward_dy = (ward.position[1] - scout.position[1]) / self.height
+            ward_progress = 1.0 - _clamp(self._cost_to_go(self.attack, ward.position) / self.width, 0.0, 1.0)
+        return tuple(float(index == role) for index in range(6)) + target_entity + (
+            _clamp(dx, -1.0, 1.0),
+            _clamp(dy, -1.0, 1.0),
+            _clamp(dvx, -2.0, 2.0),
+            _clamp(dvy, -2.0, 2.0),
+            _clamp(distance / self.width, 0.0, 1.0),
+            _clamp(distance / scout_speed / self.duration, 0.0, 1.0),
+            target_entity[-1],
+            POINT_VALUE[target.drone_type] / 5.0,
+            (target.shots_remaining or 0) / 5.0,
+            _clamp(ward_dx, -1.0, 1.0),
+            _clamp(ward_dy, -1.0, 1.0),
+            ward_progress,
+        )
 
-    def _plan(self, state, own, foes):
-        """Assign one duty per vehicle: the value game decided centrally."""
-        transport_hunters, gun_hunters, keepers, guard_cap, block_cap = self._allocation(state, own, foes)
+    def _tactical_score(self, features):
+        values = tuple(
+            tanh(bias + sum(weight * value for weight, value in zip(row, features)))
+            for row, bias in zip(TACTICAL_W1, TACTICAL_B1)
+        )
+        values = tuple(
+            tanh(bias + sum(weight * value for weight, value in zip(row, values)))
+            for row, bias in zip(TACTICAL_W2, TACTICAL_B2)
+        )
+        return TACTICAL_B3[0] + sum(
+            weight * value for weight, value in zip(TACTICAL_W3[0], values)
+        )
+
+    def _tactical_context(self, state, own, foes, scouts):
+        wards = [drone for drone in own if drone.drone_type is DroneType.TRANSPORT]
+        transports = sorted(
+            (drone for drone in foes if drone.drone_type is DroneType.TRANSPORT),
+            key=lambda drone: drone.id,
+        )
+        tanks = sorted(
+            (drone for drone in foes if drone.drone_type is DroneType.TANK and drone.shots_remaining),
+            key=lambda drone: drone.id,
+        )
+        guard_candidates = []
+        for target, _catch_time in self._pursuers(wards, foes, scouts):
+            ward = min(wards, key=lambda item: (_dist(item.position, target.position), item.id))
+            guard_candidates.append((("DRONE", int(target.id)), target, ward))
+        block_candidates = [
+            (("BLOCK_LINE", int(ward.id), int(gun.id)), gun, ward)
+            for ward, gun in self._gun_lines(wards, foes)
+        ]
+
+        def maximum_progress(drones, field):
+            return max(
+                (1.0 - _clamp(self._cost_to_go(field, drone.position) / self.width, 0.0, 1.0) for drone in drones),
+                default=1.0,
+            )
+
+        def nearest_distance(first, second):
+            if not first or not second:
+                return 1.0
+            return _clamp(min(_dist(left.position, right.position) for left in first for right in second) / self.width, 0.0, 1.0)
+
+        foe_scouts = [drone for drone in foes if drone.drone_type is DroneType.SCOUT]
+        loaded_tanks = [drone for drone in foes if drone.drone_type is DroneType.TANK and drone.shots_remaining]
+        scout_count = max(1, len(scouts))
+        global_features = tuple(self._policy_features(state, own, foes)) + (
+            maximum_progress(wards, self.attack),
+            maximum_progress(transports, self.defend),
+            nearest_distance(wards, foe_scouts),
+            nearest_distance(wards, loaded_tanks),
+            _clamp(len(guard_candidates) / scout_count, 0.0, 1.0),
+            _clamp(len(block_candidates) / scout_count, 0.0, 1.0),
+        )
+        shared = {
+            HUNT_TRANSPORT: [(('DRONE', int(target.id)), target, None) for target in transports],
+            HUNT_TANK: [(('DRONE', int(target.id)), target, None) for target in tanks],
+            GUARD_TRANSPORT: guard_candidates,
+            TACTICAL_BLOCK: block_candidates,
+        }
+        return global_features, shared
+
+    def _tactical_options(self, state, scout, global_features, shared, keep_possible):
+        previous_role, _previous_target, since = self._tactical_assignments.get(
+            int(scout.id), (TACTICAL_RUN, None, state.time)
+        )
+        duration = _clamp((state.time - since) / 10.0, 0.0, 1.0)
+        scout_features = self._entity_features(scout, True)
+        previous = tuple(float(index == previous_role) for index in range(6))
+        options = [(TACTICAL_RUN, None, (1.0, 0.0, 0.0, 0.0, 0.0, 0.0) + (0.0,) * 26)]
+        if keep_possible:
+            options.append((TACTICAL_KEEP, None, (0.0, 0.0, 0.0, 0.0, 1.0, 0.0) + (0.0,) * 26))
+        for role in (HUNT_TRANSPORT, HUNT_TANK, GUARD_TRANSPORT, TACTICAL_BLOCK):
+            ranked = sorted(
+                ((self._pair_features(scout, role, candidate), candidate) for candidate in shared.get(role, ())),
+                key=lambda item: (item[0][25], repr(item[1][0])),
+            )
+            if ranked:
+                pair_features, candidate = ranked[0]
+                options.append((role, candidate, pair_features))
+        scored = []
+        for role, candidate, pair_features in options:
+            features = global_features + scout_features + pair_features + previous + (duration,)
+            scored.append((self._tactical_score(features), role, candidate))
+        return scored
+
+    def _update_tactical_assignments(self, state, own, foes):
+        scouts = sorted(
+            (drone for drone in own if drone.drone_type is DroneType.SCOUT),
+            key=lambda drone: drone.id,
+        )
+        global_features, shared = self._tactical_context(state, own, foes, scouts)
+        live_scout_ids = {int(scout.id) for scout in scouts}
+        locked = any(
+            scout_id in live_scout_ids and state.time + TINY < override[2]
+            for scout_id, override in self._tactical_overrides.items()
+        )
+        proposal = None
+        if not locked:
+            keep_possible = self._goal_threatened(foes)
+            for scout_index, scout in enumerate(scouts):
+                scored = self._tactical_options(state, scout, global_features, shared, keep_possible)
+                logits = [option[0] for option in scored]
+                peak = max(logits)
+                probabilities = [exp(logit - peak) for logit in logits]
+                best_index = max(range(len(scored)), key=lambda index: (logits[index], -index))
+                confidence = probabilities[best_index] / sum(probabilities)
+                _score, role, candidate = scored[best_index]
+                if role == TACTICAL_RUN or confidence < TACTICAL_CONFIDENCE:
+                    continue
+                candidate_proposal = (confidence, -scout_index, scout, role, candidate)
+                if proposal is None or candidate_proposal[:2] > proposal[:2]:
+                    proposal = candidate_proposal
+
+        selected = {}
+        if proposal is not None:
+            _confidence, _order, scout, role, candidate = proposal
+            target_key = candidate[0] if candidate is not None else None
+            selected[int(scout.id)] = (role, target_key)
+            self._tactical_overrides[int(scout.id)] = (
+                role,
+                target_key,
+                state.time + TACTICAL_COMMITMENT,
+            )
+
+        updated = {}
+        for scout in scouts:
+            role, target_key = selected.get(int(scout.id), (TACTICAL_RUN, None))
+            old_role, old_target, old_since = self._tactical_assignments.get(
+                int(scout.id), (TACTICAL_RUN, None, state.time)
+            )
+            since = old_since if (old_role, old_target) == (role, target_key) else state.time
+            updated[int(scout.id)] = (role, target_key, since)
+
+        live_keys = {candidate[0] for candidates in shared.values() for candidate in candidates}
+        active = {}
+        for scout_id, (role, target_key, until) in self._tactical_overrides.items():
+            if scout_id not in updated or state.time + TINY >= until:
+                continue
+            if target_key is not None and target_key not in live_keys:
+                continue
+            old_role, old_target, old_since = updated[scout_id]
+            since = old_since if (old_role, old_target) == (role, target_key) else state.time
+            updated[scout_id] = (role, target_key, since)
+            active[scout_id] = (role, target_key, until)
+        self._tactical_assignments = updated
+        self._tactical_overrides = active
+
+    def _resolve_tactical_duties(self, state, own, foes):
+        own_by_id = {int(drone.id): drone for drone in own}
+        foes_by_id = {int(drone.id): drone for drone in foes}
         duties = {}
-        scouts = []
         for drone in own:
             if drone.drone_type is DroneType.TANK:
                 duties[drone.id] = (GUN if drone.shots_remaining else RUN, None)
             elif drone.drone_type is DroneType.TRANSPORT:
                 duties[drone.id] = (RUN, None)
             else:
-                scouts.append(drone)
-        if not scouts:
-            return duties
-
-        wards = [drone for drone in own if drone.drone_type is DroneType.TRANSPORT]
-        wards.sort(key=lambda drone: self._cost_to_go(self.attack, drone.position))
-
-        want_keep = min(keepers, len(scouts))
-        if not self._goal_threatened(foes):
-            want_keep = 0
-
-        free = list(scouts)
-        # Opus leaves most enemy TRANSPORTs uncontested.  Spend a small,
-        # deterministic scout screen on the nearest high-value runners before
-        # assigning the remaining scouts to the normal defensive duties.
-        transports = [foe for foe in foes if foe.drone_type is DroneType.TRANSPORT]
-        transports.sort(key=lambda foe: (self._cost_to_go(self.defend, foe.position), foe.id))
-        for transport in transports[:transport_hunters]:
-            if not free:
-                break
-            best = min(free, key=lambda scout: (_dist(scout.position, transport.position), scout.id))
-            free.remove(best)
-            duties[best.id] = (HUNT, transport)
-
-        for gun in self._gun_targets(foes)[:gun_hunters]:
-            if not free:
-                break
-            best = min(free, key=lambda scout: _dist(scout.position, gun.position))
-            free.remove(best)
-            duties[best.id] = (HUNT, gun)
-
-        if want_keep and free:
-            free.sort(key=lambda scout: self._cost_to_go(self.defend, scout.position))
-            for scout in free[:want_keep]:
-                duties[scout.id] = (KEEP, None)
-            del free[:want_keep]
-
-        for foe, _when in self._pursuers(wards, foes, free)[:guard_cap]:
-            if not free:
-                break
-            best = min(free, key=lambda scout: _dist(scout.position, foe.position))
-            free.remove(best)
-            duties[best.id] = (HUNT, foe)
-
-        for ward, gun in self._gun_lines(wards, foes)[:block_cap]:
-            if not free:
-                break
-            best = min(free, key=lambda scout: _dist(scout.position, ward.position))
-            free.remove(best)
-            duties[best.id] = (BLOCK, (ward, gun))
-
-        for scout in free:
-            duties[scout.id] = (RUN, None)
+                role, target_key, _since = self._tactical_assignments.get(
+                    int(drone.id), (TACTICAL_RUN, None, state.time)
+                )
+                if role == TACTICAL_KEEP:
+                    duties[drone.id] = (KEEP, None)
+                elif role == TACTICAL_BLOCK and target_key and target_key[0] == "BLOCK_LINE":
+                    ward = own_by_id.get(int(target_key[1]))
+                    tank = foes_by_id.get(int(target_key[2]))
+                    duties[drone.id] = (BLOCK, (ward, tank)) if ward is not None and tank is not None else (RUN, None)
+                elif target_key and target_key[0] == "DRONE":
+                    target = foes_by_id.get(int(target_key[1]))
+                    duties[drone.id] = (HUNT, target) if target is not None else (RUN, None)
+                else:
+                    duties[drone.id] = (RUN, None)
         return duties
+
+    def _plan(self, state, own, foes):
+        """Run the tiny learned value policy; execute duties deterministically."""
+        if state.time + TINY >= self._next_tactical_time:
+            self._update_tactical_assignments(state, own, foes)
+            self._next_tactical_time = state.time + TACTICAL_INTERVAL
+        return self._resolve_tactical_duties(state, own, foes)
 
     def _gun_targets(self, foes):
         """Loaded enemy TANKs, nearest to our own goal first.
