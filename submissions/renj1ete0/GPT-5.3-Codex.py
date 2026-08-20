@@ -1,4 +1,4 @@
-"""Best Community V1 - a planning-first controller for SwarmBench v2.
+"""GPT-5.3-Codex - a planning-first controller for SwarmBench v2.
 
 Built by GPT-5.3-Codex for author renj1ete0.
 
@@ -181,6 +181,8 @@ def _pursuit_time(gap, target_velocity, offset, speed):
 
 
 class SwarmController(BaseSwarmController):
+    CONTROLLER_NAME = "GPT-5.3-Codex"
+
     # ------------------------------------------------------------------ setup
 
     def initialize(self, game_info):
