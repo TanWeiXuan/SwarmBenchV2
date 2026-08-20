@@ -168,9 +168,11 @@ PLAN_ACTIONS = (
     (1, 1, 2, 2, 1),
 )
 
-# Approximate-policy-iteration checkpoint (training seed 73021).  Full-match
-# rollout outcomes for six safe allocation profiles supplied the improvement
-# targets; these fixed literals are the only learned state in the submission.
+# Experiment 2 PPO actor (training seed 82002, replayed validation update 10).
+# Sequential two-second decisions used terminal match reward, GAE, and clipped
+# PPO.  The critic/optimizer are deliberately absent; these fixed actor literals
+# are the only learned state in the submission.  See the module record and
+# docs/OPUS_RL_PLAN_EXPERIMENTS.md for Experiment 1's separate supervised study.
 # BEGIN EXPORTED PPO ACTOR
 POLICY_SOURCE = 'validation-0010.pt'
 POLICY_PARAMETER_COUNT = 5550
