@@ -13,15 +13,19 @@ from experiments.opus_rl_plan_dynamic import (
     HUNT_TRANSPORT,
     PAIR_FEATURES,
     ROLE_COUNT,
+    ROLE_NAMES,
     TACTICAL_RUN,
     AdaptiveOpponentLeague,
     CandidateObservation,
     DynamicActorCritic,
     ScoutObservation,
     TacticalObservation,
+    SUBJECT_PATH,
+    _mode4_teacher_controller,
     _target_signature,
     run_instrumented_match,
 )
+from experiments.opus_rl_plan_ppo import _load_controller
 
 
 def test_target_signature_uses_type_and_id_without_semantic_id_features() -> None:
@@ -30,6 +34,16 @@ def test_target_signature_uses_type_and_id_without_semantic_id_features() -> Non
     ward = SimpleNamespace(id=3, drone_type=DroneType.TRANSPORT)
     gun = SimpleNamespace(id=9, drone_type=DroneType.TANK)
     assert _target_signature((ward, gun)) == ("BLOCK_LINE", 3, 9)
+
+
+def test_mode4_hunt_is_labeled_by_guard_origin_not_target_type() -> None:
+    base = _load_controller(SUBJECT_PATH, "teacher_role_test")
+    teacher = _mode4_teacher_controller(base)
+    hunt = base._plan.__globals__["HUNT"]
+    tank = SimpleNamespace(id=9, drone_type=DroneType.TANK)
+    role, key = teacher.teacher_action(hunt, tank)
+    assert ROLE_NAMES[role] == "GUARD_TRANSPORT"
+    assert key == ("DRONE", 9)
 
 
 def test_fixed_mode_4_effective_instrumentation_is_self_consistent() -> None:

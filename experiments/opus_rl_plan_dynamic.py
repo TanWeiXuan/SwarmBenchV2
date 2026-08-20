@@ -818,6 +818,23 @@ def _mode4_teacher_controller(base_type):
         globals_[name] for name in ("RUN", "HUNT", "KEEP", "GUN", "BLOCK")
     )
 
+    def teacher_action(base_role, mark):
+        if base_role == base_run:
+            return TACTICAL_RUN, None
+        if base_role == base_keep:
+            return TACTICAL_KEEP, None
+        if base_role == base_block and mark is not None:
+            return TACTICAL_BLOCK, (
+                "BLOCK_LINE",
+                int(mark[0].id),
+                int(mark[1].id),
+            )
+        if base_role == base_hunt and mark is not None:
+            # Fixed mode 4 has zero proactive transport/tank hunters; every
+            # HUNT it emits originates from the pursuer guard pass.
+            return GUARD_TRANSPORT, ("DRONE", int(mark.id))
+        return TACTICAL_RUN, None
+
     class TeacherController(base_type):
         def initialize(self, info):
             super().initialize(info)
@@ -838,23 +855,7 @@ def _mode4_teacher_controller(base_type):
             actions = []
             for scout, candidates_by_role in zip(scouts, live_candidates):
                 base_role, mark = duties[scout.id]
-                if base_role == base_run:
-                    role, key = TACTICAL_RUN, None
-                elif base_role == base_keep:
-                    role, key = TACTICAL_KEEP, None
-                elif base_role == base_block and mark is not None:
-                    role = TACTICAL_BLOCK
-                    key = ("BLOCK_LINE", int(mark[0].id), int(mark[1].id))
-                elif base_role == base_hunt and mark is not None:
-                    if mark.drone_type is DroneType.TRANSPORT:
-                        role = HUNT_TRANSPORT
-                    elif mark.drone_type is DroneType.TANK:
-                        role = HUNT_TANK
-                    else:
-                        role = GUARD_TRANSPORT
-                    key = ("DRONE", int(mark.id))
-                else:
-                    role, key = TACTICAL_RUN, None
+                role, key = teacher_action(base_role, mark)
                 target_index = -1
                 if key is not None:
                     target_index = next(
@@ -880,6 +881,7 @@ def _mode4_teacher_controller(base_type):
             self._next_teacher_time = state.time + TACTICAL_INTERVAL
             return duties
 
+    TeacherController.teacher_action = staticmethod(teacher_action)
     return TeacherController
 
 
