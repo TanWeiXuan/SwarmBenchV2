@@ -394,3 +394,53 @@ end-to-end control remain unjustified. A future continuation should require a
 substantially larger counterfactual dataset and train a calibrated action-value
 model with an uncertainty/fallback gate, rather than directly shifting the
 deployed role logits from a few dozen labels.
+
+### Experiment 3c: calibrated guard-value fallback gate
+
+The proposed fallback was implemented as an independent 91-feature pairwise
+model. Its inputs are the 38 global features, the candidate scout's 14 entity
+features, the 32 GUARD pair features, its six-way previous-role one-hot, and
+role duration. The model is a 91-48-48-1 tanh MLP (6,817 parameters). It cannot
+change the source actor or movement controller: it may only replace RUN with a
+specific GUARD assignment above a high probability threshold, or replace an
+existing GUARD with RUN below a low threshold. Existing target reservations
+and deterministic conflict resolution remain authoritative.
+
+The two counterfactual datasets produced 121 decisive GUARD-vs-RUN pairs. A
+seed-modulus split retained 103 for training and 18 for validation. Weighted
+binary training selected epoch 17 and calibrated low/high thresholds of
+0.10/0.55. Offline, the source choices were correct on 60.2% of training pairs
+and the gate on 70.9% while changing 17 choices. On the small holdout the
+corresponding figures were 33.3% and 44.4%, but this was only two changed
+choices; the raw value classifier had 61.1% accuracy and 57.8% balanced
+accuracy. This was enough to justify a simulator test, not acceptance.
+
+The calibrated checkpoint and untouched source were then evaluated on exactly
+the same 20 new seeds, both sides, against Opus, Opus Breaker, and fixed mode 4:
+
+| Policy (120 paired games) | W-D-L | Points | Mean diff | GUARD | Duty changes/match |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Untouched source | 47-23-50 | **58.5** | -1.117 | 3.03% | 4.48 |
+| Value gate, 0.10/0.55 | 46-11-63 | 51.5 | -1.142 | 10.24% | 15.88 |
+
+The gate gained three points against Breaker (18.0 versus 15.0), was nearly
+flat against Opus (19.5 versus 20.0), and lost 9.5 points against fixed mode 4
+(14.0 versus 23.5). Its main failure was not score-margin collapse but temporal
+churn: many fixed-mode draws became losses as transient pair scores repeatedly
+activated and removed guards. Mean inference remained safe at 2.51 ms, only
+about 0.07 ms slower than the source.
+
+Threshold ablations found no useful confidence band. Raising the high threshold
+to 0.80 made all 120 matches bit-for-behavior identical to the source. A 0.65
+threshold was likewise identical on the 60-game calibration half. Thus 0.55
+changes too many out-of-distribution live states, while 0.65 and above change
+none. The checkpoint is rejected and is not a deployment/export candidate.
+
+This experiment sharpens the next-data requirement: pair labels at isolated
+states are insufficient for a memoryless override, even when their terminal
+rollouts are real. Any continuation should first collect substantially more
+opponent- and time-stratified counterfactuals and measure probability
+calibration by stratum. A temporal commitment-aware label or explicit source
+fallback target is more promising than another actor fine-tune. Increasing
+network size, loosening thresholds, or learning additional roles is not
+supported by these results.
