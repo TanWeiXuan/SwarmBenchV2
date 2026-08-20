@@ -76,6 +76,7 @@ PAIR_FEATURES = 32
 ENTITY_EMBEDDING = 16
 CONTEXT_EMBEDDING = 48
 MODEL_ARCHITECTURE = "deep-sets-factorized-v2-38x48x48"
+GUARD_VALUE_FEATURES = GLOBAL_FEATURES + ENTITY_FEATURES + PAIR_FEATURES + ROLE_COUNT + 1
 
 
 @dataclass(frozen=True)
@@ -624,6 +625,111 @@ class DynamicActorCritic(nn.Module):
         return torch.stack(losses).mean()
 
 
+class GuardValueModel(nn.Module):
+    """Independent pairwise action-value gate; source actor remains frozen."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.network = nn.Sequential(
+            nn.Linear(GUARD_VALUE_FEATURES, 48),
+            nn.Tanh(),
+            nn.Linear(48, 48),
+            nn.Tanh(),
+            nn.Linear(48, 1),
+        )
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.orthogonal_(
+                    module.weight,
+                    0.01 if module is self.network[-1] else math.sqrt(2.0),
+                )
+                nn.init.zeros_(module.bias)
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        return self.network(features).squeeze(-1)
+
+
+def guard_value_features(
+    observation: TacticalObservation, scout_index: int, target_index: int
+) -> tuple[float, ...]:
+    scout = observation.scouts[scout_index]
+    previous = tuple(
+        float(index == scout.previous_role) for index in range(ROLE_COUNT)
+    )
+    candidate = scout.candidates[GUARD_TRANSPORT][target_index]
+    return (
+        observation.global_features
+        + scout.entity
+        + candidate.features
+        + previous
+        + (scout.role_duration,)
+    )
+
+
+def apply_guard_value_gate(
+    observation: TacticalObservation,
+    source_actions: tuple[ScoutAction, ...],
+    model: GuardValueModel,
+    low_threshold: float,
+    high_threshold: float,
+) -> tuple[ScoutAction, ...]:
+    """Override only confident RUN/GUARD pairs; otherwise preserve source."""
+    reserved = {
+        observation.scouts[index]
+        .candidates[action.role][action.target_index]
+        .key
+        for index, action in enumerate(source_actions)
+        if action.target_index >= 0
+    }
+    used = set()
+    gated = []
+    with torch.no_grad():
+        for scout_index, (scout, source_action) in enumerate(
+            zip(observation.scouts, source_actions)
+        ):
+            candidates = scout.candidates[GUARD_TRANSPORT]
+            probabilities = (
+                model(
+                    torch.tensor(
+                        [
+                            guard_value_features(
+                                observation, scout_index, target_index
+                            )
+                            for target_index in range(len(candidates))
+                        ],
+                        dtype=torch.float32,
+                    )
+                ).sigmoid()
+                if candidates
+                else torch.empty(0)
+            )
+            action = source_action
+            if source_action.role == GUARD_TRANSPORT:
+                probability = probabilities[source_action.target_index]
+                if float(probability) <= low_threshold:
+                    action = ScoutAction(TACTICAL_RUN)
+            elif source_action.role == TACTICAL_RUN and candidates:
+                available = [
+                    index
+                    for index, candidate in enumerate(candidates)
+                    if candidate.key not in used
+                    and candidate.key not in reserved
+                ]
+                if available:
+                    best = max(available, key=lambda index: float(probabilities[index]))
+                    if float(probabilities[best]) >= high_threshold:
+                        action = ScoutAction(GUARD_TRANSPORT, best)
+            if action.target_index >= 0:
+                key = scout.candidates[action.role][action.target_index].key
+                if key in used:
+                    action = ScoutAction(TACTICAL_RUN)
+                else:
+                    used.add(key)
+                    reserved.discard(key)
+            gated.append(action)
+    return tuple(gated)
+
+
 def _clamp(value: float, low: float, high: float) -> float:
     return low if value < low else high if value > high else value
 
@@ -906,6 +1012,9 @@ def _dynamic_controller(
     stochastic: bool,
     decision_interval: float = TACTICAL_INTERVAL,
     ablation: str = "full",
+    guard_value_model: GuardValueModel | None = None,
+    guard_low_threshold: float = 0.0,
+    guard_high_threshold: float = 1.0,
 ):
     """Inject learned scout duties while retaining every deterministic skill."""
     if ablation not in {"full", "freeze_start", "old_targets", "static_run"}:
@@ -961,6 +1070,21 @@ def _dynamic_controller(
                                 if ablation == "old_targets"
                                 else "learned"
                             ),
+                        )
+                    if guard_value_model is not None:
+                        gated_actions = apply_guard_value_gate(
+                            observation,
+                            decision.actions,
+                            guard_value_model,
+                            guard_low_threshold,
+                            guard_high_threshold,
+                        )
+                        decision = PolicyDecision(
+                            gated_actions,
+                            decision.log_probability,
+                            decision.value,
+                            decision.entropy,
+                            decision.factor_count,
                         )
                 self.dynamic_inference_seconds += time.perf_counter() - started
                 updated = update_assignments(
@@ -1190,6 +1314,9 @@ class DynamicRolloutJob:
     ablation: str = "full"
     diagnostics: bool = False
     policy_temperature: float = 1.0
+    guard_value_state: dict[str, torch.Tensor] | None = None
+    guard_low_threshold: float = 0.0
+    guard_high_threshold: float = 1.0
 
 
 @dataclass
@@ -1504,6 +1631,11 @@ def run_dynamic_rollout_job(job: DynamicRolloutJob) -> DynamicEpisodeResult:
     model.load_state_dict(job.policy_state)
     model.policy_temperature = job.policy_temperature
     model.eval()
+    guard_value_model = None
+    if job.guard_value_state is not None:
+        guard_value_model = GuardValueModel()
+        guard_value_model.load_state_dict(job.guard_value_state)
+        guard_value_model.eval()
     generator = torch.Generator().manual_seed(
         (job.seed * 6364136223846793005 + job.policy_version * 1447 + ord(job.side))
         % (2**63)
@@ -1521,6 +1653,9 @@ def run_dynamic_rollout_job(job: DynamicRolloutJob) -> DynamicEpisodeResult:
         stochastic=job.stochastic,
         decision_interval=job.decision_interval,
         ablation=job.ablation,
+        guard_value_model=guard_value_model,
+        guard_low_threshold=job.guard_low_threshold,
+        guard_high_threshold=job.guard_high_threshold,
     )
     if job.opponent == "fixed_mode_4":
         opponent_type = _instrumented_controller(base_type, force_mode_4=True)
@@ -1807,6 +1942,264 @@ def decisive_counterfactual_examples(
             }
         )
     return examples
+
+
+def guard_value_examples(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Convert terminal branches into per-pair GUARD-better-than-RUN labels."""
+    examples = []
+    for result in payload["results"]:
+        if result["observation"] is None:
+            continue
+        observation = unpack_tactical_observation(result["observation"])
+        run_by_scout = {
+            int(alternative["scout_index"]): alternative
+            for alternative in result["alternatives"]
+            if int(alternative["role"]) == TACTICAL_RUN
+        }
+        for alternative in result["alternatives"]:
+            if int(alternative["role"]) != GUARD_TRANSPORT:
+                continue
+            scout_index = int(alternative["scout_index"])
+            run = run_by_scout.get(scout_index)
+            if run is None:
+                continue
+            guard_objective = (
+                int(alternative["outcome"]),
+                int(alternative["score_difference"]),
+            )
+            run_objective = (int(run["outcome"]), int(run["score_difference"]))
+            if guard_objective == run_objective:
+                continue
+            target_index = int(alternative["target_index"])
+            examples.append(
+                {
+                    "seed": int(result["seed"]),
+                    "side": result["side"],
+                    "opponent": result["opponent"],
+                    "observation": observation,
+                    "scout_index": scout_index,
+                    "target_index": target_index,
+                    "features": guard_value_features(
+                        observation, scout_index, target_index
+                    ),
+                    "label": float(guard_objective > run_objective),
+                    "score_advantage": guard_objective[1] - run_objective[1],
+                }
+            )
+    return examples
+
+
+def _guard_value_metrics(
+    model: GuardValueModel,
+    examples: list[dict[str, Any]],
+    source: DynamicActorCritic,
+    low_threshold: float = 0.5,
+    high_threshold: float = 0.5,
+) -> dict[str, float]:
+    if not examples:
+        return {
+            "examples": 0,
+            "accuracy": 0.0,
+            "balanced_accuracy": 0.0,
+            "loss": 0.0,
+            "source_accuracy": 0.0,
+            "gate_accuracy": 0.0,
+            "gate_changes": 0,
+        }
+    values = torch.tensor(
+        [example["features"] for example in examples], dtype=torch.float32
+    )
+    labels = torch.tensor(
+        [example["label"] for example in examples], dtype=torch.float32
+    )
+    with torch.no_grad():
+        logits = model(values)
+        probabilities = logits.sigmoid()
+        predictions = probabilities >= 0.5
+        source_choices = []
+        for example in examples:
+            if "source_choice" in example:
+                source_choices.append(bool(example["source_choice"]))
+            else:
+                decision = source.decide(
+                    example["observation"], stochastic=False
+                ).actions[example["scout_index"]]
+                source_choices.append(
+                    decision.role == GUARD_TRANSPORT
+                    and decision.target_index == example["target_index"]
+                )
+        source_tensor = torch.tensor(source_choices, dtype=torch.bool)
+        gated = source_tensor.clone()
+        gated[probabilities <= low_threshold] = False
+        gated[probabilities >= high_threshold] = True
+    positive = labels == 1.0
+    negative = ~positive
+    true_positive = (predictions & positive).sum().item() / max(1, positive.sum().item())
+    true_negative = ((~predictions) & negative).sum().item() / max(
+        1, negative.sum().item()
+    )
+    return {
+        "examples": len(examples),
+        "positive_fraction": float(labels.mean()),
+        "accuracy": float((predictions == positive).float().mean()),
+        "balanced_accuracy": 0.5 * (true_positive + true_negative),
+        "loss": float(nn.functional.binary_cross_entropy_with_logits(logits, labels)),
+        "source_accuracy": float((source_tensor == positive).float().mean()),
+        "gate_accuracy": float((gated == positive).float().mean()),
+        "gate_changes": int((gated != source_tensor).sum()),
+    }
+
+
+def _calibrate_guard_value_gate(
+    model: GuardValueModel,
+    examples: list[dict[str, Any]],
+    source: DynamicActorCritic,
+) -> tuple[float, float, dict[str, float]]:
+    best = None
+    for low in (0.1, 0.2, 0.3, 0.4, 0.45):
+        for high in (0.55, 0.6, 0.7, 0.8, 0.9):
+            metrics = _guard_value_metrics(
+                model, examples, source, low, high
+            )
+            key = (
+                metrics["gate_accuracy"],
+                -metrics["gate_changes"],
+                high - low,
+            )
+            if best is None or key > best[0]:
+                best = (key, low, high, metrics)
+    assert best is not None
+    return best[1], best[2], best[3]
+
+
+def train_guard_value_model(args) -> None:
+    if args.holdout_modulus <= 1:
+        raise ValueError("--holdout-modulus must be greater than one")
+    torch.set_num_threads(1)
+    torch.manual_seed(args.seed)
+    examples = []
+    dataset_paths = [Path(path) for path in args.dataset]
+    for path in dataset_paths:
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+        examples.extend(guard_value_examples(payload))
+    training = [
+        example
+        for example in examples
+        if example["seed"] % args.holdout_modulus != args.holdout_remainder
+    ]
+    validation = [
+        example
+        for example in examples
+        if example["seed"] % args.holdout_modulus == args.holdout_remainder
+    ]
+    if not training or not validation:
+        raise ValueError("guard-value split must contain training and validation examples")
+    initialization = torch.load(
+        Path(args.initialize), map_location="cpu", weights_only=False
+    )
+    source = DynamicActorCritic()
+    source.load_state_dict(initialization["model_state"])
+    source.eval()
+    for example in examples:
+        decision = source.decide(
+            example["observation"], stochastic=False
+        ).actions[example["scout_index"]]
+        example["source_choice"] = (
+            decision.role == GUARD_TRANSPORT
+            and decision.target_index == example["target_index"]
+        )
+    model = GuardValueModel()
+    positives = sum(example["label"] for example in training)
+    negatives = len(training) - positives
+    positive_weight = torch.tensor([negatives / max(1.0, positives)])
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
+    generator = random.Random(args.seed)
+    best_state = {name: value.detach().clone() for name, value in model.state_dict().items()}
+    best_epoch = 0
+    best_low, best_high, best_metrics = _calibrate_guard_value_gate(
+        model, validation, source
+    )
+    losses = []
+    for epoch in range(args.epochs):
+        generator.shuffle(training)
+        for start in range(0, len(training), args.minibatch):
+            batch = training[start : start + args.minibatch]
+            features = torch.tensor(
+                [example["features"] for example in batch], dtype=torch.float32
+            )
+            labels = torch.tensor(
+                [example["label"] for example in batch], dtype=torch.float32
+            )
+            loss = nn.functional.binary_cross_entropy_with_logits(
+                model(features), labels, pos_weight=positive_weight
+            )
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+            optimizer.step()
+            losses.append(float(loss.detach()))
+        low, high, metrics = _calibrate_guard_value_gate(
+            model, validation, source
+        )
+        key = (
+            metrics["gate_accuracy"],
+            -metrics["gate_changes"],
+            metrics["balanced_accuracy"],
+            -metrics["loss"],
+        )
+        best_key = (
+            best_metrics["gate_accuracy"],
+            -best_metrics["gate_changes"],
+            best_metrics["balanced_accuracy"],
+            -best_metrics["loss"],
+        )
+        if key > best_key:
+            best_epoch = epoch + 1
+            best_low, best_high = low, high
+            best_metrics = metrics
+            best_state = {
+                name: value.detach().clone()
+                for name, value in model.state_dict().items()
+            }
+    model.load_state_dict(best_state)
+    low, high, gate_metrics = best_low, best_high, best_metrics
+    selected = {
+        "training": _guard_value_metrics(model, training, source, low, high),
+        "validation": gate_metrics,
+    }
+    run_dir = EXPERIMENT_DIR / args.run_name
+    checkpoint = {
+        "schema": "opus-rl-plan-guard-value-v1",
+        "model_architecture": MODEL_ARCHITECTURE,
+        "model_parameters": sum(parameter.numel() for parameter in source.parameters())
+        + sum(parameter.numel() for parameter in model.parameters()),
+        "model_state": source.state_dict(),
+        "guard_value_state": model.state_dict(),
+        "guard_low_threshold": low,
+        "guard_high_threshold": high,
+        "iteration": int(initialization.get("iteration", 0)),
+        "source_checkpoint": str(Path(args.initialize)),
+        "datasets": [str(path) for path in dataset_paths],
+        "seed": args.seed,
+    }
+    _atomic_dynamic_checkpoint(checkpoint, run_dir / "best.pt")
+    report = {
+        "schema": checkpoint["schema"],
+        "examples": len(examples),
+        "training_examples": len(training),
+        "validation_examples": len(validation),
+        "positive_weight": float(positive_weight),
+        "best_epoch": best_epoch,
+        "thresholds": [low, high],
+        "selected": selected,
+        "final_loss": losses[-1],
+        "checkpoint": str(run_dir / "best.pt"),
+    }
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "report.json").write_text(
+        json.dumps(report, indent=2, sort_keys=True), encoding="utf-8"
+    )
+    print(json.dumps(report, sort_keys=True))
 
 
 def counterfactual_ranking_metrics(
@@ -2456,6 +2849,9 @@ def _dynamic_validation_jobs(
     opponents: tuple[str, ...] = DYNAMIC_VALIDATION_OPPONENTS,
     ablation: str = "full",
     diagnostics: bool = True,
+    guard_value_state: dict[str, torch.Tensor] | None = None,
+    guard_low_threshold: float = 0.0,
+    guard_high_threshold: float = 1.0,
 ) -> list[DynamicRolloutJob]:
     policy_state = _frozen_dynamic_state(model)
     return [
@@ -2469,6 +2865,9 @@ def _dynamic_validation_jobs(
             duration=duration,
             ablation=ablation,
             diagnostics=diagnostics,
+            guard_value_state=guard_value_state,
+            guard_low_threshold=guard_low_threshold,
+            guard_high_threshold=guard_high_threshold,
         )
         for opponent in opponents
         for seed in seeds
@@ -2713,6 +3112,16 @@ def evaluate_dynamic_checkpoint(args) -> None:
     checkpoint = torch.load(Path(args.checkpoint), map_location="cpu", weights_only=False)
     model = DynamicActorCritic()
     model.load_state_dict(checkpoint["model_state"])
+    guard_low_threshold = (
+        float(args.guard_low_threshold)
+        if args.guard_low_threshold is not None
+        else float(checkpoint.get("guard_low_threshold", 0.0))
+    )
+    guard_high_threshold = (
+        float(args.guard_high_threshold)
+        if args.guard_high_threshold is not None
+        else float(checkpoint.get("guard_high_threshold", 1.0))
+    )
     jobs = _dynamic_validation_jobs(
         model,
         int(checkpoint["iteration"]),
@@ -2721,11 +3130,17 @@ def evaluate_dynamic_checkpoint(args) -> None:
         opponents=tuple(args.opponents),
         ablation=args.ablation,
         diagnostics=True,
+        guard_value_state=checkpoint.get("guard_value_state"),
+        guard_low_threshold=guard_low_threshold,
+        guard_high_threshold=guard_high_threshold,
     )
     episodes, elapsed = collect_dynamic_jobs(jobs, args.workers)
     summary = summarize_dynamic_episodes(episodes, elapsed)
     summary["checkpoint"] = args.checkpoint
     summary["ablation"] = args.ablation
+    if checkpoint.get("guard_value_state") is not None:
+        summary["guard_low_threshold"] = guard_low_threshold
+        summary["guard_high_threshold"] = guard_high_threshold
     summary["failures"] = [
         {
             "seed": episode.seed,
@@ -3256,6 +3671,16 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("full", "freeze_start", "old_targets", "static_run"),
         default="full",
     )
+    evaluate.add_argument(
+        "--guard-low-threshold",
+        type=float,
+        help="override a guard-value checkpoint's RUN fallback threshold",
+    )
+    evaluate.add_argument(
+        "--guard-high-threshold",
+        type=float,
+        help="override a guard-value checkpoint's GUARD activation threshold",
+    )
     evaluate.add_argument("--output")
     evaluate.set_defaults(function=evaluate_dynamic_checkpoint)
 
@@ -3302,6 +3727,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="correct conditional-dataset GUARD/RUN sampling imbalance",
     )
     counterfactual_train.set_defaults(function=train_guard_counterfactual_policy)
+
+    value_train = subparsers.add_parser("counterfactual-value-train")
+    value_train.add_argument("--dataset", nargs="+", required=True)
+    value_train.add_argument("--initialize", required=True)
+    value_train.add_argument("--run-name", required=True)
+    value_train.add_argument("--seed", type=int, default=97_001)
+    value_train.add_argument("--epochs", type=int, default=200)
+    value_train.add_argument("--minibatch", type=int, default=32)
+    value_train.add_argument("--learning-rate", type=float, default=1.0e-3)
+    value_train.add_argument("--holdout-modulus", type=int, default=5)
+    value_train.add_argument("--holdout-remainder", type=int, default=0)
+    value_train.set_defaults(function=train_guard_value_model)
     return parser
 
 

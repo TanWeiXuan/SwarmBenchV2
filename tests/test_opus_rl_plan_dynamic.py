@@ -11,6 +11,7 @@ from swarmbench import DroneType
 from experiments.opus_rl_plan_dynamic import (
     ENTITY_FEATURES,
     GLOBAL_FEATURES,
+    GUARD_VALUE_FEATURES,
     GUARD_TRANSPORT,
     HARD_OPPONENTS,
     HUNT_TRANSPORT,
@@ -22,14 +23,19 @@ from experiments.opus_rl_plan_dynamic import (
     AdaptiveOpponentLeague,
     CandidateObservation,
     DynamicActorCritic,
+    DynamicRolloutJob,
+    GuardValueModel,
     ScoutObservation,
     TacticalObservation,
     SUBJECT_PATH,
     _mode4_teacher_controller,
     _target_signature,
     apply_assignment_overrides,
+    apply_guard_value_gate,
     decisive_counterfactual_examples,
+    guard_value_examples,
     dynamic_rewards,
+    run_dynamic_rollout_job,
     run_instrumented_match,
 )
 from experiments.opus_rl_plan_ppo import _load_controller
@@ -158,13 +164,17 @@ def test_plain_counterfactual_artifact_round_trips_decisive_action() -> None:
                 "alternatives": [
                     {
                         "actions": tuple(asdict(action) for action in run),
+                        "scout_index": 0,
                         "role": TACTICAL_RUN,
+                        "target_index": -1,
                         "outcome": -1,
                         "score_difference": -2,
                     },
                     {
                         "actions": tuple(asdict(action) for action in guard),
+                        "scout_index": 0,
                         "role": GUARD_TRANSPORT,
+                        "target_index": 0,
                         "outcome": 1,
                         "score_difference": 2,
                     },
@@ -177,6 +187,48 @@ def test_plain_counterfactual_artifact_round_trips_decisive_action() -> None:
     assert examples[0]["preferred_role"] == GUARD_TRANSPORT
     assert examples[0]["alternatives"][examples[0]["target_index"]] == guard
     assert examples[0]["observation"] == observation
+    value_examples = guard_value_examples(payload)
+    assert len(value_examples) == 1
+    assert value_examples[0]["label"] == 1.0
+    assert len(value_examples[0]["features"]) == GUARD_VALUE_FEATURES
+    assert GuardValueModel()(torch.tensor(value_examples[0]["features"])).shape == ()
+
+
+def test_guard_value_gate_changes_only_confident_run_guard_action() -> None:
+    observation = _observation(scouts=1, candidate=True)
+    gate = GuardValueModel()
+    with torch.no_grad():
+        for parameter in gate.parameters():
+            parameter.zero_()
+        gate.network[-1].bias.fill_(10.0)
+    assert apply_guard_value_gate(
+        observation, (ScoutAction(TACTICAL_RUN),), gate, 0.2, 0.8
+    ) == (ScoutAction(GUARD_TRANSPORT, 0),)
+    with torch.no_grad():
+        gate.network[-1].bias.fill_(-10.0)
+    assert apply_guard_value_gate(
+        observation, (ScoutAction(GUARD_TRANSPORT, 0),), gate, 0.2, 0.8
+    ) == (ScoutAction(TACTICAL_RUN),)
+
+
+def test_rollout_worker_loads_optional_guard_value_state() -> None:
+    actor = DynamicActorCritic()
+    gate = GuardValueModel()
+    result = run_dynamic_rollout_job(
+        DynamicRolloutJob(
+            seed=3_100_007,
+            side="A",
+            opponent="fixed_mode_4",
+            policy_version=0,
+            policy_state=actor.state_dict(),
+            stochastic=False,
+            duration=0.2,
+            guard_value_state=gate.state_dict(),
+            guard_low_threshold=0.2,
+            guard_high_threshold=0.8,
+        )
+    )
+    assert result.seed == 3_100_007
 
 
 def test_autoregressive_mask_prevents_duplicate_target_assignment() -> None:
