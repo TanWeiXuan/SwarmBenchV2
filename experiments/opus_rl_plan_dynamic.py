@@ -563,6 +563,137 @@ def _dynamic_controller(
     return DynamicController
 
 
+def _mode4_teacher_controller(base_type):
+    """Collect safe mode-4 duties as a brief initialization target."""
+    globals_ = base_type._plan.__globals__
+    base_run, base_hunt, base_keep, _base_gun, base_block = (
+        globals_[name] for name in ("RUN", "HUNT", "KEEP", "GUN", "BLOCK")
+    )
+
+    class TeacherController(base_type):
+        def initialize(self, info):
+            super().initialize(info)
+            self.teacher_assignments = {}
+            self.teacher_records = []
+            self._next_teacher_time = 0.0
+
+        def _allocation(self, state, own, foes):
+            return FIXED_MODE_4
+
+        def _plan(self, state, own, foes):
+            duties = super()._plan(state, own, foes)
+            if state.time + 1.0e-9 < self._next_teacher_time:
+                return duties
+            observation, scouts, live_candidates = tactical_observation(
+                self, state, own, foes, self.teacher_assignments
+            )
+            actions = []
+            for scout, candidates_by_role in zip(scouts, live_candidates):
+                base_role, mark = duties[scout.id]
+                if base_role == base_run:
+                    role, key = TACTICAL_RUN, None
+                elif base_role == base_keep:
+                    role, key = TACTICAL_KEEP, None
+                elif base_role == base_block and mark is not None:
+                    role = TACTICAL_BLOCK
+                    key = ("BLOCK_LINE", int(mark[0].id), int(mark[1].id))
+                elif base_role == base_hunt and mark is not None:
+                    if mark.drone_type is DroneType.TRANSPORT:
+                        role = HUNT_TRANSPORT
+                    elif mark.drone_type is DroneType.TANK:
+                        role = HUNT_TANK
+                    else:
+                        role = GUARD_TRANSPORT
+                    key = ("DRONE", int(mark.id))
+                else:
+                    role, key = TACTICAL_RUN, None
+                target_index = -1
+                if key is not None:
+                    target_index = next(
+                        (
+                            index
+                            for index, candidate in enumerate(candidates_by_role[role])
+                            if candidate.key == key
+                        ),
+                        -1,
+                    )
+                    if target_index < 0:
+                        role, key = TACTICAL_RUN, None
+                actions.append(ScoutAction(role, target_index))
+            action_tuple = tuple(actions)
+            self.teacher_assignments = update_assignments(
+                state,
+                scouts,
+                live_candidates,
+                action_tuple,
+                self.teacher_assignments,
+            )
+            self.teacher_records.append((observation, action_tuple))
+            self._next_teacher_time = state.time + TACTICAL_INTERVAL
+            return duties
+
+    return TeacherController
+
+
+@dataclass(frozen=True)
+class BehaviorCloneJob:
+    seed: int
+    side: str
+    opponent: str
+    duration: float = DEFAULT_MATCH_DURATION
+
+
+def run_behavior_clone_job(
+    job: BehaviorCloneJob,
+) -> list[tuple[TacticalObservation, tuple[ScoutAction, ...]]]:
+    _configure_worker()
+    scenario = generate_scenario(job.seed)
+    simulator = Simulator(scenario)
+    subject_team = Team(job.side)
+    base_type = _load_controller(
+        SUBJECT_PATH, f"bc_base_{os.getpid()}_{job.seed}"
+    )
+    teacher_type = _mode4_teacher_controller(base_type)
+    if job.opponent == "fixed_mode_4":
+        opponent_type = _instrumented_controller(base_type, force_mode_4=True)
+    else:
+        opponent_type = _load_controller(
+            _opponent_path(job.opponent), f"bc_foe_{os.getpid()}_{job.seed}"
+        )
+    teacher = teacher_type()
+    opponent = opponent_type()
+    teacher.initialize(game_info(scenario, subject_team))
+    opponent.initialize(game_info(scenario, subject_team.opponent))
+    controllers = {subject_team: teacher, subject_team.opponent: opponent}
+    control_stride = round(CONTROLLER_PERIOD / PHYSICS_DT)
+    for tick in range(round(job.duration / PHYSICS_DT)):
+        if tick % control_stride == 0:
+            commands = {
+                team: _commands(controllers[team], game_state(simulator, team))
+                for team in Team
+            }
+            for team in Team:
+                simulator.set_commands(team, commands[team])
+        simulator.step()
+        if not any(
+            drone.status is DroneStatus.ACTIVE for drone in simulator.snapshots()
+        ):
+            break
+    return teacher.teacher_records
+
+
+def collect_behavior_clone_jobs(
+    jobs: list[BehaviorCloneJob], workers: int
+) -> tuple[list[tuple[TacticalObservation, tuple[ScoutAction, ...]]], float]:
+    started = time.perf_counter()
+    records = []
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(run_behavior_clone_job, job) for job in jobs]
+        for future in as_completed(futures):
+            records.extend(future.result())
+    return records, time.perf_counter() - started
+
+
 @dataclass(frozen=True)
 class DynamicRolloutJob:
     seed: int
@@ -1223,6 +1354,13 @@ def train_dynamic_ppo(args) -> None:
     torch.set_num_threads(1)
     torch.manual_seed(config.seed)
     model = DynamicActorCritic(config.run_bias)
+    if args.initialize and args.resume:
+        raise ValueError("--initialize and --resume are mutually exclusive")
+    if args.initialize:
+        initialization = torch.load(
+            Path(args.initialize), map_location="cpu", weights_only=False
+        )
+        model.load_state_dict(initialization["model_state"])
     optimizer = torch.optim.Adam(
         model.parameters(), lr=config.learning_rate, eps=1.0e-5
     )
@@ -1430,6 +1568,100 @@ def evaluate_dynamic_checkpoint(args) -> None:
             sort_keys=True,
         )
     )
+
+
+def behavior_clone_mode4(args) -> None:
+    """Briefly clone safe mode 4, then leave PPO entirely unconstrained."""
+    torch.set_num_threads(1)
+    torch.manual_seed(args.seed)
+    rng = random.Random(args.seed)
+    league = AdaptiveOpponentLeague()
+    weights = league.weights()
+    jobs = [
+        BehaviorCloneJob(
+            seed=rng.randrange(10_000_000, 90_000_000),
+            side="A" if index % 2 == 0 else "B",
+            opponent=rng.choices(
+                league.names, [weights[name] for name in league.names], k=1
+            )[0],
+            duration=args.duration,
+        )
+        for index in range(args.matches)
+    ]
+    records, collection_seconds = collect_behavior_clone_jobs(jobs, args.workers)
+    model = DynamicActorCritic(run_bias=0.0)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
+    update_generator = torch.Generator().manual_seed(args.seed + 1)
+    losses = []
+    started = time.perf_counter()
+    for _epoch in range(args.epochs):
+        permutation = torch.randperm(len(records), generator=update_generator)
+        for start in range(0, len(records), args.minibatch):
+            indices = permutation[start : start + args.minibatch]
+            decisions = [
+                model.decide(
+                    records[int(index)][0],
+                    stochastic=False,
+                    actions=records[int(index)][1],
+                )
+                for index in indices
+            ]
+            loss = -torch.stack(
+                [
+                    decision.log_probability / max(1, decision.factor_count)
+                    for decision in decisions
+                ]
+            ).mean()
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+            optimizer.step()
+            losses.append(float(loss.detach()))
+    role_counts = Counter(
+        ROLE_NAMES[action.role]
+        for _observation, actions in records
+        for action in actions
+    )
+    run_dir = EXPERIMENT_DIR / args.run_name
+    checkpoint = {
+        "schema": "opus-rl-plan-dynamic-bc-v1",
+        "model_state": model.state_dict(),
+        "iteration": 0,
+        "seed": args.seed,
+        "matches": args.matches,
+        "records": len(records),
+        "epochs": args.epochs,
+        "learning_rate": args.learning_rate,
+        "teacher": "fixed_mode_4",
+        "league_weights": weights,
+    }
+    _atomic_dynamic_checkpoint(checkpoint, run_dir / "bc.pt")
+    report = {
+        key: checkpoint[key]
+        for key in (
+            "schema",
+            "seed",
+            "matches",
+            "records",
+            "epochs",
+            "learning_rate",
+            "teacher",
+        )
+    }
+    report.update(
+        {
+            "collection_seconds": collection_seconds,
+            "optimization_seconds": time.perf_counter() - started,
+            "final_loss": losses[-1],
+            "mean_loss": statistics.fmean(losses),
+            "teacher_role_counts": dict(role_counts),
+            "checkpoint": str(run_dir / "bc.pt"),
+        }
+    )
+    (run_dir / "bc-report.json").write_text(
+        json.dumps(report, indent=2, sort_keys=True), encoding="utf-8"
+    )
+    print(json.dumps(report, sort_keys=True))
 
 
 def _target_signature(mark: Any) -> tuple[Any, ...] | None:
@@ -1732,8 +1964,20 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--target-kl", type=float, default=DynamicPPOConfig.target_kl)
     train.add_argument("--validation-interval", type=int, default=DynamicPPOConfig.validation_interval)
     train.add_argument("--run-bias", type=float, default=DynamicPPOConfig.run_bias)
+    train.add_argument("--initialize")
     train.add_argument("--resume")
     train.set_defaults(function=train_dynamic_ppo)
+
+    clone = subparsers.add_parser("clone")
+    clone.add_argument("--run-name", required=True)
+    clone.add_argument("--seed", type=int, default=93_001)
+    clone.add_argument("--workers", type=int, default=6)
+    clone.add_argument("--matches", type=int, default=18)
+    clone.add_argument("--duration", type=float, default=DEFAULT_MATCH_DURATION)
+    clone.add_argument("--epochs", type=int, default=3)
+    clone.add_argument("--minibatch", type=int, default=64)
+    clone.add_argument("--learning-rate", type=float, default=3.0e-4)
+    clone.set_defaults(function=behavior_clone_mode4)
 
     evaluate = subparsers.add_parser("evaluate")
     evaluate.add_argument("--checkpoint", required=True)
