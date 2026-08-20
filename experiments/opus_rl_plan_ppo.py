@@ -63,8 +63,9 @@ OPPONENTS = {
 class ActorCritic(nn.Module):
     """Small shared trunk with categorical actor and scalar critic heads."""
 
-    def __init__(self) -> None:
+    def __init__(self, opus_bias: float = 2.0) -> None:
         super().__init__()
+        self.opus_bias = opus_bias
         self.trunk = nn.Sequential(
             nn.Linear(OBSERVATION_SIZE, 48),
             nn.Tanh(),
@@ -84,10 +85,10 @@ class ActorCritic(nn.Module):
                 nn.init.zeros_(layer.bias)
         nn.init.orthogonal_(self.actor.weight, 0.01)
         nn.init.zeros_(self.actor.bias)
-        # Start from deterministic Opus under argmax while stochastic training
-        # still samples every safe mode (p(Opus) is approximately 0.60).
+        # Positive bias starts near Opus; zero gives uniform stochastic
+        # exploration while deterministic tie-breaking still selects Opus.
         with torch.no_grad():
-            self.actor.bias[0] = 2.0
+            self.actor.bias[0] = self.opus_bias
         nn.init.orthogonal_(self.critic.weight, 1.0)
         nn.init.zeros_(self.critic.bias)
 
@@ -105,6 +106,7 @@ class RolloutJob:
     policy_state: dict[str, torch.Tensor]
     stochastic: bool = True
     reward_kind: str = "terminal"
+    switch_penalty: float = 0.0
     duration: float = DEFAULT_MATCH_DURATION
 
 
@@ -129,6 +131,15 @@ class EpisodeResult:
     mode_switches: int
     inference_seconds: float
     wall_seconds: float
+
+
+@dataclass(frozen=True)
+class ReferenceJob:
+    subject: str
+    seed: int
+    side: str
+    opponent: str
+    duration: float = DEFAULT_MATCH_DURATION
 
 
 def _load_controller(path: Path, module_tag: str):
@@ -231,7 +242,14 @@ def run_direct_match(
     return simulator.scores[Team.A], simulator.scores[Team.B]
 
 
-def _episode_rewards(records: list[dict[str, Any]], final_difference: int, outcome: float, kind: str, maximum_score: int) -> list[float]:
+def _episode_rewards(
+    records: list[dict[str, Any]],
+    final_difference: int,
+    outcome: float,
+    kind: str,
+    maximum_score: int,
+    switch_penalty: float = 0.0,
+) -> list[float]:
     if kind not in {"terminal", "score_potential"}:
         raise ValueError(f"unknown reward kind: {kind}")
     rewards = [0.0] * len(records)
@@ -241,6 +259,9 @@ def _episode_rewards(records: list[dict[str, Any]], final_difference: int, outco
         differences = [int(record["score_difference"]) for record in records] + [final_difference]
         for index in range(len(records)):
             rewards[index] += 0.10 * (differences[index + 1] - differences[index]) / max(1, maximum_score)
+    for index, record in enumerate(records):
+        if index > 0 and record["action"] != record["previous_action"]:
+            rewards[index] -= switch_penalty
     rewards[-1] += outcome
     return rewards
 
@@ -292,6 +313,7 @@ def run_rollout_job(job: RolloutJob) -> EpisodeResult:
         outcome,
         job.reward_kind,
         subject._initial_value,
+        job.switch_penalty,
     )
     actions = [int(record["action"]) for record in records]
     switches = sum(record["action"] != record["previous_action"] for record in records)
@@ -314,6 +336,43 @@ def run_rollout_job(job: RolloutJob) -> EpisodeResult:
         action_counts=dict(Counter(actions)),
         mode_switches=switches,
         inference_seconds=subject.ppo_inference_seconds,
+        wall_seconds=time.perf_counter() - started,
+    )
+
+
+def run_reference_job(job: ReferenceJob) -> EpisodeResult:
+    subject_paths = {
+        "controller": SUBJECT_PATH,
+        "opus": OPPONENTS["opus"],
+        "breaker": OPPONENTS["breaker"],
+    }
+    subject_path = subject_paths[job.subject]
+    opponent_path = OPPONENTS[job.opponent]
+    started = time.perf_counter()
+    if job.side == "A":
+        score_for, score_against = run_direct_match(subject_path, opponent_path, seed=job.seed, duration=job.duration)
+    else:
+        score_against, score_for = run_direct_match(opponent_path, subject_path, seed=job.seed, duration=job.duration)
+    outcome = 1.0 if score_for > score_against else -1.0 if score_for < score_against else 0.0
+    return EpisodeResult(
+        seed=job.seed,
+        side=job.side,
+        opponent=job.opponent,
+        policy_version=-1,
+        observations=[],
+        actions=[],
+        old_log_probs=[],
+        old_values=[],
+        rewards=[],
+        dones=[],
+        decision_times=[],
+        score_for=score_for,
+        score_against=score_against,
+        outcome=outcome,
+        transitions=0,
+        action_counts={},
+        mode_switches=0,
+        inference_seconds=0.0,
         wall_seconds=time.perf_counter() - started,
     )
 
@@ -358,6 +417,8 @@ class PPOConfig:
     target_kl: float = 0.03
     reward_kind: str = "terminal"
     validation_interval: int = 5
+    initial_opus_bias: float = 2.0
+    switch_penalty: float = 0.0
 
 
 TRAINING_OPPONENT_WEIGHTS = (
@@ -398,6 +459,7 @@ def _training_jobs(config: PPOConfig, model: ActorCritic, iteration: int, rng: r
                 policy_state=state,
                 stochastic=True,
                 reward_kind=config.reward_kind,
+                switch_penalty=config.switch_penalty,
                 duration=config.duration,
             )
         )
@@ -530,6 +592,7 @@ def summarize_episodes(episodes: list[EpisodeResult]) -> dict[str, Any]:
     for episode in episodes:
         action_counts.update(episode.action_counts)
     total_actions = sum(action_counts.values())
+    inference_seconds = sum(episode.inference_seconds for episode in episodes)
     return {
         "matches": len(episodes),
         "wins": sum(value > 0 for value in outcomes),
@@ -542,12 +605,28 @@ def summarize_episodes(episodes: list[EpisodeResult]) -> dict[str, Any]:
         "action_frequencies": {str(index): action_counts[index] / max(1, total_actions) for index in range(ACTION_COUNT)},
         "mode_switches": sum(episode.mode_switches for episode in episodes),
         "switches_per_match": statistics.fmean(episode.mode_switches for episode in episodes),
-        "policy_inference_seconds": sum(episode.inference_seconds for episode in episodes),
+        "policy_inference_seconds": inference_seconds,
+        "mean_policy_inference_microseconds": 1.0e6 * inference_seconds / max(1, total_actions),
+        # The trusted runner raises immediately on malformed commands or a
+        # failed update, so every successfully returned episode has zero here.
+        "invalid_actions": 0,
+        "missed_updates": 0,
+        "timeouts": 0,
     }
 
 
 def validation_details(episodes: list[EpisodeResult]) -> dict[str, Any]:
     summary = summarize_episodes(episodes)
+    transition_counts = Counter()
+    for episode in episodes:
+        transition_counts.update(zip(episode.actions, episode.actions[1:]))
+    summary["mode_transitions"] = {
+        f"{left}->{right}": transition_counts[(left, right)]
+        for left in range(ACTION_COUNT)
+        for right in range(ACTION_COUNT)
+        if transition_counts[(left, right)]
+    }
+    summary["action_sequence_samples"] = [episode.actions for episode in episodes[:5] if episode.actions]
     summary["by_opponent"] = {
         opponent: summarize_episodes([episode for episode in episodes if episode.opponent == opponent])
         for opponent in sorted({episode.opponent for episode in episodes})
@@ -559,7 +638,7 @@ def validation_details(episodes: list[EpisodeResult]) -> dict[str, Any]:
     return summary
 
 
-def _checkpoint_payload(model, optimizer, config, iteration, total_decisions, total_matches, rng, best_validation):
+def _checkpoint_payload(model, optimizer, config, iteration, total_decisions, total_matches, rng, update_generator, best_validation):
     return {
         "schema": "opus-rl-plan-ppo-v1",
         "model_state": model.state_dict(),
@@ -570,6 +649,7 @@ def _checkpoint_payload(model, optimizer, config, iteration, total_decisions, to
         "total_matches": total_matches,
         "python_rng_state": rng.getstate(),
         "torch_rng_state": torch.get_rng_state(),
+        "update_generator_state": update_generator.get_state(),
         "best_validation": best_validation,
         "observation_normalization": "fixed_physical_scaling",
     }
@@ -611,13 +691,15 @@ def train_ppo(args) -> None:
         target_kl=args.target_kl,
         reward_kind=args.reward,
         validation_interval=args.validation_interval,
+        initial_opus_bias=args.initial_opus_bias,
+        switch_penalty=args.switch_penalty,
     )
     run_dir = EXPERIMENT_DIR / args.run_name
     checkpoint_path = run_dir / "latest.pt"
     metrics_path = run_dir / "metrics.jsonl"
     torch.set_num_threads(1)
     torch.manual_seed(config.seed)
-    model = ActorCritic()
+    model = ActorCritic(config.initial_opus_bias)
     optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate, eps=1.0e-5)
     rng = random.Random(config.seed)
     update_generator = torch.Generator().manual_seed(config.seed + 1)
@@ -635,6 +717,8 @@ def train_ppo(args) -> None:
         rng.setstate(checkpoint["python_rng_state"])
         torch.set_rng_state(checkpoint["torch_rng_state"])
         best_validation = checkpoint.get("best_validation")
+        if "update_generator_state" in checkpoint:
+            update_generator.set_state(checkpoint["update_generator_state"])
 
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "config.json").write_text(json.dumps(asdict(config), indent=2, sort_keys=True), encoding="utf-8")
@@ -678,12 +762,16 @@ def train_ppo(args) -> None:
                 if best_validation is None or _validation_key(validation) > tuple(best_validation["key"]):
                     best_validation = {"iteration": iteration + 1, "key": list(_validation_key(validation)), "summary": validation}
                     atomic_torch_save(
-                        _checkpoint_payload(model, optimizer, config, iteration + 1, total_decisions, total_matches, rng, best_validation),
+                        _checkpoint_payload(model, optimizer, config, iteration + 1, total_decisions, total_matches, rng, update_generator, best_validation),
                         run_dir / "best.pt",
                     )
+                atomic_torch_save(
+                    _checkpoint_payload(model, optimizer, config, iteration + 1, total_decisions, total_matches, rng, update_generator, best_validation),
+                    run_dir / f"validation-{iteration + 1:04d}.pt",
+                )
             checkpoint_started = time.perf_counter()
             atomic_torch_save(
-                _checkpoint_payload(model, optimizer, config, iteration + 1, total_decisions, total_matches, rng, best_validation),
+                _checkpoint_payload(model, optimizer, config, iteration + 1, total_decisions, total_matches, rng, update_generator, best_validation),
                 checkpoint_path,
             )
             metric["serialization_checkpoint_seconds"] = time.perf_counter() - checkpoint_started
@@ -729,6 +817,144 @@ def evaluate_checkpoint(args) -> None:
         path = Path(args.output)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _python_tuple(value: Any) -> str:
+    """Format nested float lists as compact, deterministic Python tuples."""
+    if isinstance(value, list):
+        items = ", ".join(_python_tuple(item) for item in value)
+        return f"({items}{',' if len(value) == 1 else ''})"
+    return f"{float(value):.9g}"
+
+
+def exported_actor_constants(model: ActorCritic, checkpoint_name: str) -> str:
+    """Return the actor-only parameters; the critic is intentionally omitted."""
+    state = model.state_dict()
+    tensors = (
+        ("POLICY_W1", state["trunk.0.weight"]),
+        ("POLICY_B1", state["trunk.0.bias"]),
+        ("POLICY_W2", state["trunk.2.weight"]),
+        ("POLICY_B2", state["trunk.2.bias"]),
+        ("POLICY_W3", state["trunk.4.weight"]),
+        ("POLICY_B3", state["trunk.4.bias"]),
+        ("POLICY_W4", state["actor.weight"]),
+        ("POLICY_B4", state["actor.bias"]),
+    )
+    lines = [
+        "# BEGIN EXPORTED PPO ACTOR",
+        f"POLICY_SOURCE = {checkpoint_name!r}",
+        "POLICY_PARAMETER_COUNT = 5550",
+    ]
+    lines.extend(f"{name} = {_python_tuple(tensor.detach().cpu().tolist())}" for name, tensor in tensors)
+    lines.append("# END EXPORTED PPO ACTOR")
+    return "\n".join(lines)
+
+
+def export_actor(args) -> None:
+    """Replace only the bounded weight block in the dependency-free controller."""
+    checkpoint_path = Path(args.checkpoint)
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    model = ActorCritic()
+    model.load_state_dict(checkpoint["model_state"])
+    block = exported_actor_constants(model, checkpoint_path.name)
+    controller_path = Path(args.controller)
+    source = controller_path.read_text(encoding="utf-8")
+    start_marker = "# BEGIN EXPORTED PPO ACTOR"
+    end_marker = "# END EXPORTED PPO ACTOR"
+    if start_marker in source:
+        start = source.index(start_marker)
+        end = source.index(end_marker, start) + len(end_marker)
+    else:
+        start = source.index("POLICY_W1 =")
+        final_bias = source.index("POLICY_B4 =", start)
+        end = source.index("\n", final_bias)
+    controller_path.write_text(source[:start] + block + source[end:], encoding="utf-8")
+    print(
+        json.dumps(
+            {
+                "checkpoint": str(checkpoint_path),
+                "controller": str(controller_path),
+                "actor_parameters": 5550,
+                "critic_exported": False,
+            },
+            sort_keys=True,
+        )
+    )
+
+
+def _fixed_actor(action: int) -> ActorCritic:
+    model = ActorCritic(0.0)
+    with torch.no_grad():
+        model.actor.weight.zero_()
+        model.actor.bias.zero_()
+        model.actor.bias[action] = 1.0
+    return model
+
+
+def compare_policies(args) -> None:
+    policy_models: dict[str, tuple[ActorCritic, int]] = {}
+    if "ppo" in args.subjects:
+        checkpoint = torch.load(Path(args.checkpoint), map_location="cpu", weights_only=False)
+        model = ActorCritic()
+        model.load_state_dict(checkpoint["model_state"])
+        policy_models["ppo"] = (model, int(checkpoint["iteration"]))
+    if "fixed_opus" in args.subjects:
+        policy_models["fixed_opus"] = (_fixed_actor(0), -1)
+    if "fixed_scoring" in args.subjects:
+        policy_models["fixed_scoring"] = (_fixed_actor(4), -1)
+
+    all_results = {}
+    started = time.perf_counter()
+    with ProcessPoolExecutor(max_workers=args.workers) as pool:
+        for subject in args.subjects:
+            if subject in policy_models:
+                model, version = policy_models[subject]
+                jobs = _validation_jobs(
+                    model,
+                    version,
+                    args.duration,
+                    seeds=tuple(args.seeds),
+                    opponents=tuple(args.opponents),
+                )
+                episodes, elapsed = collect_with_pool(pool, jobs)
+            else:
+                jobs = [
+                    ReferenceJob(subject, seed, side, opponent, args.duration)
+                    for opponent in args.opponents
+                    for seed in args.seeds
+                    for side in ("A", "B")
+                ]
+                batch_started = time.perf_counter()
+                futures = [pool.submit(run_reference_job, job) for job in jobs]
+                episodes = [future.result() for future in as_completed(futures)]
+                elapsed = time.perf_counter() - batch_started
+            summary = validation_details(episodes)
+            summary["wall_seconds"] = elapsed
+            summary["matches_per_second"] = len(episodes) / elapsed
+            all_results[subject] = summary
+            print(
+                subject,
+                summary["wins"],
+                summary["draws"],
+                summary["losses"],
+                round(summary["match_points"], 1),
+                round(summary["mean_score_difference"], 3),
+                flush=True,
+            )
+    report = {
+        "schema": "opus-rl-plan-ppo-comparison-v1",
+        "checkpoint": args.checkpoint,
+        "seeds": args.seeds,
+        "opponents": args.opponents,
+        "sides": ["A", "B"],
+        "workers": args.workers,
+        "wall_seconds": time.perf_counter() - started,
+        "subjects": all_results,
+    }
+    if args.output:
+        path = Path(args.output)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
 
 
 def benchmark_workers(args) -> None:
@@ -820,6 +1046,8 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--target-kl", type=float, default=PPOConfig.target_kl)
     train.add_argument("--reward", choices=("terminal", "score_potential"), default=PPOConfig.reward_kind)
     train.add_argument("--validation-interval", type=int, default=PPOConfig.validation_interval)
+    train.add_argument("--initial-opus-bias", type=float, default=PPOConfig.initial_opus_bias)
+    train.add_argument("--switch-penalty", type=float, default=PPOConfig.switch_penalty)
     train.add_argument("--resume")
     train.set_defaults(function=train_ppo)
 
@@ -831,6 +1059,21 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--opponents", nargs="+", choices=OPPONENTS, required=True)
     evaluate.add_argument("--output")
     evaluate.set_defaults(function=evaluate_checkpoint)
+
+    compare = subparsers.add_parser("compare")
+    compare.add_argument("--checkpoint", required=True)
+    compare.add_argument("--subjects", nargs="+", choices=("ppo", "fixed_opus", "fixed_scoring", "controller", "opus", "breaker"), required=True)
+    compare.add_argument("--workers", type=int, default=PPOConfig.workers)
+    compare.add_argument("--duration", type=float, default=DEFAULT_MATCH_DURATION)
+    compare.add_argument("--seeds", nargs="+", type=int, required=True)
+    compare.add_argument("--opponents", nargs="+", choices=OPPONENTS, required=True)
+    compare.add_argument("--output")
+    compare.set_defaults(function=compare_policies)
+
+    export = subparsers.add_parser("export")
+    export.add_argument("--checkpoint", required=True)
+    export.add_argument("--controller", default=str(SUBJECT_PATH))
+    export.set_defaults(function=export_actor)
     return parser
 
 

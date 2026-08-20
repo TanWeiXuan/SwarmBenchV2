@@ -18,16 +18,24 @@ def test_actor_critic_is_small_and_has_expected_heads() -> None:
     logits, values = model(torch.zeros((3, OBSERVATION_SIZE)))
     assert logits.shape == (3, ACTION_COUNT)
     assert values.shape == (3,)
-    assert sum(parameter.numel() for parameter in model.parameters()) < 10_000
+    assert sum(parameter.numel() for parameter in model.parameters()) == 5_575
+    assert sum(parameter.numel() for parameter in model.trunk.parameters()) + sum(
+        parameter.numel() for parameter in model.actor.parameters()
+    ) == 5_550
     assert logits[0].argmax().item() == 0
 
 
 def test_reward_keeps_score_shaping_below_win_loss_scale() -> None:
-    records = [{"score_difference": 0}, {"score_difference": 5}]
+    records = [
+        {"score_difference": 0, "action": 0, "previous_action": 0},
+        {"score_difference": 5, "action": 1, "previous_action": 0},
+    ]
     assert _episode_rewards(records, 10, 1.0, "terminal", 50) == [0.0, 1.0]
     shaped = _episode_rewards(records, 10, 1.0, "score_potential", 50)
     assert shaped == pytest.approx([0.01, 1.01])
     assert sum(shaped) == pytest.approx(1.02)
+    stable = _episode_rewards(records, 10, 1.0, "terminal", 50, switch_penalty=0.002)
+    assert stable == pytest.approx([0.0, 0.998])
 
 
 def test_gae_does_not_bootstrap_past_episode_end() -> None:
