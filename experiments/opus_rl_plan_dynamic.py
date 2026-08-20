@@ -69,11 +69,12 @@ def _opponent_path(name: str) -> Path:
 ROLE_NAMES = ("RUN", "HUNT_TRANSPORT", "HUNT_TANK", "GUARD_TRANSPORT", "KEEP", "BLOCK")
 TACTICAL_RUN, HUNT_TRANSPORT, HUNT_TANK, GUARD_TRANSPORT, TACTICAL_KEEP, TACTICAL_BLOCK = range(len(ROLE_NAMES))
 ROLE_COUNT = len(ROLE_NAMES)
-GLOBAL_FEATURES = 32
+GLOBAL_FEATURES = 38
 ENTITY_FEATURES = 14
 PAIR_FEATURES = 32
 ENTITY_EMBEDDING = 16
 CONTEXT_EMBEDDING = 48
+MODEL_ARCHITECTURE = "deep-sets-factorized-v2-38x48x48"
 
 
 @dataclass(frozen=True)
@@ -132,6 +133,10 @@ class DynamicActorCritic(nn.Module):
             nn.Linear(GLOBAL_FEATURES + 4 * ENTITY_EMBEDDING, 64),
             nn.Tanh(),
             nn.Linear(64, CONTEXT_EMBEDDING),
+            nn.Tanh(),
+            nn.Linear(CONTEXT_EMBEDDING, CONTEXT_EMBEDDING),
+            nn.Tanh(),
+            nn.Linear(CONTEXT_EMBEDDING, CONTEXT_EMBEDDING),
             nn.Tanh(),
         )
         role_input = CONTEXT_EMBEDDING + ENTITY_EMBEDDING + ROLE_COUNT + 1 + ROLE_COUNT
@@ -227,7 +232,8 @@ class DynamicActorCritic(nn.Module):
         self,
         observations: list[TacticalObservation],
         actions: list[tuple[ScoutAction, ...]],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        role_class_weights: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Vectorized exact replay of recorded autoregressive assignments."""
         if len(observations) != len(actions):
             raise ValueError("observation/action batch mismatch")
@@ -307,6 +313,8 @@ class DynamicActorCritic(nn.Module):
         factor_counts = torch.zeros(
             batch_size, dtype=torch.float32, device=self.device
         )
+        imitation_loss = None
+        target_clone_log_probabilities = []
         if scout_features:
             scout_encoded = self.entity_encoder(
                 torch.tensor(
@@ -337,6 +345,12 @@ class DynamicActorCritic(nn.Module):
             log_probability = log_probability.index_add(
                 0, observation_indices, role_distribution.log_prob(selected)
             )
+            if role_class_weights is not None:
+                selected_log_probabilities = role_distribution.log_prob(selected)
+                selected_weights = role_class_weights.to(self.device)[selected]
+                imitation_loss = -(
+                    selected_log_probabilities * selected_weights
+                ).sum() / selected_weights.sum().clamp_min(1.0)
             entropy_sum = entropy_sum.index_add(
                 0, observation_indices, role_distribution.entropy()
             )
@@ -394,6 +408,9 @@ class DynamicActorCritic(nn.Module):
                             )
                         )
                     )
+                    target_clone_log_probabilities.append(
+                        target_log_probabilities[-1]
+                    )
                     target_entropies.append(distribution.entropy())
                     target_observation_indices.append(observation_index)
                 target_indices = torch.tensor(
@@ -417,7 +434,11 @@ class DynamicActorCritic(nn.Module):
                     ),
                 )
         entropy = entropy_sum / factor_counts.clamp_min(1.0)
-        return log_probability, values, entropy
+        if imitation_loss is not None and target_clone_log_probabilities:
+            imitation_loss = imitation_loss - 0.25 * torch.stack(
+                target_clone_log_probabilities
+            ).mean()
+        return log_probability, values, entropy, imitation_loss
 
     def decide(
         self,
@@ -614,6 +635,56 @@ def tactical_observation(controller, state, own, foes, assignment_state):
         LiveCandidate(("BLOCK_LINE", int(ward.id), int(gun.id)), (ward, gun), gun, ward)
         for ward, gun in controller._gun_lines(wards, foes)
     ]
+
+    def maximum_progress(drones, field):
+        return max(
+            (
+                1.0
+                - _clamp(
+                    controller._cost_to_go(field, drone.position)
+                    / controller.width,
+                    0.0,
+                    1.0,
+                )
+                for drone in drones
+            ),
+            default=1.0,
+        )
+
+    def nearest_distance(first, second):
+        if not first or not second:
+            return 1.0
+        return _clamp(
+            min(
+                math.hypot(
+                    left.position[0] - right.position[0],
+                    left.position[1] - right.position[1],
+                )
+                for left in first
+                for right in second
+            )
+            / controller.width,
+            0.0,
+            1.0,
+        )
+
+    foe_scouts = [
+        drone for drone in foes if drone.drone_type is DroneType.SCOUT
+    ]
+    loaded_foe_tanks = [
+        drone
+        for drone in foes
+        if drone.drone_type is DroneType.TANK and drone.shots_remaining
+    ]
+    scout_count = max(1, len(scouts))
+    expanded_global_features = tuple(controller._policy_features(state, own, foes)) + (
+        maximum_progress(wards, controller.attack),
+        maximum_progress(transports, controller.defend),
+        nearest_distance(wards, foe_scouts),
+        nearest_distance(wards, loaded_foe_tanks),
+        _clamp(len(guard_candidates) / scout_count, 0.0, 1.0),
+        _clamp(len(block_candidates) / scout_count, 0.0, 1.0),
+    )
     shared = {
         HUNT_TRANSPORT: [LiveCandidate(("DRONE", int(target.id)), target, target) for target in transports],
         HUNT_TANK: [LiveCandidate(("DRONE", int(target.id)), target, target) for target in tanks],
@@ -653,7 +724,7 @@ def tactical_observation(controller, state, own, foes, assignment_state):
         )
         live_candidates.append(tuple(live_by_role))
     observation = TacticalObservation(
-        tuple(controller._policy_features(state, own, foes)),
+        expanded_global_features,
         tuple(entity_features(controller, drone, friendly=True) for drone in own),
         tuple(entity_features(controller, drone, friendly=False) for drone in foes),
         tuple(scout_observations),
@@ -1372,9 +1443,12 @@ def dynamic_ppo_update(
             minibatch_actions = [
                 batch["actions"][int(index)] for index in indices
             ]
-            new_log_probabilities, values, entropies = model.evaluate_batch(
-                minibatch_observations, minibatch_actions
-            )
+            (
+                new_log_probabilities,
+                values,
+                entropies,
+                _imitation_loss,
+            ) = model.evaluate_batch(minibatch_observations, minibatch_actions)
             old_log_probabilities = batch["old_log_probabilities"][indices]
             log_ratio = new_log_probabilities - old_log_probabilities
             ratio = log_ratio.exp()
@@ -1585,6 +1659,8 @@ def _dynamic_checkpoint_payload(
 ):
     return {
         "schema": "opus-rl-plan-dynamic-ppo-v1",
+        "model_architecture": MODEL_ARCHITECTURE,
+        "model_parameters": sum(parameter.numel() for parameter in model.parameters()),
         "model_state": model.state_dict(),
         "optimizer_state": optimizer.state_dict(),
         "config": asdict(config),
@@ -1872,6 +1948,8 @@ def behavior_clone_mode4(args) -> None:
     records, collection_seconds = collect_behavior_clone_jobs(jobs, args.workers)
     model = DynamicActorCritic(run_bias=0.0)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
+    role_class_weights = torch.ones(ROLE_COUNT, dtype=torch.float32)
+    role_class_weights[GUARD_TRANSPORT] = args.guard_weight
     update_generator = torch.Generator().manual_seed(args.seed + 1)
     losses = []
     started = time.perf_counter()
@@ -1881,17 +1959,11 @@ def behavior_clone_mode4(args) -> None:
             indices = permutation[start : start + args.minibatch]
             observations = [records[int(index)][0] for index in indices]
             actions = [records[int(index)][1] for index in indices]
-            log_probabilities, _values, _entropies = model.evaluate_batch(
-                observations, actions
+            _log_probabilities, _values, _entropies, loss = model.evaluate_batch(
+                observations, actions, role_class_weights
             )
-            factor_counts = torch.tensor(
-                [
-                    sum(1 + int(action.target_index >= 0) for action in assignment)
-                    for assignment in actions
-                ],
-                dtype=torch.float32,
-            )
-            loss = -(log_probabilities / factor_counts.clamp_min(1.0)).mean()
+            if loss is None:
+                raise RuntimeError("behavior-clone minibatch contained no scouts")
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
@@ -1902,9 +1974,30 @@ def behavior_clone_mode4(args) -> None:
         for _observation, actions in records
         for action in actions
     )
+    confusion = Counter()
+    exact_assignments = 0
+    target_matches = 0
+    target_factors = 0
+    model.eval()
+    with torch.no_grad():
+        for observation, teacher_actions in records:
+            predicted_actions = model.decide(
+                observation, stochastic=False
+            ).actions
+            exact_assignments += predicted_actions == teacher_actions
+            for teacher, predicted in zip(teacher_actions, predicted_actions):
+                confusion[(ROLE_NAMES[teacher.role], ROLE_NAMES[predicted.role])] += 1
+                if teacher.target_index >= 0:
+                    target_factors += 1
+                    target_matches += (
+                        teacher.role == predicted.role
+                        and teacher.target_index == predicted.target_index
+                    )
     run_dir = EXPERIMENT_DIR / args.run_name
     checkpoint = {
         "schema": "opus-rl-plan-dynamic-bc-v1",
+        "model_architecture": MODEL_ARCHITECTURE,
+        "model_parameters": sum(parameter.numel() for parameter in model.parameters()),
         "model_state": model.state_dict(),
         "iteration": 0,
         "seed": args.seed,
@@ -1912,6 +2005,7 @@ def behavior_clone_mode4(args) -> None:
         "records": len(records),
         "epochs": args.epochs,
         "learning_rate": args.learning_rate,
+        "guard_weight": args.guard_weight,
         "teacher": "fixed_mode_4",
         "league_weights": weights,
     }
@@ -1920,11 +2014,14 @@ def behavior_clone_mode4(args) -> None:
         key: checkpoint[key]
         for key in (
             "schema",
+            "model_architecture",
+            "model_parameters",
             "seed",
             "matches",
             "records",
             "epochs",
             "learning_rate",
+            "guard_weight",
             "teacher",
         )
     }
@@ -1935,6 +2032,12 @@ def behavior_clone_mode4(args) -> None:
             "final_loss": losses[-1],
             "mean_loss": statistics.fmean(losses),
             "teacher_role_counts": dict(role_counts),
+            "training_exact_assignment_rate": exact_assignments / len(records),
+            "training_role_confusion": {
+                f"{teacher}->{predicted}": count
+                for (teacher, predicted), count in sorted(confusion.items())
+            },
+            "training_target_accuracy": target_matches / max(1, target_factors),
             "checkpoint": str(run_dir / "bc.pt"),
         }
     )
@@ -2262,6 +2365,12 @@ def build_parser() -> argparse.ArgumentParser:
     clone.add_argument("--epochs", type=int, default=3)
     clone.add_argument("--minibatch", type=int, default=64)
     clone.add_argument("--learning-rate", type=float, default=3.0e-4)
+    clone.add_argument(
+        "--guard-weight",
+        type=float,
+        default=30.0,
+        help="relative role-loss weight for the rare mode-4 guard decisions",
+    )
     clone.set_defaults(function=behavior_clone_mode4)
 
     evaluate = subparsers.add_parser("evaluate")

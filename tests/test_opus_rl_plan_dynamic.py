@@ -10,10 +10,12 @@ from swarmbench import DroneType
 from experiments.opus_rl_plan_dynamic import (
     ENTITY_FEATURES,
     GLOBAL_FEATURES,
+    GUARD_TRANSPORT,
     HUNT_TRANSPORT,
     PAIR_FEATURES,
     ROLE_COUNT,
     ROLE_NAMES,
+    ScoutAction,
     TACTICAL_RUN,
     AdaptiveOpponentLeague,
     CandidateObservation,
@@ -75,12 +77,13 @@ def _observation(*, scouts: int, candidate: bool) -> TacticalObservation:
         candidates = [tuple() for _ in range(ROLE_COUNT)]
         if candidate:
             candidates[HUNT_TRANSPORT] = (target,)
+            candidates[GUARD_TRANSPORT] = (target,)
         scout_values.append(
             ScoutObservation(
                 (0.0,) * ENTITY_FEATURES,
                 TACTICAL_RUN,
                 0.0,
-                (True, candidate, False, False, False, False),
+                (True, candidate, False, candidate, False, False),
                 tuple(candidates),
             )
         )
@@ -122,14 +125,51 @@ def test_autoregressive_mask_prevents_duplicate_target_assignment() -> None:
         actions=decision.actions,
     )
     assert torch.allclose(replay.log_probability, decision.log_probability)
-    batch_log_probability, batch_value, batch_entropy = model.evaluate_batch(
-        [_observation(scouts=2, candidate=True)], [decision.actions]
+    batch_log_probability, batch_value, batch_entropy, imitation_loss = (
+        model.evaluate_batch(
+            [_observation(scouts=2, candidate=True)], [decision.actions]
+        )
     )
+    assert imitation_loss is None
     assert batch_log_probability[0].item() == pytest.approx(
         decision.log_probability.item(), abs=1.0e-6
     )
     assert batch_value[0].item() == pytest.approx(decision.value.item(), abs=1.0e-6)
     assert batch_entropy[0].item() == pytest.approx(decision.entropy.item(), abs=1.0e-6)
+
+
+def test_weighted_imitation_loss_emphasizes_guard_roles() -> None:
+    model = DynamicActorCritic(run_bias=0.0)
+    observation = _observation(scouts=1, candidate=True)
+    run = ((ScoutAction(TACTICAL_RUN, -1)),)
+    guard = ((ScoutAction(GUARD_TRANSPORT, 0)),)
+    weights = torch.ones(ROLE_COUNT)
+    weights[GUARD_TRANSPORT] = 30.0
+    _log_probability, _value, _entropy, loss = model.evaluate_batch(
+        [observation, observation], [run, guard], weights
+    )
+    assert loss is not None
+    role_logits = model.role_head(
+        torch.cat(
+            (
+                model.encode_context(observation),
+                model.entity_encoder(torch.tensor(observation.scouts[0].entity)),
+                    torch.tensor(
+                        [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+                        + [0.0] * ROLE_COUNT
+                    ),
+            )
+        )
+    )
+    role_logits = role_logits.masked_fill(
+        ~torch.tensor(observation.scouts[0].base_role_mask), -1.0e9
+    )
+    expected_role_loss = -(
+        torch.log_softmax(role_logits, dim=0)[TACTICAL_RUN]
+        + 30.0 * torch.log_softmax(role_logits, dim=0)[GUARD_TRANSPORT]
+    ) / 31.0
+    # A single available target has zero target NLL, so this isolates role weighting.
+    assert loss.item() == pytest.approx(expected_role_loss.item(), abs=1.0e-6)
 
 
 def test_adaptive_league_is_normalized_and_contains_current_hard_field() -> None:
