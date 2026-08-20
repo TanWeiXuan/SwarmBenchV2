@@ -38,7 +38,7 @@ def test_privileged_reporter_merges_with_github_app_token() -> None:
     text = workflow("submission-reporter.yml")
     read_jobs = text.index("- name: Read validation jobs")
     app_token = text.index("- name: Create short-lived submission token")
-    update = text.index("- name: Update sticky progress and enable auto-merge")
+    update = text.index("- name: Update sticky progress and automatically merge")
     app_token_step = text[app_token:text.index("- name: Download final validated result")]
     update_step = text[update:]
     assert "actions/create-github-app-token@v3" in text
@@ -53,6 +53,9 @@ def test_privileged_reporter_merges_with_github_app_token() -> None:
     assert "github.rest.actions.listJobsForWorkflowRun" not in update_step
     assert "VALIDATION_JOBS: ${{ steps.validation-jobs.outputs.jobs }}" in update_step
     assert "JSON.parse(process.env.VALIDATION_JOBS)" in update_step
+    assert "enablePullRequestAutoMerge" not in update_step
+    assert "pull.head.sha !== run.head_sha" in update_step
+    assert "sha: run.head_sha" in update_step
     assert "createWorkflowDispatch" not in text
     assert "submission-accepted.yml" not in text
 
@@ -74,7 +77,7 @@ def test_privileged_reporter_downloads_results_only_for_submission_prs() -> None
     text = workflow("submission-reporter.yml")
     resolve = text.index("- name: Resolve validated submission PR")
     download = text.index("- name: Download final validated result")
-    update = text.index("- name: Update sticky progress and enable auto-merge")
+    update = text.index("- name: Update sticky progress and automatically merge")
     download_step = text[download:update]
     assert resolve < download < update
     assert "core.setOutput('pr_number', prNumber)" in text[resolve:download]
@@ -91,6 +94,11 @@ def test_acceptance_workflow_checks_out_only_merged_main() -> None:
     assert "actions: read" in text
     assert "ref: main" in text
     assert "ref: ${{ github.event.pull_request.head" not in text
+    assert 'pulls/$PR_NUMBER/files' not in text
+    assert "--jq '.merge_commit_sha'" in text
+    assert "git diff-tree --no-commit-id --name-only" in text
+    assert '"$merge_sha^" "$merge_sha" -- submissions' in text
+    assert "${#submission_paths[@]} -ne 1" in text
     assert "competition.publisher" in text
     assert 'pip install -e ".[competition]"' in text
 

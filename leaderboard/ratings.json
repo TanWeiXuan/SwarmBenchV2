@@ -227,6 +227,20 @@
     {
       "author": "renj1ete0",
       "built_in": false,
+      "controller_id": "renj1ete0/best_community_v1",
+      "deviation": 35.377436451572805,
+      "display_name": "Best Community V1",
+      "draws": 0,
+      "games": 0,
+      "losses": 0,
+      "rating": 1248.5183461580175,
+      "version_sha": "61078fee0e202e306fbcc839ca990fcff81cf9f9",
+      "volatility": 0.05999842515507306,
+      "wins": 0
+    },
+    {
+      "author": "renj1ete0",
+      "built_in": false,
       "controller_id": "renj1ete0/gemini_3_1_pro_v1",
       "deviation": 35.37743646754581,
       "display_name": "Gemini 3 1 Pro V1",
