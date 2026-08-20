@@ -213,6 +213,20 @@
     {
       "author": "renj1ete0",
       "built_in": false,
+      "controller_id": "renj1ete0/GPT-5.3-Codex",
+      "deviation": 35.37743646262343,
+      "display_name": "Gpt-5.3-Codex",
+      "draws": 0,
+      "games": 0,
+      "losses": 0,
+      "rating": 1873.7722417424882,
+      "version_sha": "3a759a7c5089ba0e62d52335332bde214a80002e",
+      "volatility": 0.060000497270163405,
+      "wins": 0
+    },
+    {
+      "author": "renj1ete0",
+      "built_in": false,
       "controller_id": "renj1ete0/opus_5_v1",
       "deviation": 28.59689266572155,
       "display_name": "Opus 5 V1",
