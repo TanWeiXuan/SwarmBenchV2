@@ -345,8 +345,52 @@ with useful dynamic/target ablations. It does not convincingly beat Opus, and
 the best result does not replicate against fixed mode 4 across training seeds.
 No 250-seed claim, pure-Python export, or submission replacement was made.
 
-The next evidence-supported experiment is state-restorable counterfactual
-labeling of the relatively rare pursuer states: compare RUN versus each
-feasible GUARD target over a short rollout, then train the existing small head
-on measured advantages. More PPO epochs, higher entropy, score shaping, a GRU,
-Transformers, and end-to-end control are not justified by these results.
+### Experiment 3b: state-restorable guard counterfactuals
+
+The proposed counterfactual experiment was implemented rather than left as a
+suggestion. At a feasible guard state, the authoritative simulator and both
+stateful controllers are deep-copied before commands execute. Branches force
+one scout to RUN or one of the two best feasible GUARD targets for five
+seconds; all other learned decisions continue normally, the override expires,
+and every branch runs to the real match end. Selection is lexicographic on
+win/draw/loss and then score differential. Temporary assignments expire when
+the scout/target dies and reserve their target exactly like normal
+autoregressive assignment.
+
+The first dataset branched the first guard opportunity on ten seeds, both
+sides, against Opus, Breaker, and fixed mode 4. All 60 jobs found a state; 40
+had a unique terminal preference, split 31 GUARD / 9 RUN, with mean score
+spread 6.82 and maximum 42. A second batch sampled feasible opportunity
+indices 0-5. It found 47/60 states at mean time 9.26 seconds; 16 were decisive
+and exactly balanced (8/8), with 31 ties. Artifacts contain plain nested data,
+not process-local dataclass pickle identities.
+
+Fine-tuning ranks only the alternative full assignments, so unchanged scout
+factors cancel. It uses a seed-modulus holdout and per-epoch early stopping.
+Unconstrained fitting demonstrated that the labels are learnable (ranking
+accuracy rose from 36.4% to 66.7% train and 14.3% to 57.1% holdout), but it
+changed shared features globally, activated KEEP/HUNT, guarded 19-21%, and
+collapsed to 12.5-16.5/60. Restricting gradients to the final RUN/GUARD and
+target output rows removed unrelated roles but still over-guarded.
+
+Because the sampled data is conditioned on guard feasibility, its 31:9 class
+ratio cannot safely become a global role prior. Inverse-frequency weighting
+kept the actor near its source behavior (2.81% GUARD). On the first paired
+screen it improved from 28.0/60 to 30.5/60. That gain did not generalize:
+
+| Policy on 30 new seeds × both sides | All | Opus | Breaker | fixed mode 4 |
+| --- | ---: | ---: | ---: | ---: |
+| Counterfactual fine-tune | 78.5/180 | 26.0/60 | 27.0/60 | 25.5/60 |
+| Untouched source | 80.5/180 | 25.0/60 | 29.0/60 | 26.5/60 |
+
+Adding the later-state batch produced 56 decisive labels (39 GUARD / 17 RUN),
+but its combined fit regressed to 25.5/60 versus the same source's 28.0/60 on
+the smaller paired screen. Counterfactual branching therefore found genuinely
+high-leverage states, but direct small-sample policy ranking did not generalize
+and is rejected.
+
+More PPO epochs, higher entropy, score shaping, recurrence, Transformers, and
+end-to-end control remain unjustified. A future continuation should require a
+substantially larger counterfactual dataset and train a calibrated action-value
+model with an uncertainty/fallback gate, rather than directly shifting the
+deployed role logits from a few dozen labels.
