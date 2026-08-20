@@ -267,6 +267,20 @@
       "wins": 123
     },
     {
+      "author": "renj1ete0",
+      "built_in": false,
+      "controller_id": "renj1ete0/sonnet_5_v3",
+      "deviation": 35.279655287042814,
+      "display_name": "Sonnet 5 V3",
+      "draws": 0,
+      "games": 0,
+      "losses": 0,
+      "rating": 1914.295862090343,
+      "version_sha": "98d67b69ffe2c6eeaf16e6a86835abe4aaebe2e4",
+      "volatility": 0.06000136262025302,
+      "wins": 0
+    },
+    {
       "author": "SwarmBench",
       "built_in": true,
       "controller_id": "rush",
