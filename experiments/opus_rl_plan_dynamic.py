@@ -11,9 +11,12 @@ import argparse
 import json
 import math
 import os
+import random
+import statistics
 import time
 from collections import Counter
-from dataclasses import dataclass
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +38,33 @@ EXPERIMENT_DIR = ROOT / ".rl_local" / "dynamic"
 TACTICAL_INTERVAL = 1.0
 FIXED_MODE_4 = (0, 0, 0, 1, 0)
 POINT_VALUE = {DroneType.SCOUT: 1, DroneType.TRANSPORT: 5, DroneType.TANK: 1}
+
+COMMUNITY_OPPONENTS = {
+    f"{path.parent.name}/{path.stem}": path
+    for path in (ROOT / "submissions").glob("*/*.py")
+    if path.resolve() != SUBJECT_PATH.resolve()
+}
+BASELINE_OPPONENTS = {
+    name: OPPONENTS[name]
+    for name in ("potential", "greedy", "assignment", "rush", "defend", "convoy", "marksman")
+}
+LEAGUE_OPPONENTS = {**COMMUNITY_OPPONENTS, **BASELINE_OPPONENTS}
+HARD_OPPONENTS = (
+    "renj1ete0/opus_5_v1",
+    "TanWeiXuan/Luna_xHigh_opus_breaker",
+    "renj1ete0/GPT-5.3-Codex",
+    "renj1ete0/gemini_3_1_pro_v1",
+    "renj1ete0/sonnet_5_v3",
+    "TanWeiXuan/Luna_xHigh_sipp_marksman_v1",
+)
+
+
+def _opponent_path(name: str) -> Path:
+    if name in LEAGUE_OPPONENTS:
+        return LEAGUE_OPPONENTS[name]
+    if name in OPPONENTS:
+        return OPPONENTS[name]
+    raise KeyError(f"unknown opponent: {name}")
 
 ROLE_NAMES = ("RUN", "HUNT_TRANSPORT", "HUNT_TANK", "GUARD_TRANSPORT", "KEEP", "BLOCK")
 TACTICAL_RUN, HUNT_TRANSPORT, HUNT_TANK, GUARD_TRANSPORT, TACTICAL_KEEP, TACTICAL_BLOCK = range(len(ROLE_NAMES))
@@ -383,6 +413,1025 @@ def tactical_observation(controller, state, own, foes, assignment_state):
     return observation, tuple(scouts), tuple(live_candidates)
 
 
+def update_assignments(state, scouts, live_candidates, actions, previous):
+    """Convert sampled indices into stable execution tokens and persistence state."""
+    updated = {}
+    for scout, candidates_by_role, action in zip(scouts, live_candidates, actions):
+        target_key = None
+        if action.target_index >= 0:
+            target_key = candidates_by_role[action.role][action.target_index].key
+        old_role, old_target, old_since = previous.get(
+            int(scout.id), (TACTICAL_RUN, None, state.time)
+        )
+        since = old_since if (old_role, old_target) == (action.role, target_key) else state.time
+        updated[int(scout.id)] = (action.role, target_key, since)
+    return updated
+
+
+def resolve_tactical_duties(controller, state, own, foes, assignment_state):
+    """Resolve stable ID tokens to current snapshots on every control update."""
+    run, hunt, keep, gun, block = controller.BASE_ROLES
+    own_by_id = {int(drone.id): drone for drone in own}
+    foes_by_id = {int(drone.id): drone for drone in foes}
+    duties = {}
+    for drone in own:
+        if drone.drone_type is DroneType.TANK:
+            duties[drone.id] = (gun if drone.shots_remaining else run, None)
+        elif drone.drone_type is DroneType.TRANSPORT:
+            duties[drone.id] = (run, None)
+        else:
+            role, target_key, _since = assignment_state.get(
+                int(drone.id), (TACTICAL_RUN, None, state.time)
+            )
+            if role == TACTICAL_RUN:
+                duties[drone.id] = (run, None)
+            elif role == TACTICAL_KEEP:
+                duties[drone.id] = (keep, None)
+            elif role == TACTICAL_BLOCK and target_key and target_key[0] == "BLOCK_LINE":
+                ward = own_by_id.get(int(target_key[1]))
+                tank = foes_by_id.get(int(target_key[2]))
+                duties[drone.id] = (block, (ward, tank)) if ward is not None and tank is not None else (run, None)
+            elif target_key and target_key[0] == "DRONE":
+                target = foes_by_id.get(int(target_key[1]))
+                duties[drone.id] = (hunt, target) if target is not None else (run, None)
+            else:
+                duties[drone.id] = (run, None)
+    return duties
+
+
+def _dynamic_controller(
+    base_type,
+    model: DynamicActorCritic,
+    generator: torch.Generator,
+    *,
+    stochastic: bool,
+    decision_interval: float = TACTICAL_INTERVAL,
+    ablation: str = "full",
+):
+    """Inject learned scout duties while retaining every deterministic skill."""
+    if ablation not in {"full", "freeze_start"}:
+        raise ValueError(f"unsupported dynamic ablation: {ablation}")
+
+    class DynamicController(base_type):
+        def initialize(self, info):
+            super().initialize(info)
+            self.dynamic_assignments: dict[int, tuple[int, tuple[Any, ...] | None, float]] = {}
+            self.dynamic_records: list[dict[str, Any]] = []
+            self.dynamic_inference_seconds = 0.0
+            self._next_dynamic_time = 0.0
+            self._previous_effective: dict[int, tuple[int, tuple[Any, ...] | None]] = {}
+
+        def _plan(self, state, own, foes):
+            should_decide = state.time + 1.0e-9 >= self._next_dynamic_time
+            if ablation == "freeze_start" and self.dynamic_records:
+                should_decide = False
+            if should_decide:
+                observation, scouts, live_candidates = tactical_observation(
+                    self, state, own, foes, self.dynamic_assignments
+                )
+                started = time.perf_counter()
+                with torch.no_grad():
+                    decision = model.decide(
+                        observation,
+                        stochastic=stochastic,
+                        generator=generator,
+                    )
+                self.dynamic_inference_seconds += time.perf_counter() - started
+                updated = update_assignments(
+                    state,
+                    scouts,
+                    live_candidates,
+                    decision.actions,
+                    self.dynamic_assignments,
+                )
+                effective = {
+                    scout_id: (role, target)
+                    for scout_id, (role, target, _since) in updated.items()
+                }
+                duty_changes = sum(
+                    self._previous_effective.get(scout_id) != assignment
+                    for scout_id, assignment in effective.items()
+                )
+                target_changes = sum(
+                    scout_id in self._previous_effective
+                    and self._previous_effective[scout_id][1] != assignment[1]
+                    for scout_id, assignment in effective.items()
+                )
+                self.dynamic_assignments = updated
+                self._previous_effective = effective
+                self._next_dynamic_time = state.time + decision_interval
+                self.dynamic_records.append(
+                    {
+                        "observation": observation,
+                        "actions": decision.actions,
+                        "log_probability": float(decision.log_probability.item()),
+                        "value": float(decision.value.item()),
+                        "entropy": float(decision.entropy.item()),
+                        "factor_count": decision.factor_count,
+                        "time": state.time,
+                        "score_difference": state.own_score - state.opponent_score,
+                        "selected_roles": [ROLE_NAMES[action.role] for action in decision.actions],
+                        "selected_targets": [
+                            updated[int(scout.id)][1] for scout in scouts
+                        ],
+                        "duty_changes": duty_changes,
+                        "target_changes": target_changes,
+                        "commands_different_from_mode_4": 0,
+                    }
+                )
+            return resolve_tactical_duties(
+                self, state, own, foes, self.dynamic_assignments
+            )
+
+        def note_shadow_commands(self, state, commands, shadow_commands):
+            if not self.dynamic_records or abs(self.dynamic_records[-1]["time"] - state.time) > 1.0e-9:
+                return
+            scout_ids = {
+                drone.id
+                for drone in state.own_drones
+                if drone.status is DroneStatus.ACTIVE and drone.drone_type is DroneType.SCOUT
+            }
+            self.dynamic_records[-1]["commands_different_from_mode_4"] = sum(
+                commands.get(drone_id) != shadow_commands.get(drone_id)
+                for drone_id in scout_ids
+            )
+
+    globals_ = base_type._plan.__globals__
+    DynamicController.BASE_ROLES = tuple(
+        globals_[name] for name in ("RUN", "HUNT", "KEEP", "GUN", "BLOCK")
+    )
+    return DynamicController
+
+
+@dataclass(frozen=True)
+class DynamicRolloutJob:
+    seed: int
+    side: str
+    opponent: str
+    policy_version: int
+    policy_state: dict[str, torch.Tensor]
+    stochastic: bool = True
+    duration: float = DEFAULT_MATCH_DURATION
+    decision_interval: float = TACTICAL_INTERVAL
+    ablation: str = "full"
+    diagnostics: bool = False
+
+
+@dataclass
+class DynamicEpisodeResult:
+    seed: int
+    side: str
+    opponent: str
+    policy_version: int
+    observations: list[TacticalObservation]
+    actions: list[tuple[ScoutAction, ...]]
+    old_log_probabilities: list[float]
+    old_values: list[float]
+    rewards: list[float]
+    dones: list[bool]
+    score_for: int
+    score_against: int
+    outcome: float
+    selected_role_counts: dict[str, int]
+    duty_changes: int
+    target_changes: int
+    command_differences: int
+    inference_seconds: float
+    events: list[dict[str, Any]]
+    score_timeline: list[dict[str, Any]]
+    tactical_records: list[dict[str, Any]]
+    wall_seconds: float
+
+    @property
+    def transitions(self) -> int:
+        return len(self.observations)
+
+
+def _frozen_dynamic_state(model: DynamicActorCritic) -> dict[str, torch.Tensor]:
+    return {
+        name: value.detach().cpu().clone()
+        for name, value in model.state_dict().items()
+    }
+
+
+def run_dynamic_rollout_job(job: DynamicRolloutJob) -> DynamicEpisodeResult:
+    """Execute one complete factorized-policy episode with frozen weights."""
+    _configure_worker()
+    started = time.perf_counter()
+    random.seed(job.seed ^ (0 if job.side == "A" else 0x6C8E9CF5))
+    torch.manual_seed(job.seed % (2**31))
+    model = DynamicActorCritic()
+    model.load_state_dict(job.policy_state)
+    model.eval()
+    generator = torch.Generator().manual_seed(
+        (job.seed * 6364136223846793005 + job.policy_version * 1447 + ord(job.side))
+        % (2**63)
+    )
+    scenario = generate_scenario(job.seed)
+    simulator = Simulator(scenario)
+    subject_team = Team(job.side)
+    base_type = _load_controller(
+        SUBJECT_PATH, f"dynamic_base_{os.getpid()}_{job.seed}"
+    )
+    subject_type = _dynamic_controller(
+        base_type,
+        model,
+        generator,
+        stochastic=job.stochastic,
+        decision_interval=job.decision_interval,
+        ablation=job.ablation,
+    )
+    if job.opponent == "fixed_mode_4":
+        opponent_type = _instrumented_controller(base_type, force_mode_4=True)
+    else:
+        opponent_type = _load_controller(
+            _opponent_path(job.opponent),
+            f"dynamic_foe_{os.getpid()}_{job.seed}",
+        )
+    subject = subject_type()
+    opponent = opponent_type()
+    own_info = game_info(scenario, subject_team)
+    subject.initialize(own_info)
+    opponent.initialize(game_info(scenario, subject_team.opponent))
+    controllers = {subject_team: subject, subject_team.opponent: opponent}
+    shadow = None
+    if job.diagnostics:
+        shadow_type = _instrumented_controller(base_type, force_mode_4=True)
+        shadow = shadow_type()
+        shadow.initialize(own_info)
+    events = []
+    score_timeline = [{"time": 0.0, "for": 0, "against": 0}]
+    previous_scores = (0, 0)
+    control_stride = round(CONTROLLER_PERIOD / PHYSICS_DT)
+    for tick in range(round(job.duration / PHYSICS_DT)):
+        if tick % control_stride == 0:
+            states = {team: game_state(simulator, team) for team in Team}
+            commands = {
+                team: _commands(controllers[team], states[team])
+                for team in Team
+            }
+            if shadow is not None:
+                shadow_commands = _commands(shadow, states[subject_team])
+                subject.note_shadow_commands(
+                    states[subject_team], commands[subject_team], shadow_commands
+                )
+            for team in Team:
+                simulator.set_commands(team, commands[team])
+        resolved = simulator.step()
+        if job.diagnostics:
+            events.extend(_event_dict(event) for event in resolved)
+        scores = (
+            simulator.scores[subject_team],
+            simulator.scores[subject_team.opponent],
+        )
+        if scores != previous_scores:
+            score_timeline.append(
+                {"time": simulator.time, "for": scores[0], "against": scores[1]}
+            )
+            previous_scores = scores
+        if not any(
+            drone.status is DroneStatus.ACTIVE for drone in simulator.snapshots()
+        ):
+            break
+    score_for = simulator.scores[subject_team]
+    score_against = simulator.scores[subject_team.opponent]
+    outcome = (
+        1.0
+        if score_for > score_against
+        else -1.0
+        if score_for < score_against
+        else 0.0
+    )
+    records = subject.dynamic_records
+    rewards = [0.0] * len(records)
+    if rewards:
+        rewards[-1] = outcome
+    role_counts = Counter(
+        role
+        for record in records
+        for role in record["selected_roles"]
+    )
+    return DynamicEpisodeResult(
+        seed=job.seed,
+        side=job.side,
+        opponent=job.opponent,
+        policy_version=job.policy_version,
+        observations=[record["observation"] for record in records],
+        actions=[record["actions"] for record in records],
+        old_log_probabilities=[record["log_probability"] for record in records],
+        old_values=[record["value"] for record in records],
+        rewards=rewards,
+        dones=[False] * max(0, len(records) - 1) + ([True] if records else []),
+        score_for=score_for,
+        score_against=score_against,
+        outcome=outcome,
+        selected_role_counts=dict(role_counts),
+        duty_changes=sum(record["duty_changes"] for record in records[1:]),
+        target_changes=sum(record["target_changes"] for record in records[1:]),
+        command_differences=sum(
+            record["commands_different_from_mode_4"] for record in records
+        ),
+        inference_seconds=subject.dynamic_inference_seconds,
+        events=events,
+        score_timeline=score_timeline,
+        tactical_records=[
+            {
+                key: record[key]
+                for key in (
+                    "time",
+                    "score_difference",
+                    "selected_roles",
+                    "selected_targets",
+                    "duty_changes",
+                    "target_changes",
+                    "commands_different_from_mode_4",
+                )
+            }
+            for record in records
+        ],
+        wall_seconds=time.perf_counter() - started,
+    )
+
+
+def collect_dynamic_jobs(
+    jobs: list[DynamicRolloutJob], workers: int
+) -> tuple[list[DynamicEpisodeResult], float]:
+    started = time.perf_counter()
+    results = []
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(run_dynamic_rollout_job, job) for job in jobs]
+        for future in as_completed(futures):
+            results.append(future.result())
+    return results, time.perf_counter() - started
+
+
+def collect_dynamic_with_pool(
+    pool: ProcessPoolExecutor, jobs: list[DynamicRolloutJob]
+) -> tuple[list[DynamicEpisodeResult], float]:
+    started = time.perf_counter()
+    futures = [pool.submit(run_dynamic_rollout_job, job) for job in jobs]
+    results = [future.result() for future in as_completed(futures)]
+    return results, time.perf_counter() - started
+
+
+def dynamic_gae(
+    episodes: list[DynamicEpisodeResult], gamma: float, gae_lambda: float
+) -> dict[str, Any]:
+    observations = []
+    actions = []
+    old_log_probabilities = []
+    old_values = []
+    advantages = []
+    returns = []
+    for episode in episodes:
+        episode_advantages = [0.0] * episode.transitions
+        gae = 0.0
+        next_value = 0.0
+        for index in reversed(range(episode.transitions)):
+            nonterminal = 0.0 if episode.dones[index] else 1.0
+            delta = (
+                episode.rewards[index]
+                + gamma * next_value * nonterminal
+                - episode.old_values[index]
+            )
+            gae = delta + gamma * gae_lambda * nonterminal * gae
+            episode_advantages[index] = gae
+            next_value = episode.old_values[index]
+        observations.extend(episode.observations)
+        actions.extend(episode.actions)
+        old_log_probabilities.extend(episode.old_log_probabilities)
+        old_values.extend(episode.old_values)
+        advantages.extend(episode_advantages)
+        returns.extend(
+            advantage + value
+            for advantage, value in zip(episode_advantages, episode.old_values)
+        )
+    return {
+        "observations": observations,
+        "actions": actions,
+        "old_log_probabilities": torch.tensor(
+            old_log_probabilities, dtype=torch.float32
+        ),
+        "old_values": torch.tensor(old_values, dtype=torch.float32),
+        "advantages": torch.tensor(advantages, dtype=torch.float32),
+        "returns": torch.tensor(returns, dtype=torch.float32),
+    }
+
+
+@dataclass(frozen=True)
+class DynamicPPOConfig:
+    seed: int = 93_001
+    workers: int = 6
+    episodes_per_iteration: int = 18
+    iterations: int = 10
+    duration: float = DEFAULT_MATCH_DURATION
+    decision_interval: float = TACTICAL_INTERVAL
+    gamma: float = 0.995
+    gae_lambda: float = 0.95
+    clip_epsilon: float = 0.2
+    update_epochs: int = 4
+    minibatch_size: int = 64
+    learning_rate: float = 1.0e-4
+    entropy_coefficient: float = 0.01
+    value_coefficient: float = 0.5
+    max_gradient_norm: float = 0.5
+    target_kl: float = 0.02
+    validation_interval: int = 5
+    run_bias: float = 1.0
+
+
+class AdaptiveOpponentLeague:
+    """Small evidence-driven mixture: 25% uniform, 75% useful difficulty."""
+
+    def __init__(self) -> None:
+        names = sorted(LEAGUE_OPPONENTS)
+        self.names = tuple(names + ["fixed_mode_4"])
+        self.stats = {
+            name: {"games": 0, "points": 0.0, "wins": 0, "draws": 0, "losses": 0}
+            for name in self.names
+        }
+        rating_data = json.loads(
+            (ROOT / "leaderboard" / "ratings.json").read_text(encoding="utf-8")
+        )
+        rating_by_id = {
+            controller["controller_id"]: float(controller["rating"])
+            for controller in rating_data["controllers"]
+        }
+        aliases = {"potential": "potential_field", "greedy": "greedy_value"}
+        self.ratings = {
+            name: (
+                2000.0
+                if name == "fixed_mode_4"
+                else rating_by_id.get(aliases.get(name, name), 1500.0)
+            )
+            for name in self.names
+        }
+
+    def weights(self) -> dict[str, float]:
+        ratings = list(self.ratings.values())
+        rating_low, rating_high = min(ratings), max(ratings)
+        usefulness = {}
+        for name in self.names:
+            stats = self.stats[name]
+            if stats["games"]:
+                point_rate = stats["points"] / stats["games"]
+                learner_loss_rate = stats["losses"] / stats["games"]
+                near_parity = 1.0 - min(1.0, abs(point_rate - 0.5) * 2.0)
+            else:
+                learner_loss_rate = 0.5
+                near_parity = 1.0
+            strength = (self.ratings[name] - rating_low) / max(
+                1.0, rating_high - rating_low
+            )
+            hard_bonus = 0.5 if name in HARD_OPPONENTS or name == "fixed_mode_4" else 0.0
+            usefulness[name] = (
+                0.25
+                + 1.5 * learner_loss_rate
+                + near_parity
+                + 0.75 * strength
+                + hard_bonus
+            )
+        total = sum(usefulness.values())
+        uniform = 0.25 / len(self.names)
+        return {
+            name: uniform + 0.75 * usefulness[name] / total
+            for name in self.names
+        }
+
+    def sample(self, rng: random.Random) -> str:
+        weights = self.weights()
+        return rng.choices(self.names, [weights[name] for name in self.names], k=1)[0]
+
+    def record(self, episodes: list[DynamicEpisodeResult]) -> None:
+        for episode in episodes:
+            stats = self.stats[episode.opponent]
+            stats["games"] += 1
+            stats["points"] += 1.0 if episode.outcome > 0 else 0.5 if episode.outcome == 0 else 0.0
+            if episode.outcome > 0:
+                stats["wins"] += 1
+            elif episode.outcome < 0:
+                stats["losses"] += 1
+            else:
+                stats["draws"] += 1
+
+    def state_dict(self) -> dict[str, Any]:
+        return {"stats": self.stats}
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        for name, values in state.get("stats", {}).items():
+            if name in self.stats:
+                self.stats[name].update(values)
+
+
+def _explained_variance(predictions: torch.Tensor, targets: torch.Tensor) -> float:
+    variance = torch.var(targets, unbiased=False)
+    if float(variance) < 1.0e-12:
+        return 0.0
+    return float(
+        1.0 - torch.var(targets - predictions, unbiased=False) / variance
+    )
+
+
+def dynamic_ppo_update(
+    model: DynamicActorCritic,
+    optimizer: torch.optim.Optimizer,
+    batch: dict[str, Any],
+    config: DynamicPPOConfig,
+    generator: torch.Generator,
+) -> dict[str, float]:
+    advantages = batch["advantages"]
+    advantages = (
+        advantages - advantages.mean()
+    ) / (advantages.std(unbiased=False) + 1.0e-8)
+    count = len(advantages)
+    summaries = []
+    epochs_completed = 0
+    started = time.perf_counter()
+    for epoch in range(config.update_epochs):
+        permutation = torch.randperm(count, generator=generator)
+        epoch_kls = []
+        for start in range(0, count, config.minibatch_size):
+            indices = permutation[start : start + config.minibatch_size]
+            decisions = [
+                model.decide(
+                    batch["observations"][int(index)],
+                    stochastic=False,
+                    actions=batch["actions"][int(index)],
+                )
+                for index in indices
+            ]
+            new_log_probabilities = torch.stack(
+                [decision.log_probability for decision in decisions]
+            )
+            values = torch.stack([decision.value for decision in decisions])
+            entropies = torch.stack([decision.entropy for decision in decisions])
+            old_log_probabilities = batch["old_log_probabilities"][indices]
+            log_ratio = new_log_probabilities - old_log_probabilities
+            ratio = log_ratio.exp()
+            minibatch_advantages = advantages[indices]
+            unclipped = ratio * minibatch_advantages
+            clipped = torch.clamp(
+                ratio,
+                1.0 - config.clip_epsilon,
+                1.0 + config.clip_epsilon,
+            ) * minibatch_advantages
+            actor_loss = -torch.minimum(unclipped, clipped).mean()
+            critic_loss = 0.5 * (
+                values - batch["returns"][indices]
+            ).square().mean()
+            entropy = entropies.mean()
+            loss = (
+                actor_loss
+                + config.value_coefficient * critic_loss
+                - config.entropy_coefficient * entropy
+            )
+            optimizer.zero_grad()
+            loss.backward()
+            gradient_norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters(), config.max_gradient_norm
+            )
+            optimizer.step()
+            with torch.no_grad():
+                approximate_kl = ((ratio - 1.0) - log_ratio).mean()
+                clip_fraction = (
+                    (ratio - 1.0).abs() > config.clip_epsilon
+                ).float().mean()
+            kl = float(approximate_kl)
+            epoch_kls.append(kl)
+            summaries.append(
+                {
+                    "actor_loss": float(actor_loss.detach()),
+                    "critic_loss": float(critic_loss.detach()),
+                    "entropy": float(entropy.detach()),
+                    "total_loss": float(loss.detach()),
+                    "approximate_kl": kl,
+                    "clip_fraction": float(clip_fraction),
+                    "gradient_norm": float(gradient_norm),
+                }
+            )
+        epochs_completed = epoch + 1
+        if statistics.fmean(epoch_kls) > config.target_kl:
+            break
+    metrics = {
+        key: statistics.fmean(summary[key] for summary in summaries)
+        for key in summaries[0]
+    }
+    metrics.update(
+        {
+            "epochs_completed": epochs_completed,
+            "optimization_seconds": time.perf_counter() - started,
+            "explained_variance_before": _explained_variance(
+                batch["old_values"], batch["returns"]
+            ),
+        }
+    )
+    return metrics
+
+
+def summarize_dynamic_episodes(
+    episodes: list[DynamicEpisodeResult], elapsed: float | None = None
+) -> dict[str, Any]:
+    outcomes = [episode.outcome for episode in episodes]
+    differences = [episode.score_for - episode.score_against for episode in episodes]
+    role_counts = Counter()
+    event_counts = Counter()
+    for episode in episodes:
+        role_counts.update(episode.selected_role_counts)
+        event_counts.update(event["type"] for event in episode.events)
+    role_total = sum(role_counts.values())
+    transitions = sum(episode.transitions for episode in episodes)
+    inference = sum(episode.inference_seconds for episode in episodes)
+    summary = {
+        "matches": len(episodes),
+        "wins": sum(outcome > 0 for outcome in outcomes),
+        "draws": sum(outcome == 0 for outcome in outcomes),
+        "losses": sum(outcome < 0 for outcome in outcomes),
+        "match_points": sum(
+            1.0 if outcome > 0 else 0.5 if outcome == 0 else 0.0
+            for outcome in outcomes
+        ),
+        "mean_score_difference": statistics.fmean(differences),
+        "median_score_difference": statistics.median(differences),
+        "transitions": transitions,
+        "role_frequencies": {
+            role: role_counts[role] / max(1, role_total) for role in ROLE_NAMES
+        },
+        "duty_changes_per_match": statistics.fmean(
+            episode.duty_changes for episode in episodes
+        ),
+        "target_changes_per_match": statistics.fmean(
+            episode.target_changes for episode in episodes
+        ),
+        "command_differences_per_match": statistics.fmean(
+            episode.command_differences for episode in episodes
+        ),
+        "mean_inference_microseconds": 1.0e6 * inference / max(1, transitions),
+        "event_counts": dict(event_counts),
+        "by_opponent": {},
+        "by_side": {},
+    }
+    for opponent in sorted({episode.opponent for episode in episodes}):
+        subset = [episode for episode in episodes if episode.opponent == opponent]
+        summary["by_opponent"][opponent] = {
+            "wins": sum(episode.outcome > 0 for episode in subset),
+            "draws": sum(episode.outcome == 0 for episode in subset),
+            "losses": sum(episode.outcome < 0 for episode in subset),
+            "mean_score_difference": statistics.fmean(
+                episode.score_for - episode.score_against for episode in subset
+            ),
+        }
+    for side in ("A", "B"):
+        subset = [episode for episode in episodes if episode.side == side]
+        summary["by_side"][side] = {
+            "wins": sum(episode.outcome > 0 for episode in subset),
+            "draws": sum(episode.outcome == 0 for episode in subset),
+            "losses": sum(episode.outcome < 0 for episode in subset),
+            "mean_score_difference": statistics.fmean(
+                episode.score_for - episode.score_against for episode in subset
+            ),
+        }
+    if elapsed is not None:
+        summary["wall_seconds"] = elapsed
+        summary["matches_per_second"] = len(episodes) / elapsed
+        summary["decisions_per_second"] = transitions / elapsed
+    return summary
+
+
+DYNAMIC_VALIDATION_SEEDS = (93_100_019, 93_100_057)
+DYNAMIC_VALIDATION_OPPONENTS = HARD_OPPONENTS + ("fixed_mode_4",)
+
+
+def _dynamic_training_jobs(
+    config: DynamicPPOConfig,
+    model: DynamicActorCritic,
+    version: int,
+    rng: random.Random,
+    league: AdaptiveOpponentLeague,
+) -> list[DynamicRolloutJob]:
+    policy_state = _frozen_dynamic_state(model)
+    return [
+        DynamicRolloutJob(
+            seed=rng.randrange(10_000_000, 90_000_000),
+            side="A" if (index + version) % 2 == 0 else "B",
+            opponent=league.sample(rng),
+            policy_version=version,
+            policy_state=policy_state,
+            stochastic=True,
+            duration=config.duration,
+            decision_interval=config.decision_interval,
+        )
+        for index in range(config.episodes_per_iteration)
+    ]
+
+
+def _dynamic_validation_jobs(
+    model: DynamicActorCritic,
+    version: int,
+    duration: float,
+    *,
+    seeds: tuple[int, ...] = DYNAMIC_VALIDATION_SEEDS,
+    opponents: tuple[str, ...] = DYNAMIC_VALIDATION_OPPONENTS,
+    ablation: str = "full",
+    diagnostics: bool = True,
+) -> list[DynamicRolloutJob]:
+    policy_state = _frozen_dynamic_state(model)
+    return [
+        DynamicRolloutJob(
+            seed=seed,
+            side=side,
+            opponent=opponent,
+            policy_version=version,
+            policy_state=policy_state,
+            stochastic=False,
+            duration=duration,
+            ablation=ablation,
+            diagnostics=diagnostics,
+        )
+        for opponent in opponents
+        for seed in seeds
+        for side in ("A", "B")
+    ]
+
+
+def _atomic_dynamic_checkpoint(payload: dict[str, Any], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    torch.save(payload, temporary)
+    temporary.replace(path)
+
+
+def _dynamic_checkpoint_payload(
+    model,
+    optimizer,
+    config,
+    iteration,
+    total_matches,
+    total_decisions,
+    rng,
+    update_generator,
+    league,
+    best_validation,
+):
+    return {
+        "schema": "opus-rl-plan-dynamic-ppo-v1",
+        "model_state": model.state_dict(),
+        "optimizer_state": optimizer.state_dict(),
+        "config": asdict(config),
+        "iteration": iteration,
+        "total_matches": total_matches,
+        "total_decisions": total_decisions,
+        "python_rng_state": rng.getstate(),
+        "torch_rng_state": torch.get_rng_state(),
+        "update_generator_state": update_generator.get_state(),
+        "league": league.state_dict(),
+        "best_validation": best_validation,
+        "observation_normalization": "fixed_physical_scaling",
+    }
+
+
+def _append_json_line(path: Path, value: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(value, sort_keys=True) + "\n")
+
+
+def _validation_key(summary: dict[str, Any]) -> tuple[float, float]:
+    return float(summary["match_points"]), float(summary["mean_score_difference"])
+
+
+def train_dynamic_ppo(args) -> None:
+    config = DynamicPPOConfig(
+        seed=args.seed,
+        workers=args.workers,
+        episodes_per_iteration=args.episodes,
+        iterations=args.iterations,
+        duration=args.duration,
+        decision_interval=args.decision_interval,
+        gamma=args.gamma,
+        gae_lambda=args.gae_lambda,
+        clip_epsilon=args.clip,
+        update_epochs=args.epochs,
+        minibatch_size=args.minibatch,
+        learning_rate=args.learning_rate,
+        entropy_coefficient=args.entropy,
+        value_coefficient=args.value_coefficient,
+        max_gradient_norm=args.max_gradient_norm,
+        target_kl=args.target_kl,
+        validation_interval=args.validation_interval,
+        run_bias=args.run_bias,
+    )
+    torch.set_num_threads(1)
+    torch.manual_seed(config.seed)
+    model = DynamicActorCritic(config.run_bias)
+    optimizer = torch.optim.Adam(
+        model.parameters(), lr=config.learning_rate, eps=1.0e-5
+    )
+    rng = random.Random(config.seed)
+    update_generator = torch.Generator().manual_seed(config.seed + 1)
+    league = AdaptiveOpponentLeague()
+    start_iteration = total_matches = total_decisions = 0
+    best_validation = None
+    run_dir = EXPERIMENT_DIR / args.run_name
+    latest_path = run_dir / "latest.pt"
+    metrics_path = run_dir / "metrics.jsonl"
+    if args.resume:
+        checkpoint = torch.load(Path(args.resume), map_location="cpu", weights_only=False)
+        model.load_state_dict(checkpoint["model_state"])
+        optimizer.load_state_dict(checkpoint["optimizer_state"])
+        start_iteration = int(checkpoint["iteration"])
+        total_matches = int(checkpoint["total_matches"])
+        total_decisions = int(checkpoint["total_decisions"])
+        rng.setstate(checkpoint["python_rng_state"])
+        torch.set_rng_state(checkpoint["torch_rng_state"])
+        update_generator.set_state(checkpoint["update_generator_state"])
+        league.load_state_dict(checkpoint.get("league", {}))
+        best_validation = checkpoint.get("best_validation")
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "config.json").write_text(
+        json.dumps(asdict(config), indent=2, sort_keys=True), encoding="utf-8"
+    )
+    with ProcessPoolExecutor(max_workers=config.workers) as pool:
+        for iteration in range(start_iteration, config.iterations):
+            iteration_started = time.perf_counter()
+            sampling_weights = league.weights()
+            jobs = _dynamic_training_jobs(config, model, iteration, rng, league)
+            episodes, rollout_seconds = collect_dynamic_with_pool(pool, jobs)
+            if any(episode.policy_version != iteration for episode in episodes):
+                raise RuntimeError("stale factorized-policy trajectory detected")
+            league.record(episodes)
+            batch = dynamic_gae(episodes, config.gamma, config.gae_lambda)
+            ppo_metrics = dynamic_ppo_update(
+                model, optimizer, batch, config, update_generator
+            )
+            total_matches += len(episodes)
+            total_decisions += sum(episode.transitions for episode in episodes)
+            elapsed = time.perf_counter() - iteration_started
+            metric = {
+                "iteration": iteration + 1,
+                "policy_version": iteration,
+                "total_matches": total_matches,
+                "total_decisions": total_decisions,
+                "workers": config.workers,
+                "rollout_seconds": rollout_seconds,
+                "matches_per_second": len(episodes) / rollout_seconds,
+                "decisions_per_second": sum(episode.transitions for episode in episodes)
+                / rollout_seconds,
+                "collection_fraction": rollout_seconds / elapsed,
+                "optimization_fraction": ppo_metrics["optimization_seconds"] / elapsed,
+                "training": summarize_dynamic_episodes(episodes),
+                "ppo": ppo_metrics,
+                "league_weights": sampling_weights,
+                "league_stats": league.state_dict()["stats"],
+                "jobs": [
+                    {"seed": job.seed, "side": job.side, "opponent": job.opponent}
+                    for job in jobs
+                ],
+            }
+            if (
+                (iteration + 1) % config.validation_interval == 0
+                or iteration + 1 == config.iterations
+            ):
+                validation_episodes, validation_seconds = collect_dynamic_with_pool(
+                    pool,
+                    _dynamic_validation_jobs(
+                        model, iteration + 1, config.duration
+                    ),
+                )
+                validation = summarize_dynamic_episodes(
+                    validation_episodes, validation_seconds
+                )
+                metric["validation"] = validation
+                if best_validation is None or _validation_key(validation) > tuple(
+                    best_validation["key"]
+                ):
+                    best_validation = {
+                        "iteration": iteration + 1,
+                        "key": list(_validation_key(validation)),
+                        "summary": validation,
+                    }
+                    _atomic_dynamic_checkpoint(
+                        _dynamic_checkpoint_payload(
+                            model,
+                            optimizer,
+                            config,
+                            iteration + 1,
+                            total_matches,
+                            total_decisions,
+                            rng,
+                            update_generator,
+                            league,
+                            best_validation,
+                        ),
+                        run_dir / "best.pt",
+                    )
+                _atomic_dynamic_checkpoint(
+                    _dynamic_checkpoint_payload(
+                        model,
+                        optimizer,
+                        config,
+                        iteration + 1,
+                        total_matches,
+                        total_decisions,
+                        rng,
+                        update_generator,
+                        league,
+                        best_validation,
+                    ),
+                    run_dir / f"validation-{iteration + 1:04d}.pt",
+                )
+            checkpoint_started = time.perf_counter()
+            _atomic_dynamic_checkpoint(
+                _dynamic_checkpoint_payload(
+                    model,
+                    optimizer,
+                    config,
+                    iteration + 1,
+                    total_matches,
+                    total_decisions,
+                    rng,
+                    update_generator,
+                    league,
+                    best_validation,
+                ),
+                latest_path,
+            )
+            metric["checkpoint_seconds"] = time.perf_counter() - checkpoint_started
+            _append_json_line(metrics_path, metric)
+            compact = {
+                "iteration": iteration + 1,
+                "WDL": [
+                    metric["training"][key]
+                    for key in ("wins", "draws", "losses")
+                ],
+                "mps": round(metric["matches_per_second"], 3),
+                "dps": round(metric["decisions_per_second"], 2),
+                "entropy": round(ppo_metrics["entropy"], 3),
+                "kl": round(ppo_metrics["approximate_kl"], 5),
+                "validation": metric.get("validation", {}).get("match_points"),
+            }
+            print(json.dumps(compact, sort_keys=True), flush=True)
+
+
+def evaluate_dynamic_checkpoint(args) -> None:
+    checkpoint = torch.load(Path(args.checkpoint), map_location="cpu", weights_only=False)
+    model = DynamicActorCritic()
+    model.load_state_dict(checkpoint["model_state"])
+    jobs = _dynamic_validation_jobs(
+        model,
+        int(checkpoint["iteration"]),
+        args.duration,
+        seeds=tuple(args.seeds),
+        opponents=tuple(args.opponents),
+        ablation=args.ablation,
+        diagnostics=True,
+    )
+    episodes, elapsed = collect_dynamic_jobs(jobs, args.workers)
+    summary = summarize_dynamic_episodes(episodes, elapsed)
+    summary["checkpoint"] = args.checkpoint
+    summary["ablation"] = args.ablation
+    summary["failures"] = [
+        {
+            "seed": episode.seed,
+            "side": episode.side,
+            "opponent": episode.opponent,
+            "score": [episode.score_for, episode.score_against],
+            "score_timeline": episode.score_timeline,
+            "event_counts": dict(Counter(event["type"] for event in episode.events)),
+            "role_counts": episode.selected_role_counts,
+            "duty_changes": episode.duty_changes,
+            "target_changes": episode.target_changes,
+            "command_differences": episode.command_differences,
+            "tactical_records": episode.tactical_records,
+        }
+        for episode in episodes
+        if episode.outcome <= 0
+    ]
+    text = json.dumps(summary, indent=2, sort_keys=True)
+    if args.output:
+        path = Path(args.output)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    print(
+        json.dumps(
+            {
+                key: summary[key]
+                for key in (
+                    "wins",
+                    "draws",
+                    "losses",
+                    "match_points",
+                    "mean_score_difference",
+                    "duty_changes_per_match",
+                    "target_changes_per_match",
+                    "command_differences_per_match",
+                    "mean_inference_microseconds",
+                )
+            },
+            sort_keys=True,
+        )
+    )
+
+
 def _target_signature(mark: Any) -> tuple[Any, ...] | None:
     if mark is None:
         return None
@@ -600,6 +1649,48 @@ def instrument_command(args) -> None:
     )
 
 
+def benchmark_dynamic_workers(args) -> None:
+    torch.manual_seed(args.seed)
+    model = DynamicActorCritic()
+    state = _frozen_dynamic_state(model)
+    output = []
+    for workers in args.levels:
+        jobs = [
+            DynamicRolloutJob(
+                seed=args.seed + index,
+                side="A" if index % 2 == 0 else "B",
+                opponent=args.opponent,
+                policy_version=0,
+                policy_state=state,
+                stochastic=False,
+                duration=args.duration,
+            )
+            for index in range(args.matches)
+        ]
+        episodes, elapsed = collect_dynamic_jobs(jobs, workers)
+        row = {
+            "workers": workers,
+            "matches": len(episodes),
+            "duration": args.duration,
+            "wall_seconds": elapsed,
+            "matches_per_second": len(episodes) / elapsed,
+            "decisions_per_second": sum(
+                episode.transitions for episode in episodes
+            )
+            / elapsed,
+            "mean_inference_microseconds": 1.0e6
+            * sum(episode.inference_seconds for episode in episodes)
+            / max(1, sum(episode.transitions for episode in episodes)),
+            "controller_subprocesses": 0,
+        }
+        output.append(row)
+        print(json.dumps(row, sort_keys=True), flush=True)
+    if args.output:
+        path = Path(args.output)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(output, indent=2), encoding="utf-8")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -611,6 +1702,53 @@ def build_parser() -> argparse.ArgumentParser:
     instrument.add_argument("--duration", type=float, default=DEFAULT_MATCH_DURATION)
     instrument.add_argument("--output")
     instrument.set_defaults(function=instrument_command)
+
+    benchmark = subparsers.add_parser("benchmark")
+    benchmark.add_argument("--levels", nargs="+", type=int, default=[1, 2, 4, 6, 8, 12])
+    benchmark.add_argument("--matches", type=int, default=12)
+    benchmark.add_argument("--duration", type=float, default=30.0)
+    benchmark.add_argument("--opponent", choices=tuple(sorted(LEAGUE_OPPONENTS)), default="renj1ete0/opus_5_v1")
+    benchmark.add_argument("--seed", type=int, default=93_000_001)
+    benchmark.add_argument("--output")
+    benchmark.set_defaults(function=benchmark_dynamic_workers)
+
+    train = subparsers.add_parser("train")
+    train.add_argument("--run-name", required=True)
+    train.add_argument("--seed", type=int, default=DynamicPPOConfig.seed)
+    train.add_argument("--workers", type=int, default=DynamicPPOConfig.workers)
+    train.add_argument("--episodes", type=int, default=DynamicPPOConfig.episodes_per_iteration)
+    train.add_argument("--iterations", type=int, default=DynamicPPOConfig.iterations)
+    train.add_argument("--duration", type=float, default=DynamicPPOConfig.duration)
+    train.add_argument("--decision-interval", type=float, default=DynamicPPOConfig.decision_interval)
+    train.add_argument("--gamma", type=float, default=DynamicPPOConfig.gamma)
+    train.add_argument("--gae-lambda", type=float, default=DynamicPPOConfig.gae_lambda)
+    train.add_argument("--clip", type=float, default=DynamicPPOConfig.clip_epsilon)
+    train.add_argument("--epochs", type=int, default=DynamicPPOConfig.update_epochs)
+    train.add_argument("--minibatch", type=int, default=DynamicPPOConfig.minibatch_size)
+    train.add_argument("--learning-rate", type=float, default=DynamicPPOConfig.learning_rate)
+    train.add_argument("--entropy", type=float, default=DynamicPPOConfig.entropy_coefficient)
+    train.add_argument("--value-coefficient", type=float, default=DynamicPPOConfig.value_coefficient)
+    train.add_argument("--max-gradient-norm", type=float, default=DynamicPPOConfig.max_gradient_norm)
+    train.add_argument("--target-kl", type=float, default=DynamicPPOConfig.target_kl)
+    train.add_argument("--validation-interval", type=int, default=DynamicPPOConfig.validation_interval)
+    train.add_argument("--run-bias", type=float, default=DynamicPPOConfig.run_bias)
+    train.add_argument("--resume")
+    train.set_defaults(function=train_dynamic_ppo)
+
+    evaluate = subparsers.add_parser("evaluate")
+    evaluate.add_argument("--checkpoint", required=True)
+    evaluate.add_argument("--workers", type=int, default=DynamicPPOConfig.workers)
+    evaluate.add_argument("--duration", type=float, default=DEFAULT_MATCH_DURATION)
+    evaluate.add_argument("--seeds", nargs="+", type=int, required=True)
+    evaluate.add_argument(
+        "--opponents",
+        nargs="+",
+        choices=tuple(sorted((*LEAGUE_OPPONENTS, "fixed_mode_4"))),
+        required=True,
+    )
+    evaluate.add_argument("--ablation", choices=("full", "freeze_start"), default="full")
+    evaluate.add_argument("--output")
+    evaluate.set_defaults(function=evaluate_dynamic_checkpoint)
     return parser
 
 

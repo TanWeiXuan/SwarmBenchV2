@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from swarmbench import DroneType
+import pytest
 import torch
+
+from swarmbench import DroneType
 
 from experiments.opus_rl_plan_dynamic import (
     ENTITY_FEATURES,
@@ -12,6 +14,7 @@ from experiments.opus_rl_plan_dynamic import (
     PAIR_FEATURES,
     ROLE_COUNT,
     TACTICAL_RUN,
+    AdaptiveOpponentLeague,
     CandidateObservation,
     DynamicActorCritic,
     ScoutObservation,
@@ -90,3 +93,20 @@ def test_autoregressive_mask_prevents_duplicate_target_assignment() -> None:
     assert decision.actions[0].target_index == 0
     assert decision.actions[1].role == TACTICAL_RUN
     assert decision.factor_count == 3
+    replay = model.decide(
+        _observation(scouts=2, candidate=True),
+        stochastic=False,
+        actions=decision.actions,
+    )
+    assert torch.allclose(replay.log_probability, decision.log_probability)
+
+
+def test_adaptive_league_is_normalized_and_contains_current_hard_field() -> None:
+    league = AdaptiveOpponentLeague()
+    weights = league.weights()
+    assert sum(weights.values()) == pytest.approx(1.0)
+    assert "renj1ete0/opus_5_v1" in weights
+    assert "renj1ete0/GPT-5.3-Codex" in weights
+    assert "renj1ete0/gemini_3_1_pro_v1" in weights
+    assert "renj1ete0/sonnet_5_v3" in weights
+    assert "fixed_mode_4" in weights
