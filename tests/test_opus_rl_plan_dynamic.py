@@ -110,6 +110,7 @@ def test_dynamic_actor_is_small_and_set_context_is_permutation_invariant() -> No
 
 def test_autoregressive_mask_prevents_duplicate_target_assignment() -> None:
     model = DynamicActorCritic(run_bias=0.0)
+    model.policy_temperature = 2.0
     with torch.no_grad():
         model.role_head[-1].weight.zero_()
         model.role_head[-1].bias.zero_()
@@ -170,6 +171,44 @@ def test_weighted_imitation_loss_emphasizes_guard_roles() -> None:
     ) / 31.0
     # A single available target has zero target NLL, so this isolates role weighting.
     assert loss.item() == pytest.approx(expected_role_loss.item(), abs=1.0e-6)
+
+
+def test_old_target_ablation_uses_deterministic_intercept_ranking() -> None:
+    model = DynamicActorCritic(run_bias=0.0)
+    with torch.no_grad():
+        model.role_head[-1].weight.zero_()
+        model.role_head[-1].bias.zero_()
+        model.role_head[-1].bias[HUNT_TRANSPORT] = 10.0
+    observation = _observation(scouts=1, candidate=True)
+    scout = observation.scouts[0]
+    far_features = [0.0] * PAIR_FEATURES
+    far_features[25] = 0.8
+    near_features = [0.0] * PAIR_FEATURES
+    near_features[25] = 0.2
+    candidates = list(scout.candidates)
+    candidates[HUNT_TRANSPORT] = (
+        CandidateObservation(("DRONE", 11), tuple(far_features)),
+        CandidateObservation(("DRONE", 12), tuple(near_features)),
+    )
+    ranked_observation = TacticalObservation(
+        observation.global_features,
+        observation.own_entities,
+        observation.foe_entities,
+        (
+            ScoutObservation(
+                scout.entity,
+                scout.previous_role,
+                scout.role_duration,
+                scout.base_role_mask,
+                tuple(candidates),
+            ),
+        ),
+    )
+    decision = model.decide(
+        ranked_observation, stochastic=False, target_mode="old_ranking"
+    )
+    assert decision.actions == (ScoutAction(HUNT_TRANSPORT, 1),)
+    assert decision.factor_count == 1
 
 
 def test_adaptive_league_is_normalized_and_contains_current_hard_field() -> None:

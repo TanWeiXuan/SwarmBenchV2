@@ -122,6 +122,7 @@ class DynamicActorCritic(nn.Module):
 
     def __init__(self, run_bias: float = 1.0) -> None:
         super().__init__()
+        self.policy_temperature = 1.0
         self.entity_encoder = nn.Sequential(
             nn.Linear(ENTITY_FEATURES, 24),
             nn.Tanh(),
@@ -334,7 +335,7 @@ class DynamicActorCritic(nn.Module):
                 ),
                 dim=1,
             )
-            role_logits = self.role_head(role_input).masked_fill(
+            role_logits = (self.role_head(role_input) / self.policy_temperature).masked_fill(
                 ~torch.tensor(role_masks, dtype=torch.bool, device=self.device),
                 -1.0e9,
             )
@@ -391,9 +392,10 @@ class DynamicActorCritic(nn.Module):
                     (observation_index, start, len(packed_targets), chosen_local)
                 )
             if packed_targets:
-                packed_logits = self.target_head(
-                    torch.stack(packed_targets)
-                ).squeeze(-1)
+                packed_logits = (
+                    self.target_head(torch.stack(packed_targets)).squeeze(-1)
+                    / self.policy_temperature
+                )
                 target_log_probabilities = []
                 target_entropies = []
                 target_observation_indices = []
@@ -447,7 +449,10 @@ class DynamicActorCritic(nn.Module):
         stochastic: bool,
         generator: torch.Generator | None = None,
         actions: tuple[ScoutAction, ...] | None = None,
+        target_mode: str = "learned",
     ) -> PolicyDecision:
+        if target_mode not in {"learned", "old_ranking"}:
+            raise ValueError(f"unsupported target mode: {target_mode}")
         """Sample or re-evaluate one full autoregressive swarm assignment."""
         if actions is not None and len(actions) != len(observation.scouts):
             raise ValueError("recorded action count does not match live scouts")
@@ -472,7 +477,7 @@ class DynamicActorCritic(nn.Module):
             role_input = torch.cat(
                 (context, scout_entity, previous_role, duration, assigned_counts / scout_total)
             )
-            role_logits = self.role_head(role_input)
+            role_logits = self.role_head(role_input) / self.policy_temperature
             available_by_role: dict[int, list[int]] = {}
             role_mask = list(scout.base_role_mask)
             for role in (HUNT_TRANSPORT, HUNT_TANK, GUARD_TRANSPORT, TACTICAL_BLOCK):
@@ -503,6 +508,18 @@ class DynamicActorCritic(nn.Module):
             target_index = -1
             if role in available_by_role:
                 available = available_by_role[role]
+                if target_mode == "old_ranking" and actions is None:
+                    target_index = min(
+                        available,
+                        key=lambda index: (
+                            scout.candidates[role][index].features[25],
+                            scout.candidates[role][index].key,
+                        ),
+                    )
+                    used_targets.add(scout.candidates[role][target_index].key)
+                    chosen.append(ScoutAction(role, target_index))
+                    assigned_counts[role] += 1.0
+                    continue
                 target_inputs = []
                 for index in available:
                     pair = torch.tensor(
@@ -511,7 +528,10 @@ class DynamicActorCritic(nn.Module):
                         device=self.device,
                     )
                     target_inputs.append(torch.cat((context, scout_entity, pair)))
-                target_logits = self.target_head(torch.stack(target_inputs)).squeeze(-1)
+                target_logits = (
+                    self.target_head(torch.stack(target_inputs)).squeeze(-1)
+                    / self.policy_temperature
+                )
                 target_distribution = torch.distributions.Categorical(logits=target_logits)
                 if actions is not None:
                     target_index = actions[scout_index].target_index
@@ -788,7 +808,7 @@ def _dynamic_controller(
     ablation: str = "full",
 ):
     """Inject learned scout duties while retaining every deterministic skill."""
-    if ablation not in {"full", "freeze_start"}:
+    if ablation not in {"full", "freeze_start", "old_targets", "static_run"}:
         raise ValueError(f"unsupported dynamic ablation: {ablation}")
 
     class DynamicController(base_type):
@@ -810,11 +830,26 @@ def _dynamic_controller(
                 )
                 started = time.perf_counter()
                 with torch.no_grad():
-                    decision = model.decide(
-                        observation,
-                        stochastic=stochastic,
-                        generator=generator,
-                    )
+                    if ablation == "static_run":
+                        actions = tuple(
+                            ScoutAction(TACTICAL_RUN) for _scout in scouts
+                        )
+                        decision = model.decide(
+                            observation,
+                            stochastic=False,
+                            actions=actions,
+                        )
+                    else:
+                        decision = model.decide(
+                            observation,
+                            stochastic=stochastic,
+                            generator=generator,
+                            target_mode=(
+                                "old_ranking"
+                                if ablation == "old_targets"
+                                else "learned"
+                            ),
+                        )
                 self.dynamic_inference_seconds += time.perf_counter() - started
                 updated = update_assignments(
                     state,
@@ -1028,6 +1063,7 @@ class DynamicRolloutJob:
     reward_kind: str = "terminal"
     ablation: str = "full"
     diagnostics: bool = False
+    policy_temperature: float = 1.0
 
 
 @dataclass
@@ -1075,6 +1111,7 @@ def run_dynamic_rollout_job(job: DynamicRolloutJob) -> DynamicEpisodeResult:
     torch.manual_seed(job.seed % (2**31))
     model = DynamicActorCritic()
     model.load_state_dict(job.policy_state)
+    model.policy_temperature = job.policy_temperature
     model.eval()
     generator = torch.Generator().manual_seed(
         (job.seed * 6364136223846793005 + job.policy_version * 1447 + ord(job.side))
@@ -1323,6 +1360,7 @@ class DynamicPPOConfig:
     validation_interval: int = 5
     run_bias: float = 1.0
     reward_kind: str = "terminal"
+    policy_temperature: float = 1.0
 
 
 class AdaptiveOpponentLeague:
@@ -1604,6 +1642,7 @@ def _dynamic_training_jobs(
             duration=config.duration,
             decision_interval=config.decision_interval,
             reward_kind=config.reward_kind,
+            policy_temperature=config.policy_temperature,
         )
         for index in range(config.episodes_per_iteration)
     ]
@@ -1687,6 +1726,8 @@ def _validation_key(summary: dict[str, Any]) -> tuple[float, float]:
 
 
 def train_dynamic_ppo(args) -> None:
+    if args.policy_temperature <= 0.0:
+        raise ValueError("--policy-temperature must be positive")
     config = DynamicPPOConfig(
         seed=args.seed,
         workers=args.workers,
@@ -1707,10 +1748,12 @@ def train_dynamic_ppo(args) -> None:
         validation_interval=args.validation_interval,
         run_bias=args.run_bias,
         reward_kind=args.reward,
+        policy_temperature=args.policy_temperature,
     )
     torch.set_num_threads(1)
     torch.manual_seed(config.seed)
     model = DynamicActorCritic(config.run_bias)
+    model.policy_temperature = config.policy_temperature
     if args.initialize and args.resume:
         raise ValueError("--initialize and --resume are mutually exclusive")
     if args.initialize:
@@ -2348,6 +2391,12 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--validation-interval", type=int, default=DynamicPPOConfig.validation_interval)
     train.add_argument("--run-bias", type=float, default=DynamicPPOConfig.run_bias)
     train.add_argument(
+        "--policy-temperature",
+        type=float,
+        default=DynamicPPOConfig.policy_temperature,
+        help="training-only role/target sampling temperature; evaluation stays greedy",
+    )
+    train.add_argument(
         "--reward",
         choices=("terminal", "score_potential"),
         default=DynamicPPOConfig.reward_kind,
@@ -2384,7 +2433,11 @@ def build_parser() -> argparse.ArgumentParser:
         choices=tuple(sorted((*LEAGUE_OPPONENTS, "fixed_mode_4"))),
         required=True,
     )
-    evaluate.add_argument("--ablation", choices=("full", "freeze_start"), default="full")
+    evaluate.add_argument(
+        "--ablation",
+        choices=("full", "freeze_start", "old_targets", "static_run"),
+        default="full",
+    )
     evaluate.add_argument("--output")
     evaluate.set_defaults(function=evaluate_dynamic_checkpoint)
     return parser
