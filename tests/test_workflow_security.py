@@ -119,6 +119,22 @@ def test_bot_publishers_use_github_app_token() -> None:
         assert "gh workflow run submission-validation.yml" not in text
 
 
+def test_rating_publishers_share_lock_until_their_pr_merges() -> None:
+    tournament_final = workflow("tournament.yml").split("  final:", 1)[1]
+    accepted = workflow("submission-accepted.yml").split("  initialize-rating:", 1)[1]
+    for publisher in (tournament_final, accepted):
+        assert "group: swarmbench-rating-publication" in publisher
+        assert "cancel-in-progress: false" in publisher
+        assert 'gh pr merge "$url" --auto --squash' in publisher
+        assert 'bash .github/scripts/wait-for-pr-merge.sh "$url"' in publisher
+
+    waiter = (ROOT / ".github" / "scripts" / "wait-for-pr-merge.sh").read_text(encoding="utf-8")
+    assert "mergeStateStatus" in waiter
+    assert "MERGED)" in waiter
+    assert '[[ "$merge_state" == "DIRTY" ]]' in waiter
+    assert "Timed out waiting" in waiter
+
+
 def test_submission_jobs_install_validation_dependencies() -> None:
     installs = [line for line in workflow("submission-validation.yml").splitlines() if "pip install -e" in line]
     assert installs

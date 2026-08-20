@@ -92,6 +92,23 @@ def validate_plan(data: Any) -> tuple[TournamentPlan, dict[str, RatingRecord]]:
     return plan, records
 
 
+def reconcile_tournament_ratings(
+    planned: dict[str, RatingRecord],
+    tournament_after: dict[str, RatingRecord],
+    current: dict[str, RatingRecord],
+) -> dict[str, RatingRecord]:
+    """Merge a deterministic tournament result into the latest rating state."""
+
+    if set(tournament_after) != set(planned):
+        raise ValueError("tournament rating result does not match the planned controllers")
+    merged = dict(current)
+    for controller_id, planned_record in planned.items():
+        if current.get(controller_id) != planned_record:
+            raise ValueError(f"rating state changed during tournament: {controller_id}")
+        merged[controller_id] = tournament_after[controller_id]
+    return merged
+
+
 def controller_paths(records: dict[str, RatingRecord], root: Path) -> dict[str, Path]:
     paths = {}
     for controller_id, record in records.items():
@@ -507,8 +524,9 @@ def main(argv: list[str] | None = None) -> int:
         outcome = aggregate_batches(plan, _load_batches(args.batches), records)
         report_body = final_report(data, outcome)
         if plan.mode == "official":
-            save_ratings(outcome.ratings_after, args.ratings)
-            update_readme_leaderboard(args.readme, outcome.ratings_after)
+            published_ratings = reconcile_tournament_ratings(records, outcome.ratings_after, load_ratings(args.ratings))
+            save_ratings(published_ratings, args.ratings)
+            update_readme_leaderboard(args.readme, published_ratings)
         args.output.write_text(
             json.dumps(
                 {

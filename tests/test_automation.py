@@ -1,11 +1,19 @@
 import json
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from swarmbench.competition import automation
-from swarmbench.competition.automation import live_report, prepare_plan, progress_summary, resolve_seed, validate_plan
+from swarmbench.competition.automation import (
+    live_report,
+    prepare_plan,
+    progress_summary,
+    reconcile_tournament_ratings,
+    resolve_seed,
+    validate_plan,
+)
 from swarmbench.competition.publisher import leaderboard_markdown, update_readme_leaderboard
 from swarmbench.competition.ratings import RatingRecord
 from swarmbench.version import ENGINE_VERSION, TOURNAMENT_FORMAT_VERSION
@@ -90,6 +98,40 @@ def test_plan_tampering_is_rejected() -> None:
     data["engine_version"] = "tampered"
     with pytest.raises(ValueError):
         validate_plan(data)
+
+
+def test_tournament_rating_reconciliation_preserves_later_controllers() -> None:
+    planned = records()
+    tournament_after = {
+        controller_id: replace(record, rating=record.rating + 25, games=8, wins=5, draws=1, losses=2)
+        for controller_id, record in planned.items()
+    }
+    later = RatingRecord("bob/new", "New", "bob", rating=1777, version_sha="a" * 40)
+    current = {**planned, later.controller_id: later}
+
+    merged = reconcile_tournament_ratings(planned, tournament_after, current)
+
+    assert merged == {**tournament_after, later.controller_id: later}
+    assert current == {**planned, later.controller_id: later}
+
+
+def test_tournament_rating_reconciliation_rejects_changed_participant() -> None:
+    planned = records()
+    tournament_after = dict(planned)
+    current = dict(planned)
+    current["c0"] = replace(current["c0"], rating=current["c0"].rating + 1)
+
+    with pytest.raises(ValueError, match="rating state changed during tournament: c0"):
+        reconcile_tournament_ratings(planned, tournament_after, current)
+
+
+def test_tournament_rating_reconciliation_rejects_wrong_result_set() -> None:
+    planned = records()
+    tournament_after = dict(planned)
+    tournament_after.pop("c0")
+
+    with pytest.raises(ValueError, match="does not match the planned controllers"):
+        reconcile_tournament_ratings(planned, tournament_after, planned)
 
 
 def test_progress_summary_validates_each_completed_batch() -> None:

@@ -22,6 +22,9 @@ jobs:
   initialize-rating:
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.pull_request.merged == true }}
     runs-on: ubuntu-latest
+    concurrency:
+      group: swarmbench-rating-publication
+      cancel-in-progress: false
     env:
       PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
       HEAD_SHA: ${{ github.event.pull_request.head.sha || inputs.head_sha }}
@@ -70,3 +73,4 @@ jobs:
           git push --set-upstream origin "bot/rating-$PR_NUMBER"
           url=$(gh pr create --title "Initialize accepted controller rating" --body "Validated current-state update for submission PR #$PR_NUMBER." --base main --head "bot/rating-$PR_NUMBER")
           gh pr merge "$url" --auto --squash
+          bash .github/scripts/wait-for-pr-merge.sh "$url"
