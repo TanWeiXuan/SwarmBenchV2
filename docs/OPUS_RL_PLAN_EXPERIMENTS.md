@@ -3,8 +3,10 @@
 This is the continuation record for the learned high-level planner. The
 competition controller retains Opus/Opus Breaker's deterministic path planning,
 safety, movement, interception, collision/projectile avoidance, assignment, and
-gunnery. Learning selects only one of six safe scout-allocation profiles every
-two simulated seconds.
+gunnery. Experiments 1-2 selected one of six allocation profiles. Experiment 3
+instead evaluates effective per-scout role/target alternatives once per second;
+the retained controller may commit one scout to a learned tactical override for
+five seconds while all low-level control remains deterministic.
 
 ## Observation, actions, and variable swarm size
 
@@ -29,6 +31,18 @@ The six actions are tuples of `transport_hunters`, `gun_hunters`, `keepers`,
 `guard_cap`, and `block_cap`. They do not identify individual drones or issue
 movement commands. Existing deterministic scoring and conflict resolution pick
 the actual scouts and targets.
+
+Experiment 3 keeps the same 38 globals and adds variable-set/per-candidate
+features. The expanded PPO actor's Deep Sets encoder sees every currently live
+friendly and enemy drone through a shared 14-to-24 MLP and mean pooling. The
+final tactical value model uses 38 globals + 14 features for one live scout +
+32 role/pair features
++ previous-role one-hot (6) + role duration (1) = 91 inputs. Set length is not
+part of the network shape: a different sampled drone count only changes the
+mean and count/survival globals. Death or scoring removes the entity and any
+target candidates on the next control step. Overrides are cancelled if their
+scout or target disappears. Zero live scouts yields no candidates and no
+learned action, which is an ordinary valid state.
 
 ## Experiment 1: retrospective profile classification
 
@@ -171,8 +185,9 @@ scoring, recurrence, and end-to-end control remain unjustified.
 Experiment 3 replaces the six-profile action with effective per-scout duties.
 It preserves the shipped controller and all Experiment 1/2 evidence; the
 research implementation is `experiments/opus_rl_plan_dynamic.py`. No
-Experiment 3 actor was exported into the submission because no checkpoint met
-the acceptance criteria below.
+Experiment 3 PPO actor was exported because no PPO checkpoint met the
+acceptance criteria below. The later accepted counterfactual value MLP is
+exported separately as described in Experiment 3f.
 
 ### Representation and action
 
@@ -338,7 +353,8 @@ On the identical 100 Opus games, freeze/all-RUN scored 45.0 points, old targets
 the Opus matchup on the larger schedule. The earlier 12-8 screen was sampling
 noise.
 
-Experiment 3 therefore does **not** satisfy the controller acceptance criteria.
+This factorized-PPO phase of Experiment 3 therefore does **not** satisfy the
+controller acceptance criteria.
 It proves that the variable-set/factorized implementation can learn and execute
 state-dependent assignments, and one checkpoint beats Breaker and fixed mode 4
 with useful dynamic/target ablations. It does not convincingly beat Opus, and
@@ -444,3 +460,159 @@ calibration by stratum. A temporal commitment-aware label or explicit source
 fallback target is more promising than another actor fine-tune. Increasing
 network size, loosening thresholds, or learning additional roles is not
 supported by these results.
+
+### Experiment 3d: commitment-aligned cross-role counterfactual values
+
+The guard-only gate was first made temporally consistent with its labels by
+holding an override for the same five seconds used in the counterfactual
+branch. It improved a 60-game calibration from 28.0 to 30.0 points, but fell
+from 30.5 to 27.0 on the untouched holdout. A third fixed-mode/time-stratified
+guard dataset contained only 9 decisive states among 33 found opportunities;
+three fits were unstable and one collapsed to 22/60. The guard-only hypothesis
+was rejected again.
+
+The brancher was then generalized. At each sampled opportunity it deep-copies
+the authoritative simulator and both stateful controllers and rolls feasible
+`RUN`, `KEEP`, `HUNT_TRANSPORT`, `HUNT_TANK`, `GUARD_TRANSPORT`, and `BLOCK`
+alternatives to the real match end. It chooses one scout with the richest
+feasible action set, holds the alternative for five seconds, then returns
+control to the policy. Outcomes are ranked lexicographically by W/D/L and score
+differential. This is approximate policy iteration/value distillation, not PPO;
+that distinction is intentional and preserves the negative PPO conclusion.
+
+Two datasets produced 140 informative listwise examples:
+
+| Dataset | Jobs | States found | Decisive | Mean branch time | Mean score spread |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Tactical 1 | 90 | 54 | 35 | 9.44 s | 7.20 |
+| Tactical 2 | 120 | 112 | 77 | 6.58 s | 7.75 |
+
+The examples were balanced across sides and included 54 Opus, 56 Breaker, and
+30 fixed-mode states. Counting tied preferred alternatives, the labels covered
+RUN 51, HUNT_TRANSPORT 46, HUNT_TANK 48, KEEP 15, GUARD 12, and BLOCK 4. The
+small 91-48-48-1 tanh network has 6,817 parameters and is trained with a
+listwise softmax loss over alternatives from the same copied state. A
+seed-modulus split prevents branches from one arena leaking across train and
+validation. The source action remains authoritative unless the best learned
+alternative has at least 0.40 softmax confidence; only one global override may
+be active, and it is committed for five seconds.
+
+Three initialization seeds were screened on the same 60-game hard set. Seed 1
+scored 36.5/60, seed 2 28.5/60, and seed 3 34.0/60, versus 28.0 for the source.
+On a separate 60-game holdout seeds 1 and 3 scored 34.0 and 33.5, versus 30.5.
+This was the first effect that replicated across fits and held-out arenas;
+seed 1 was retained before any final-test schedule was run.
+
+### Experiment 3e: causal ablations and rejected learned targeting expansion
+
+On 30 new paired seeds, both sides, against Opus, Breaker, and fixed mode 4:
+
+| Policy (180 games) | W-D-L | Points | Mean diff |
+| --- | ---: | ---: | ---: |
+| Untouched 28k PPO actor | 78-34-68 | 95.0 | +0.956 |
+| Freeze first learned assignment | 95-18-67 | 104.0 | +1.906 |
+| Dynamic PPO actor + tactical value | 101-13-66 | 107.5 | +2.872 |
+| **Static all-RUN + tactical value** | **102-15-63** | **109.5** | **+3.022** |
+
+The value gate is therefore consequential, but the expanded PPO actor is not:
+replacing it with deterministic all-RUN improved the total and reduced duty
+changes from 10.27 to 6.80 per match. The final controller deliberately omits
+the 28,432-parameter PPO actor and deploys only the 6,817-parameter value MLP.
+This is a stronger YAGNI result than retaining an unnecessary larger model.
+
+The first version scores one candidate per role: the top target under the
+existing deterministic pair ranking. To test whether that hid target value, a
+third dataset exposed two targets per role. It found 55/60 states, 38 decisive,
+and 50 informative listwise examples; in 19 states a non-first target was
+preferred. Three models were trained on all 190 examples. The best screens
+were 34.0/60 (seed 3) and 31.5/60 (seed 2), below the retained one-target
+model's 36.5/60. The learned two-target extension was rejected. Thus the final
+network learns *when and which role* but still uses deterministic top-target
+ranking inside that role. Learned target selection remains a measured
+limitation, not an unimplemented assumption.
+
+The accepted policy is genuinely state-dependent but sparse. In the final
+500-game Opus gate its decision frequencies were RUN 95.998%, HUNT_TANK
+1.808%, HUNT_TRANSPORT 1.484%, KEEP 0.549%, GUARD 0.135%, and BLOCK 0.025%.
+Those overrides alter actual duties/commands and automatically disappear when
+a drone dies, scores, or loses its target.
+
+### Experiment 3f: final held-out evaluation
+
+All final schedules used seeds excluded from collection, calibration, model
+selection, and PPO. Every seed was run on both sides. Match point is 1 for a
+win and 0.5 for a draw; confidence intervals are normal 95% intervals over the
+paired two-side result for each seed, rather than treating the two mirrored
+games as independent.
+
+The decisive Opus schedule used 250 new seeds (500 games):
+
+| Opponent | W-D-L | Points / games | Rate | Mean diff | Paired-seed 95% CI |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Opus 5 V1 | **301-49-150** | **325.5/500** | **65.1%** | **+3.172** | **59.88%-70.32%** |
+
+Side A was 152-24-74 and side B 149-25-76. This clears the predeclared
+requirement that the direct Opus match-point interval exclude 50%.
+
+Two additional 250-paired-seed gates tested the strongest remaining counter
+and the fixed Experiment 2 baseline:
+
+| Opponent | W-D-L | Points / games | Rate | Mean diff | Paired-seed 95% CI |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Gemini 3.1 Pro | 245-37-218 | 263.5/500 | 52.7% | +0.716 | 47.16%-58.24% |
+| Fixed mode 4 | 222-84-194 | 264.0/500 | 52.8% | +0.580 | 47.59%-58.01% |
+
+Both point estimates beat parity, but both intervals cross it. The honest
+conclusion is “competitive/slightly ahead,” not a statistically convincing
+advantage. Gemini is the primary remaining counter; more data or a new causal
+hypothesis is required before claiming superiority over it.
+
+The broad current-field gate used 20 separate paired seeds against every 15
+valid community submissions (600 games). The final static-RUN/value policy
+scored **509-35-56, 526.5/600 (87.75%), mean differential +14.272**. Results
+against the five strongest/relevant opponents were:
+
+| Opponent | W-D-L | Points / 40 | Rate |
+| --- | ---: | ---: | ---: |
+| Gemini 3.1 Pro | 19-5-16 | 21.5 | 53.75% |
+| GPT-5.3-Codex | 21-9-10 | 25.5 | 63.75% |
+| Opus 5 V1 | 21-9-10 | 25.5 | 63.75% |
+| Sonnet 5 V3 | 26-4-10 | 28.0 | 70.0% |
+| Opus Breaker | 27-6-7 | 30.0 | 75.0% |
+
+It was above parity against every current submission and scored at least
+39/40 against eight of the remaining ten. This broad gate is supportive but
+only the larger direct schedules should be used for tight claims.
+
+### Deployment and verification
+
+The retained checkpoint is the seed-1 combined-data model with confidence
+0.40, one candidate per role, and five-second commitment. Deployment exports
+6,817 float32 weights as zlib-compressed Base85 and evaluates the two 48-unit
+tanh layers with plain Python. The critic, optimizer, PyTorch, counterfactual
+artifacts, and training code are not required by the submitted controller.
+
+On 100 random 91-vectors, exported inference differed from PyTorch by at most
+`8.39e-7`. Eight complete matches across two seeds, Opus/Breaker, and both sides
+had exactly identical final scores between the research and exported
+controllers. Repository source validation and the empty-arena smoke test found
+zero exceptions, invalid actions, missed updates, or hard timeouts. Smoke-test
+mean controller time was 0.55 ms and maximum 7.06 ms; research-match learned
+inference averaged about 2.33 ms.
+
+### Final conclusion and next experiment
+
+Experiment 3 succeeds at the central question: a tiny learned high-level value
+policy makes sparse, consequential tactical reallocations and establishes a
+statistically convincing advantage over Opus while remaining strong across the
+complete current field. It does **not** prove dynamic PPO was useful: both the
+coarse Experiment 2 actor and the larger factorized PPO actor were dispensable.
+The successful method was simulator counterfactual value distillation with a
+conservative source fallback.
+
+The clearest next experiment is not a larger network. Collect substantially
+more Gemini/fixed-mode counterfactual states, stratified by time and tactical
+pressure, while keeping the current model and one-override safety envelope.
+Only reconsider learned target ranking after a larger two-target dataset shows
+a held-out gain. Recurrence, attention, graph networks, and end-to-end control
+remain unsupported.
