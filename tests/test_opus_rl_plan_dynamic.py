@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import asdict
 from types import SimpleNamespace
 
 import pytest
@@ -26,6 +27,8 @@ from experiments.opus_rl_plan_dynamic import (
     SUBJECT_PATH,
     _mode4_teacher_controller,
     _target_signature,
+    apply_assignment_overrides,
+    decisive_counterfactual_examples,
     dynamic_rewards,
     run_instrumented_match,
 )
@@ -119,6 +122,61 @@ def test_empty_live_scout_set_has_value_but_no_imitation_factor() -> None:
     assert torch.isfinite(value).all()
     assert entropy.tolist() == [0.0]
     assert imitation_loss is None
+
+
+def test_temporary_assignment_override_expires_and_reserves_target() -> None:
+    target = ("DRONE", 17)
+    assignments = {
+        1: (TACTICAL_RUN, None, 0.0),
+        2: (GUARD_TRANSPORT, target, 0.0),
+    }
+    overrides = {1: (GUARD_TRANSPORT, target, 6.0)}
+    updated, active = apply_assignment_overrides(
+        5.0, assignments, overrides, {1, 2}, {target}
+    )
+    assert updated[1][:2] == (GUARD_TRANSPORT, target)
+    assert updated[2][:2] == (TACTICAL_RUN, None)
+    assert active == overrides
+    expired, active = apply_assignment_overrides(
+        6.0, assignments, overrides, {1, 2}, {target}
+    )
+    assert expired == assignments
+    assert active == {}
+
+
+def test_plain_counterfactual_artifact_round_trips_decisive_action() -> None:
+    observation = _observation(scouts=1, candidate=True)
+    run = (ScoutAction(TACTICAL_RUN),)
+    guard = (ScoutAction(GUARD_TRANSPORT, 0),)
+    payload = {
+        "results": [
+            {
+                "seed": 17,
+                "side": "A",
+                "opponent": "opus",
+                "observation": asdict(observation),
+                "alternatives": [
+                    {
+                        "actions": tuple(asdict(action) for action in run),
+                        "role": TACTICAL_RUN,
+                        "outcome": -1,
+                        "score_difference": -2,
+                    },
+                    {
+                        "actions": tuple(asdict(action) for action in guard),
+                        "role": GUARD_TRANSPORT,
+                        "outcome": 1,
+                        "score_difference": 2,
+                    },
+                ],
+            }
+        ]
+    }
+    examples = decisive_counterfactual_examples(payload)
+    assert len(examples) == 1
+    assert examples[0]["preferred_role"] == GUARD_TRANSPORT
+    assert examples[0]["alternatives"][examples[0]["target_index"]] == guard
+    assert examples[0]["observation"] == observation
 
 
 def test_autoregressive_mask_prevents_duplicate_target_assignment() -> None:

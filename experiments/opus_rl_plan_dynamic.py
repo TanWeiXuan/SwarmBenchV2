@@ -8,6 +8,7 @@ nominal neural actions cannot be mistaken for consequential assignments.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 import os
@@ -830,6 +831,42 @@ def update_assignments(state, scouts, live_candidates, actions, previous):
     return updated
 
 
+def apply_assignment_overrides(
+    state_time: float,
+    assignments: dict[int, tuple[int, tuple[Any, ...] | None, float]],
+    overrides: dict[int, tuple[int, tuple[Any, ...] | None, float]],
+    live_scout_ids: set[int],
+    live_target_keys: set[tuple[Any, ...]],
+) -> tuple[
+    dict[int, tuple[int, tuple[Any, ...] | None, float]],
+    dict[int, tuple[int, tuple[Any, ...] | None, float]],
+]:
+    """Apply temporary counterfactual duties without weakening live masks."""
+    updated = dict(assignments)
+    active = {}
+    for scout_id, (role, target_key, until) in overrides.items():
+        if scout_id not in live_scout_ids or state_time + 1.0e-9 >= until:
+            continue
+        if target_key is not None and target_key not in live_target_keys:
+            continue
+        for other_id, (other_role, other_target, other_since) in list(
+            updated.items()
+        ):
+            if other_id != scout_id and target_key is not None and other_target == target_key:
+                updated[other_id] = (TACTICAL_RUN, None, state_time)
+        old_role, old_target, old_since = updated.get(
+            scout_id, (TACTICAL_RUN, None, state_time)
+        )
+        since = (
+            old_since
+            if (old_role, old_target) == (role, target_key)
+            else state_time
+        )
+        updated[scout_id] = (role, target_key, since)
+        active[scout_id] = (role, target_key, until)
+    return updated, active
+
+
 def resolve_tactical_duties(controller, state, own, foes, assignment_state):
     """Resolve stable ID tokens to current snapshots on every control update."""
     run, hunt, keep, gun, block = controller.BASE_ROLES
@@ -882,6 +919,18 @@ def _dynamic_controller(
             self.dynamic_inference_seconds = 0.0
             self._next_dynamic_time = 0.0
             self._previous_effective: dict[int, tuple[int, tuple[Any, ...] | None]] = {}
+            self.dynamic_overrides: dict[
+                int, tuple[int, tuple[Any, ...] | None, float]
+            ] = {}
+
+        def force_dynamic_assignment(
+            self,
+            scout_id: int,
+            role: int,
+            target_key: tuple[Any, ...] | None,
+            until: float,
+        ) -> None:
+            self.dynamic_overrides[int(scout_id)] = (role, target_key, until)
 
         def _plan(self, state, own, foes):
             should_decide = state.time + 1.0e-9 >= self._next_dynamic_time
@@ -920,6 +969,20 @@ def _dynamic_controller(
                     live_candidates,
                     decision.actions,
                     self.dynamic_assignments,
+                )
+                live_scout_ids = {int(scout.id) for scout in scouts}
+                live_target_keys = {
+                    candidate.key
+                    for candidates_by_role in live_candidates
+                    for candidates in candidates_by_role
+                    for candidate in candidates
+                }
+                updated, self.dynamic_overrides = apply_assignment_overrides(
+                    state.time,
+                    updated,
+                    self.dynamic_overrides,
+                    live_scout_ids,
+                    live_target_keys,
                 )
                 effective = {
                     scout_id: (role, target)
@@ -1159,6 +1222,271 @@ class DynamicEpisodeResult:
         return len(self.observations)
 
 
+@dataclass(frozen=True)
+class GuardCounterfactualJob:
+    seed: int
+    side: str
+    opponent: str
+    policy_state: dict[str, torch.Tensor]
+    policy_version: int = 0
+    duration: float = DEFAULT_MATCH_DURATION
+    commitment: float = 5.0
+    maximum_pairs: int = 2
+    opportunity_index: int = 0
+
+
+@dataclass
+class GuardCounterfactualResult:
+    seed: int
+    side: str
+    opponent: str
+    decision_time: float | None
+    observation: TacticalObservation | None
+    alternatives: list[dict[str, Any]]
+    wall_seconds: float
+
+
+def _counterfactual_action_tuple(
+    baseline: tuple[ScoutAction, ...],
+    observation: TacticalObservation,
+    scout_index: int,
+    role: int,
+    target_index: int = -1,
+) -> tuple[ScoutAction, ...]:
+    actions = list(baseline)
+    target_key = (
+        observation.scouts[scout_index].candidates[role][target_index].key
+        if target_index >= 0
+        else None
+    )
+    if target_key is not None:
+        for other_index, other_action in enumerate(actions):
+            if other_index == scout_index or other_action.target_index < 0:
+                continue
+            candidates = observation.scouts[other_index].candidates[
+                other_action.role
+            ]
+            if (
+                other_action.target_index < len(candidates)
+                and candidates[other_action.target_index].key == target_key
+            ):
+                actions[other_index] = ScoutAction(TACTICAL_RUN)
+    actions[scout_index] = ScoutAction(role, target_index)
+    return tuple(actions)
+
+
+def _continue_counterfactual_branch(
+    simulator,
+    subject,
+    opponent,
+    subject_team: Team,
+    start_tick: int,
+    duration: float,
+    override: tuple[int, int, tuple[Any, ...] | None, float] | None,
+) -> dict[str, Any]:
+    simulator = copy.deepcopy(simulator)
+    subject = copy.deepcopy(subject)
+    opponent = copy.deepcopy(opponent)
+    if override is not None:
+        scout_id, role, target_key, until = override
+        subject.force_dynamic_assignment(scout_id, role, target_key, until)
+    controllers = {subject_team: subject, subject_team.opponent: opponent}
+    control_stride = round(CONTROLLER_PERIOD / PHYSICS_DT)
+    events = Counter()
+    for tick in range(start_tick, round(duration / PHYSICS_DT)):
+        if tick % control_stride == 0:
+            states = {team: game_state(simulator, team) for team in Team}
+            commands = {
+                team: _commands(controllers[team], states[team]) for team in Team
+            }
+            for team in Team:
+                simulator.set_commands(team, commands[team])
+        events.update(event.event_type.value for event in simulator.step())
+        if not any(
+            drone.status is DroneStatus.ACTIVE for drone in simulator.snapshots()
+        ):
+            break
+    score_for = simulator.scores[subject_team]
+    score_against = simulator.scores[subject_team.opponent]
+    return {
+        "score_for": score_for,
+        "score_against": score_against,
+        "outcome": (
+            1 if score_for > score_against else -1 if score_for < score_against else 0
+        ),
+        "score_difference": score_for - score_against,
+        "event_counts": dict(events),
+    }
+
+
+def run_guard_counterfactual_job(
+    job: GuardCounterfactualJob,
+) -> GuardCounterfactualResult:
+    """Branch one real guard opportunity into terminal RUN/GUARD outcomes."""
+    _configure_worker()
+    started = time.perf_counter()
+    scenario = generate_scenario(job.seed)
+    simulator = Simulator(scenario)
+    subject_team = Team(job.side)
+    model = DynamicActorCritic()
+    model.load_state_dict(job.policy_state)
+    model.eval()
+    generator = torch.Generator().manual_seed(
+        (job.seed * 6364136223846793005 + job.policy_version * 1447 + ord(job.side))
+        % (2**63)
+    )
+    base_type = _load_controller(
+        SUBJECT_PATH, f"counterfactual_base_{os.getpid()}_{job.seed}"
+    )
+    subject_type = _dynamic_controller(
+        base_type, model, generator, stochastic=False
+    )
+    if job.opponent == "fixed_mode_4":
+        opponent_type = _instrumented_controller(base_type, force_mode_4=True)
+    else:
+        opponent_type = _load_controller(
+            _opponent_path(job.opponent),
+            f"counterfactual_foe_{os.getpid()}_{job.seed}",
+        )
+    subject = subject_type()
+    opponent = opponent_type()
+    subject.initialize(game_info(scenario, subject_team))
+    opponent.initialize(game_info(scenario, subject_team.opponent))
+    controllers = {subject_team: subject, subject_team.opponent: opponent}
+    control_stride = round(CONTROLLER_PERIOD / PHYSICS_DT)
+    opportunities_seen = 0
+    for tick in range(round(job.duration / PHYSICS_DT)):
+        if tick % control_stride == 0:
+            states = {team: game_state(simulator, team) for team in Team}
+            will_decide = (
+                states[subject_team].time + 1.0e-9
+                >= subject._next_dynamic_time
+            )
+            if will_decide:
+                # Counterfactual search never consumes old diagnostics.  Keep
+                # clone cost bounded as the sampled opportunity gets later.
+                subject.dynamic_records = subject.dynamic_records[-1:]
+                if hasattr(opponent, "effective_records"):
+                    opponent.effective_records = opponent.effective_records[-1:]
+                simulator_before = copy.deepcopy(simulator)
+                subject_before = copy.deepcopy(subject)
+                opponent_before = copy.deepcopy(opponent)
+            commands = {
+                team: _commands(controllers[team], states[team]) for team in Team
+            }
+            new_decision = (
+                subject.dynamic_records
+                and abs(subject.dynamic_records[-1]["time"] - states[subject_team].time)
+                < 1.0e-9
+            )
+            if new_decision and will_decide:
+                observation = subject.dynamic_records[-1]["observation"]
+                baseline = subject.dynamic_records[-1]["actions"]
+                pair_options = []
+                for scout_index, scout in enumerate(observation.scouts):
+                    for target_index, candidate in enumerate(
+                        scout.candidates[GUARD_TRANSPORT]
+                    ):
+                        pair_options.append(
+                            (
+                                candidate.features[25],
+                                candidate.key,
+                                scout_index,
+                                target_index,
+                            )
+                        )
+                pair_options.sort()
+                pair_options = pair_options[: job.maximum_pairs]
+                if pair_options:
+                    if opportunities_seen < job.opportunity_index:
+                        opportunities_seen += 1
+                        pair_options = []
+                if pair_options:
+                    live_scouts = sorted(
+                        (
+                            drone
+                            for drone in states[subject_team].own_drones
+                            if drone.status is DroneStatus.ACTIVE
+                            and drone.drone_type is DroneType.SCOUT
+                        ),
+                        key=lambda drone: drone.id,
+                    )
+                    alternatives = []
+                    run_scout_indices = sorted(
+                        {option[2] for option in pair_options}
+                    )
+                    specifications = [
+                        (scout_index, TACTICAL_RUN, -1)
+                        for scout_index in run_scout_indices
+                    ] + [
+                        (scout_index, GUARD_TRANSPORT, target_index)
+                        for _rank, _key, scout_index, target_index in pair_options
+                    ]
+                    for scout_index, role, target_index in specifications:
+                        actions = _counterfactual_action_tuple(
+                            baseline,
+                            observation,
+                            scout_index,
+                            role,
+                            target_index,
+                        )
+                        target_key = (
+                            observation.scouts[scout_index]
+                            .candidates[role][target_index]
+                            .key
+                            if target_index >= 0
+                            else None
+                        )
+                        branch = _continue_counterfactual_branch(
+                            simulator_before,
+                            subject_before,
+                            opponent_before,
+                            subject_team,
+                            tick,
+                            job.duration,
+                            (
+                                int(live_scouts[scout_index].id),
+                                role,
+                                target_key,
+                                states[subject_team].time + job.commitment,
+                            ),
+                        )
+                        branch.update(
+                            {
+                                "scout_index": scout_index,
+                                "role": role,
+                                "target_index": target_index,
+                                "actions": actions,
+                            }
+                        )
+                        alternatives.append(branch)
+                    return GuardCounterfactualResult(
+                        job.seed,
+                        job.side,
+                        job.opponent,
+                        states[subject_team].time,
+                        observation,
+                        alternatives,
+                        time.perf_counter() - started,
+                    )
+            for team in Team:
+                simulator.set_commands(team, commands[team])
+        simulator.step()
+        if not any(
+            drone.status is DroneStatus.ACTIVE for drone in simulator.snapshots()
+        ):
+            break
+    return GuardCounterfactualResult(
+        job.seed,
+        job.side,
+        job.opponent,
+        None,
+        None,
+        [],
+        time.perf_counter() - started,
+    )
+
+
 def _frozen_dynamic_state(model: DynamicActorCritic) -> dict[str, torch.Tensor]:
     return {
         name: value.detach().cpu().clone()
@@ -1329,6 +1657,409 @@ def collect_dynamic_with_pool(
     futures = [pool.submit(run_dynamic_rollout_job, job) for job in jobs]
     results = [future.result() for future in as_completed(futures)]
     return results, time.perf_counter() - started
+
+
+def collect_guard_counterfactual_jobs(
+    jobs: list[GuardCounterfactualJob], workers: int
+) -> tuple[list[GuardCounterfactualResult], float]:
+    started = time.perf_counter()
+    results = []
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(run_guard_counterfactual_job, job) for job in jobs]
+        for future in as_completed(futures):
+            results.append(future.result())
+    return results, time.perf_counter() - started
+
+
+def summarize_guard_counterfactuals(
+    results: list[GuardCounterfactualResult], elapsed: float
+) -> dict[str, Any]:
+    preferences = Counter()
+    decisive = 0
+    tied = 0
+    spreads = []
+    for result in results:
+        objectives = [
+            (alternative["outcome"], alternative["score_difference"])
+            for alternative in result.alternatives
+        ]
+        if not objectives:
+            continue
+        best = max(objectives)
+        winners = [
+            alternative
+            for alternative, objective in zip(result.alternatives, objectives)
+            if objective == best
+        ]
+        unique_actions = {winner["actions"] for winner in winners}
+        if len(unique_actions) == 1:
+            decisive += 1
+            action = next(iter(unique_actions))
+            changed = [
+                candidate
+                for candidate in result.alternatives
+                if candidate["actions"] == action
+            ][0]
+            preferences[ROLE_NAMES[changed["role"]]] += 1
+        else:
+            tied += 1
+        score_differences = [objective[1] for objective in objectives]
+        spreads.append(max(score_differences) - min(score_differences))
+    states = sum(result.observation is not None for result in results)
+    decision_times = [
+        result.decision_time
+        for result in results
+        if result.decision_time is not None
+    ]
+    return {
+        "schema": "opus-rl-plan-guard-counterfactual-v1",
+        "jobs": len(results),
+        "states": states,
+        "no_guard_opportunity": len(results) - states,
+        "decisive_states": decisive,
+        "tied_states": tied,
+        "preferred_roles": dict(sorted(preferences.items())),
+        "mean_score_spread": statistics.fmean(spreads) if spreads else 0.0,
+        "maximum_score_spread": max(spreads, default=0),
+        "wall_seconds": elapsed,
+        "jobs_per_second": len(results) / elapsed,
+        "mean_decision_time": (
+            statistics.fmean(decision_times) if decision_times else None
+        ),
+    }
+
+
+def unpack_tactical_observation(value: dict[str, Any]) -> TacticalObservation:
+    scouts = []
+    for scout in value["scouts"]:
+        candidates_by_role = []
+        for candidates in scout["candidates"]:
+            candidates_by_role.append(
+                tuple(
+                    CandidateObservation(
+                        tuple(candidate["key"]), tuple(candidate["features"])
+                    )
+                    for candidate in candidates
+                )
+            )
+        scouts.append(
+            ScoutObservation(
+                tuple(scout["entity"]),
+                int(scout["previous_role"]),
+                float(scout["role_duration"]),
+                tuple(scout["base_role_mask"]),
+                tuple(candidates_by_role),
+            )
+        )
+    return TacticalObservation(
+        tuple(value["global_features"]),
+        tuple(tuple(entity) for entity in value["own_entities"]),
+        tuple(tuple(entity) for entity in value["foe_entities"]),
+        tuple(scouts),
+    )
+
+
+def decisive_counterfactual_examples(
+    payload: dict[str, Any],
+) -> list[dict[str, Any]]:
+    examples = []
+    for result in payload["results"]:
+        if result["observation"] is None:
+            continue
+        by_action = {}
+        for alternative in result["alternatives"]:
+            actions = tuple(
+                ScoutAction(int(action["role"]), int(action["target_index"]))
+                for action in alternative["actions"]
+            )
+            objective = (
+                int(alternative["outcome"]),
+                int(alternative["score_difference"]),
+            )
+            previous = by_action.get(actions)
+            if previous is None or objective > previous:
+                by_action[actions] = objective
+        best = max(by_action.values())
+        winners = [actions for actions, objective in by_action.items() if objective == best]
+        if len(winners) != 1 or len(by_action) < 2:
+            continue
+        examples.append(
+            {
+                "seed": int(result["seed"]),
+                "side": result["side"],
+                "opponent": result["opponent"],
+                "observation": unpack_tactical_observation(result["observation"]),
+                "alternatives": tuple(by_action),
+                "target_index": tuple(by_action).index(winners[0]),
+                "preferred_role": next(
+                    int(alternative["role"])
+                    for alternative in result["alternatives"]
+                    if tuple(
+                        ScoutAction(
+                            int(action["role"]), int(action["target_index"])
+                        )
+                        for action in alternative["actions"]
+                    )
+                    == winners[0]
+                ),
+                "score_spread": max(value[1] for value in by_action.values())
+                - min(value[1] for value in by_action.values()),
+            }
+        )
+    return examples
+
+
+def counterfactual_ranking_metrics(
+    model: DynamicActorCritic, examples: list[dict[str, Any]]
+) -> dict[str, float]:
+    correct = 0
+    losses = []
+    with torch.no_grad():
+        for example in examples:
+            logits = torch.stack(
+                [
+                    model.decide(
+                        example["observation"],
+                        stochastic=False,
+                        actions=actions,
+                    ).log_probability
+                    for actions in example["alternatives"]
+                ]
+            )
+            target = int(example["target_index"])
+            correct += int(int(logits.argmax()) == target)
+            losses.append(float(-torch.log_softmax(logits, dim=0)[target]))
+    return {
+        "examples": len(examples),
+        "accuracy": correct / max(1, len(examples)),
+        "loss": statistics.fmean(losses) if losses else 0.0,
+    }
+
+
+def train_guard_counterfactual_policy(args) -> None:
+    if args.holdout_modulus <= 1:
+        raise ValueError("--holdout-modulus must be greater than one")
+    if args.guard_example_weight <= 0.0:
+        raise ValueError("--guard-example-weight must be positive")
+    torch.set_num_threads(1)
+    torch.manual_seed(args.seed)
+    dataset_paths = [Path(path) for path in args.dataset]
+    examples = []
+    for path in dataset_paths:
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+        examples.extend(decisive_counterfactual_examples(payload))
+    training = [
+        example
+        for example in examples
+        if example["seed"] % args.holdout_modulus != args.holdout_remainder
+    ]
+    validation = [
+        example
+        for example in examples
+        if example["seed"] % args.holdout_modulus == args.holdout_remainder
+    ]
+    if not training or not validation:
+        raise ValueError("counterfactual split must contain training and validation examples")
+    initialization = torch.load(
+        Path(args.initialize), map_location="cpu", weights_only=False
+    )
+    model = DynamicActorCritic()
+    model.load_state_dict(initialization["model_state"])
+    gradient_hooks = []
+    if not args.full_network:
+        for parameter in model.parameters():
+            parameter.requires_grad_(False)
+        for parameter in (*model.role_head[-1].parameters(), *model.target_head[-1].parameters()):
+            parameter.requires_grad_(True)
+        role_weight_mask = torch.zeros_like(model.role_head[-1].weight)
+        role_weight_mask[TACTICAL_RUN] = 1.0
+        role_weight_mask[GUARD_TRANSPORT] = 1.0
+        role_bias_mask = torch.zeros_like(model.role_head[-1].bias)
+        role_bias_mask[TACTICAL_RUN] = 1.0
+        role_bias_mask[GUARD_TRANSPORT] = 1.0
+        gradient_hooks.extend(
+            (
+                model.role_head[-1].weight.register_hook(
+                    lambda gradient: gradient * role_weight_mask
+                ),
+                model.role_head[-1].bias.register_hook(
+                    lambda gradient: gradient * role_bias_mask
+                ),
+            )
+        )
+    before = {
+        "training": counterfactual_ranking_metrics(model, training),
+        "validation": counterfactual_ranking_metrics(model, validation),
+    }
+    best_epoch = 0
+    best_validation = before["validation"]
+    best_state = _frozen_dynamic_state(model)
+    optimizer = torch.optim.Adam(
+        [parameter for parameter in model.parameters() if parameter.requires_grad],
+        lr=args.learning_rate,
+    )
+    generator = random.Random(args.seed)
+    losses = []
+    for epoch in range(args.epochs):
+        generator.shuffle(training)
+        for start in range(0, len(training), args.minibatch):
+            batch = training[start : start + args.minibatch]
+            batch_losses = []
+            for example in batch:
+                logits = torch.stack(
+                    [
+                        model.decide(
+                            example["observation"],
+                            stochastic=False,
+                            actions=actions,
+                        ).log_probability
+                        for actions in example["alternatives"]
+                    ]
+                )
+                batch_losses.append(
+                    -torch.log_softmax(logits, dim=0)[example["target_index"]]
+                )
+            example_weights = torch.tensor(
+                [
+                    args.guard_example_weight
+                    if example["preferred_role"] == GUARD_TRANSPORT
+                    else 1.0
+                    for example in batch
+                ],
+                dtype=torch.float32,
+            )
+            loss = (
+                torch.stack(batch_losses) * example_weights
+            ).sum() / example_weights.sum().clamp_min(1.0)
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                [parameter for parameter in model.parameters() if parameter.requires_grad],
+                0.5,
+            )
+            optimizer.step()
+            losses.append(float(loss.detach()))
+        epoch_validation = counterfactual_ranking_metrics(model, validation)
+        key = (epoch_validation["accuracy"], -epoch_validation["loss"])
+        best_key = (best_validation["accuracy"], -best_validation["loss"])
+        if key > best_key:
+            best_epoch = epoch + 1
+            best_validation = epoch_validation
+            best_state = _frozen_dynamic_state(model)
+    final = {
+        "training": counterfactual_ranking_metrics(model, training),
+        "validation": counterfactual_ranking_metrics(model, validation),
+    }
+    model.load_state_dict(best_state)
+    selected = {
+        "training": counterfactual_ranking_metrics(model, training),
+        "validation": counterfactual_ranking_metrics(model, validation),
+    }
+    run_dir = EXPERIMENT_DIR / args.run_name
+    checkpoint = {
+        "schema": "opus-rl-plan-guard-counterfactual-policy-v1",
+        "model_architecture": MODEL_ARCHITECTURE,
+        "model_parameters": sum(parameter.numel() for parameter in model.parameters()),
+        "model_state": model.state_dict(),
+        "iteration": int(initialization.get("iteration", 0)),
+        "seed": args.seed,
+        "source_checkpoint": str(Path(args.initialize)),
+        "datasets": [str(path) for path in dataset_paths],
+        "epochs": args.epochs,
+        "learning_rate": args.learning_rate,
+        "minibatch": args.minibatch,
+        "holdout_modulus": args.holdout_modulus,
+        "holdout_remainder": args.holdout_remainder,
+        "full_network": args.full_network,
+        "guard_example_weight": args.guard_example_weight,
+    }
+    _atomic_dynamic_checkpoint(checkpoint, run_dir / "best.pt")
+    report = {
+        key: checkpoint[key]
+        for key in (
+            "schema",
+            "seed",
+            "source_checkpoint",
+            "datasets",
+            "epochs",
+            "learning_rate",
+            "minibatch",
+            "holdout_modulus",
+            "holdout_remainder",
+            "full_network",
+            "guard_example_weight",
+        )
+    }
+    report.update(
+        {
+            "before": before,
+            "final": final,
+            "selected": selected,
+            "selected_epoch": best_epoch,
+            "final_loss": losses[-1],
+            "mean_loss": statistics.fmean(losses),
+            "checkpoint": str(run_dir / "best.pt"),
+        }
+    )
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "report.json").write_text(
+        json.dumps(report, indent=2, sort_keys=True), encoding="utf-8"
+    )
+    print(json.dumps(report, sort_keys=True))
+
+
+def guard_counterfactual_command(args) -> None:
+    if args.maximum_opportunity_index < 0:
+        raise ValueError("--maximum-opportunity-index must be nonnegative")
+    checkpoint = torch.load(
+        Path(args.checkpoint), map_location="cpu", weights_only=False
+    )
+    state = checkpoint["model_state"]
+    combinations = [
+        (opponent, seed, side)
+        for opponent in args.opponents
+        for seed in args.seeds
+        for side in ("A", "B")
+    ]
+    jobs = [
+        GuardCounterfactualJob(
+            seed=seed,
+            side=side,
+            opponent=opponent,
+            policy_state=state,
+            policy_version=int(checkpoint.get("iteration", 0)),
+            duration=args.duration,
+            commitment=args.commitment,
+            maximum_pairs=args.maximum_pairs,
+            opportunity_index=(
+                index % (args.maximum_opportunity_index + 1)
+            ),
+        )
+        for index, (opponent, seed, side) in enumerate(combinations)
+    ]
+    results, elapsed = collect_guard_counterfactual_jobs(jobs, args.workers)
+    report = summarize_guard_counterfactuals(results, elapsed)
+    payload = {
+        "schema": report["schema"],
+        "source_checkpoint": str(Path(args.checkpoint)),
+        "commitment": args.commitment,
+        "maximum_pairs": args.maximum_pairs,
+        "maximum_opportunity_index": args.maximum_opportunity_index,
+        # Persist plain data rather than ``__main__`` dataclass identities so
+        # artifacts load identically from CLI, tests, and imported modules.
+        "results": [asdict(result) for result in results],
+        "report": report,
+    }
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_suffix(output.suffix + ".tmp")
+    torch.save(payload, temporary)
+    temporary.replace(output)
+    report_path = output.with_suffix(".json")
+    report_path.write_text(
+        json.dumps(report, indent=2, sort_keys=True), encoding="utf-8"
+    )
+    print(json.dumps(report, sort_keys=True))
 
 
 def dynamic_gae(
@@ -2527,6 +3258,50 @@ def build_parser() -> argparse.ArgumentParser:
     )
     evaluate.add_argument("--output")
     evaluate.set_defaults(function=evaluate_dynamic_checkpoint)
+
+    counterfactual = subparsers.add_parser("counterfactual")
+    counterfactual.add_argument("--checkpoint", required=True)
+    counterfactual.add_argument("--workers", type=int, default=6)
+    counterfactual.add_argument(
+        "--duration", type=float, default=DEFAULT_MATCH_DURATION
+    )
+    counterfactual.add_argument("--commitment", type=float, default=5.0)
+    counterfactual.add_argument("--maximum-pairs", type=int, default=2)
+    counterfactual.add_argument(
+        "--maximum-opportunity-index", type=int, default=0
+    )
+    counterfactual.add_argument("--seeds", nargs="+", type=int, required=True)
+    counterfactual.add_argument(
+        "--opponents",
+        nargs="+",
+        choices=tuple(sorted((*LEAGUE_OPPONENTS, "fixed_mode_4"))),
+        required=True,
+    )
+    counterfactual.add_argument("--output", required=True)
+    counterfactual.set_defaults(function=guard_counterfactual_command)
+
+    counterfactual_train = subparsers.add_parser("counterfactual-train")
+    counterfactual_train.add_argument("--dataset", nargs="+", required=True)
+    counterfactual_train.add_argument("--initialize", required=True)
+    counterfactual_train.add_argument("--run-name", required=True)
+    counterfactual_train.add_argument("--seed", type=int, default=96_001)
+    counterfactual_train.add_argument("--epochs", type=int, default=20)
+    counterfactual_train.add_argument("--minibatch", type=int, default=8)
+    counterfactual_train.add_argument("--learning-rate", type=float, default=1.0e-5)
+    counterfactual_train.add_argument("--holdout-modulus", type=int, default=5)
+    counterfactual_train.add_argument("--holdout-remainder", type=int, default=0)
+    counterfactual_train.add_argument(
+        "--full-network",
+        action="store_true",
+        help="update shared encoders too; default updates only RUN/GUARD and target outputs",
+    )
+    counterfactual_train.add_argument(
+        "--guard-example-weight",
+        type=float,
+        default=1.0,
+        help="correct conditional-dataset GUARD/RUN sampling imbalance",
+    )
+    counterfactual_train.set_defaults(function=train_guard_counterfactual_policy)
     return parser
 
 
