@@ -23,6 +23,7 @@ from experiments.opus_rl_plan_dynamic import (
     SUBJECT_PATH,
     _mode4_teacher_controller,
     _target_signature,
+    dynamic_rewards,
     run_instrumented_match,
 )
 from experiments.opus_rl_plan_ppo import _load_controller
@@ -44,6 +45,14 @@ def test_mode4_hunt_is_labeled_by_guard_origin_not_target_type() -> None:
     role, key = teacher.teacher_action(hunt, tank)
     assert ROLE_NAMES[role] == "GUARD_TRANSPORT"
     assert key == ("DRONE", 9)
+
+
+def test_score_potential_remains_subordinate_to_match_outcome() -> None:
+    records = [{"score_difference": 0}, {"score_difference": 5}]
+    assert dynamic_rewards(records, 10, 1.0, 50, "terminal") == [0.0, 1.0]
+    shaped = dynamic_rewards(records, 10, 1.0, 50, "score_potential")
+    assert shaped == pytest.approx([0.01, 1.01])
+    assert sum(shaped) == pytest.approx(1.02)
 
 
 def test_fixed_mode_4_effective_instrumentation_is_self_consistent() -> None:

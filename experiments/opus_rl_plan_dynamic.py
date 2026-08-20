@@ -954,6 +954,7 @@ class DynamicRolloutJob:
     stochastic: bool = True
     duration: float = DEFAULT_MATCH_DURATION
     decision_interval: float = TACTICAL_INTERVAL
+    reward_kind: str = "terminal"
     ablation: str = "full"
     diagnostics: bool = False
 
@@ -1084,9 +1085,13 @@ def run_dynamic_rollout_job(job: DynamicRolloutJob) -> DynamicEpisodeResult:
         else 0.0
     )
     records = subject.dynamic_records
-    rewards = [0.0] * len(records)
-    if rewards:
-        rewards[-1] = outcome
+    rewards = dynamic_rewards(
+        records,
+        score_for - score_against,
+        outcome,
+        subject._initial_value,
+        job.reward_kind,
+    )
     role_counts = Counter(
         role
         for record in records
@@ -1199,6 +1204,33 @@ def dynamic_gae(
     }
 
 
+def dynamic_rewards(
+    records: list[dict[str, Any]],
+    final_difference: int,
+    outcome: float,
+    maximum_score: int,
+    kind: str,
+) -> list[float]:
+    """Winning dominates; optional score potential has total magnitude <= 0.1."""
+    if kind not in {"terminal", "score_potential"}:
+        raise ValueError(f"unknown dynamic reward: {kind}")
+    rewards = [0.0] * len(records)
+    if not rewards:
+        return rewards
+    if kind == "score_potential":
+        differences = [
+            int(record["score_difference"]) for record in records
+        ] + [final_difference]
+        for index in range(len(records)):
+            rewards[index] = (
+                0.1
+                * (differences[index + 1] - differences[index])
+                / max(1, maximum_score)
+            )
+    rewards[-1] += outcome
+    return rewards
+
+
 @dataclass(frozen=True)
 class DynamicPPOConfig:
     seed: int = 93_001
@@ -1219,6 +1251,7 @@ class DynamicPPOConfig:
     target_kl: float = 0.02
     validation_interval: int = 5
     run_bias: float = 1.0
+    reward_kind: str = "terminal"
 
 
 class AdaptiveOpponentLeague:
@@ -1496,6 +1529,7 @@ def _dynamic_training_jobs(
             stochastic=True,
             duration=config.duration,
             decision_interval=config.decision_interval,
+            reward_kind=config.reward_kind,
         )
         for index in range(config.episodes_per_iteration)
     ]
@@ -1596,6 +1630,7 @@ def train_dynamic_ppo(args) -> None:
         target_kl=args.target_kl,
         validation_interval=args.validation_interval,
         run_bias=args.run_bias,
+        reward_kind=args.reward,
     )
     torch.set_num_threads(1)
     torch.manual_seed(config.seed)
@@ -2209,6 +2244,11 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--target-kl", type=float, default=DynamicPPOConfig.target_kl)
     train.add_argument("--validation-interval", type=int, default=DynamicPPOConfig.validation_interval)
     train.add_argument("--run-bias", type=float, default=DynamicPPOConfig.run_bias)
+    train.add_argument(
+        "--reward",
+        choices=("terminal", "score_potential"),
+        default=DynamicPPOConfig.reward_kind,
+    )
     train.add_argument("--initialize")
     train.add_argument("--resume")
     train.set_defaults(function=train_dynamic_ppo)
