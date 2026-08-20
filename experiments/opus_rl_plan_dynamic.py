@@ -171,6 +171,254 @@ class DynamicActorCritic(nn.Module):
         global_features = torch.tensor(observation.global_features, dtype=torch.float32, device=self.device)
         return self.context_encoder(torch.cat((global_features, own_mean, own_sum, foe_mean, foe_sum)))
 
+    def encode_context_batch(
+        self, observations: list[TacticalObservation]
+    ) -> torch.Tensor:
+        """Pack variable live sets without padding or hard-coded drone counts."""
+        batch_size = len(observations)
+
+        def packed_team(attribute: str) -> tuple[torch.Tensor, torch.Tensor]:
+            entities = []
+            owners = []
+            for observation_index, observation in enumerate(observations):
+                values = getattr(observation, attribute)
+                entities.extend(values)
+                owners.extend([observation_index] * len(values))
+            if not entities:
+                zero = torch.zeros(
+                    (batch_size, ENTITY_EMBEDDING),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                return zero, zero
+            encoded = self.entity_encoder(
+                torch.tensor(entities, dtype=torch.float32, device=self.device)
+            )
+            owner_tensor = torch.tensor(owners, dtype=torch.long, device=self.device)
+            sums = torch.zeros(
+                (batch_size, ENTITY_EMBEDDING),
+                dtype=torch.float32,
+                device=self.device,
+            ).index_add(0, owner_tensor, encoded)
+            counts = torch.zeros(
+                batch_size, dtype=torch.float32, device=self.device
+            ).index_add(
+                0,
+                owner_tensor,
+                torch.ones(len(owners), dtype=torch.float32, device=self.device),
+            )
+            means = sums / counts.clamp_min(1.0).unsqueeze(1)
+            return means, sums / 26.0
+
+        own_mean, own_sum = packed_team("own_entities")
+        foe_mean, foe_sum = packed_team("foe_entities")
+        global_features = torch.tensor(
+            [observation.global_features for observation in observations],
+            dtype=torch.float32,
+            device=self.device,
+        )
+        return self.context_encoder(
+            torch.cat(
+                (global_features, own_mean, own_sum, foe_mean, foe_sum), dim=1
+            )
+        )
+
+    def evaluate_batch(
+        self,
+        observations: list[TacticalObservation],
+        actions: list[tuple[ScoutAction, ...]],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Vectorized exact replay of recorded autoregressive assignments."""
+        if len(observations) != len(actions):
+            raise ValueError("observation/action batch mismatch")
+        contexts = self.encode_context_batch(observations)
+        values = self.critic(contexts).squeeze(-1)
+        scout_features = []
+        scout_observation_indices = []
+        scout_inputs = []
+        role_masks = []
+        chosen_roles = []
+        target_factors = []
+
+        for observation_index, (observation, assignment) in enumerate(
+            zip(observations, actions)
+        ):
+            if len(observation.scouts) != len(assignment):
+                raise ValueError("recorded action count does not match live scouts")
+            used_targets: set[tuple[Any, ...]] = set()
+            assigned_counts = [0.0] * ROLE_COUNT
+            scout_total = max(1, len(observation.scouts))
+            for scout, action in zip(observation.scouts, assignment):
+                flat_scout_index = len(scout_features)
+                scout_features.append(scout.entity)
+                scout_observation_indices.append(observation_index)
+                previous = [0.0] * ROLE_COUNT
+                if 0 <= scout.previous_role < ROLE_COUNT:
+                    previous[scout.previous_role] = 1.0
+                scout_inputs.append(
+                    previous
+                    + [scout.role_duration]
+                    + [count / scout_total for count in assigned_counts]
+                )
+                mask = list(scout.base_role_mask)
+                available_by_role = {}
+                for role in (
+                    HUNT_TRANSPORT,
+                    HUNT_TANK,
+                    GUARD_TRANSPORT,
+                    TACTICAL_BLOCK,
+                ):
+                    available = [
+                        index
+                        for index, candidate in enumerate(scout.candidates[role])
+                        if candidate.key not in used_targets
+                    ]
+                    available_by_role[role] = available
+                    mask[role] = mask[role] and bool(available)
+                if not mask[action.role]:
+                    raise ValueError("recorded role is masked in batch replay")
+                role_masks.append(mask)
+                chosen_roles.append(action.role)
+                if action.role in available_by_role:
+                    available = available_by_role[action.role]
+                    if action.target_index not in available:
+                        raise ValueError("recorded target is masked in batch replay")
+                    target_factors.append(
+                        (
+                            observation_index,
+                            flat_scout_index,
+                            scout.candidates[action.role],
+                            available,
+                            available.index(action.target_index),
+                        )
+                    )
+                    used_targets.add(
+                        scout.candidates[action.role][action.target_index].key
+                    )
+                assigned_counts[action.role] += 1.0
+
+        batch_size = len(observations)
+        log_probability = torch.zeros(
+            batch_size, dtype=torch.float32, device=self.device
+        )
+        entropy_sum = torch.zeros(
+            batch_size, dtype=torch.float32, device=self.device
+        )
+        factor_counts = torch.zeros(
+            batch_size, dtype=torch.float32, device=self.device
+        )
+        if scout_features:
+            scout_encoded = self.entity_encoder(
+                torch.tensor(
+                    scout_features, dtype=torch.float32, device=self.device
+                )
+            )
+            observation_indices = torch.tensor(
+                scout_observation_indices, dtype=torch.long, device=self.device
+            )
+            role_input = torch.cat(
+                (
+                    contexts[observation_indices],
+                    scout_encoded,
+                    torch.tensor(
+                        scout_inputs, dtype=torch.float32, device=self.device
+                    ),
+                ),
+                dim=1,
+            )
+            role_logits = self.role_head(role_input).masked_fill(
+                ~torch.tensor(role_masks, dtype=torch.bool, device=self.device),
+                -1.0e9,
+            )
+            role_distribution = torch.distributions.Categorical(logits=role_logits)
+            selected = torch.tensor(
+                chosen_roles, dtype=torch.long, device=self.device
+            )
+            log_probability = log_probability.index_add(
+                0, observation_indices, role_distribution.log_prob(selected)
+            )
+            entropy_sum = entropy_sum.index_add(
+                0, observation_indices, role_distribution.entropy()
+            )
+            factor_counts = factor_counts.index_add(
+                0,
+                observation_indices,
+                torch.ones(
+                    len(scout_features), dtype=torch.float32, device=self.device
+                ),
+            )
+
+            packed_targets = []
+            target_slices = []
+            for (
+                observation_index,
+                flat_scout_index,
+                candidates,
+                available,
+                chosen_local,
+            ) in target_factors:
+                start = len(packed_targets)
+                for candidate_index in available:
+                    pair = torch.tensor(
+                        candidates[candidate_index].features,
+                        dtype=torch.float32,
+                        device=self.device,
+                    )
+                    packed_targets.append(
+                        torch.cat(
+                            (
+                                contexts[observation_index],
+                                scout_encoded[flat_scout_index],
+                                pair,
+                            )
+                        )
+                    )
+                target_slices.append(
+                    (observation_index, start, len(packed_targets), chosen_local)
+                )
+            if packed_targets:
+                packed_logits = self.target_head(
+                    torch.stack(packed_targets)
+                ).squeeze(-1)
+                target_log_probabilities = []
+                target_entropies = []
+                target_observation_indices = []
+                for observation_index, start, end, chosen_local in target_slices:
+                    distribution = torch.distributions.Categorical(
+                        logits=packed_logits[start:end]
+                    )
+                    target_log_probabilities.append(
+                        distribution.log_prob(
+                            torch.tensor(
+                                chosen_local, dtype=torch.long, device=self.device
+                            )
+                        )
+                    )
+                    target_entropies.append(distribution.entropy())
+                    target_observation_indices.append(observation_index)
+                target_indices = torch.tensor(
+                    target_observation_indices,
+                    dtype=torch.long,
+                    device=self.device,
+                )
+                log_probability = log_probability.index_add(
+                    0, target_indices, torch.stack(target_log_probabilities)
+                )
+                entropy_sum = entropy_sum.index_add(
+                    0, target_indices, torch.stack(target_entropies)
+                )
+                factor_counts = factor_counts.index_add(
+                    0,
+                    target_indices,
+                    torch.ones(
+                        len(target_slices),
+                        dtype=torch.float32,
+                        device=self.device,
+                    ),
+                )
+        entropy = entropy_sum / factor_counts.clamp_min(1.0)
+        return log_probability, values, entropy
+
     def decide(
         self,
         observation: TacticalObservation,
@@ -1083,19 +1331,15 @@ def dynamic_ppo_update(
         epoch_kls = []
         for start in range(0, count, config.minibatch_size):
             indices = permutation[start : start + config.minibatch_size]
-            decisions = [
-                model.decide(
-                    batch["observations"][int(index)],
-                    stochastic=False,
-                    actions=batch["actions"][int(index)],
-                )
-                for index in indices
+            minibatch_observations = [
+                batch["observations"][int(index)] for index in indices
             ]
-            new_log_probabilities = torch.stack(
-                [decision.log_probability for decision in decisions]
+            minibatch_actions = [
+                batch["actions"][int(index)] for index in indices
+            ]
+            new_log_probabilities, values, entropies = model.evaluate_batch(
+                minibatch_observations, minibatch_actions
             )
-            values = torch.stack([decision.value for decision in decisions])
-            entropies = torch.stack([decision.entropy for decision in decisions])
             old_log_probabilities = batch["old_log_probabilities"][indices]
             log_ratio = new_log_probabilities - old_log_probabilities
             ratio = log_ratio.exp()
@@ -1598,20 +1842,19 @@ def behavior_clone_mode4(args) -> None:
         permutation = torch.randperm(len(records), generator=update_generator)
         for start in range(0, len(records), args.minibatch):
             indices = permutation[start : start + args.minibatch]
-            decisions = [
-                model.decide(
-                    records[int(index)][0],
-                    stochastic=False,
-                    actions=records[int(index)][1],
-                )
-                for index in indices
-            ]
-            loss = -torch.stack(
+            observations = [records[int(index)][0] for index in indices]
+            actions = [records[int(index)][1] for index in indices]
+            log_probabilities, _values, _entropies = model.evaluate_batch(
+                observations, actions
+            )
+            factor_counts = torch.tensor(
                 [
-                    decision.log_probability / max(1, decision.factor_count)
-                    for decision in decisions
-                ]
-            ).mean()
+                    sum(1 + int(action.target_index >= 0) for action in assignment)
+                    for assignment in actions
+                ],
+                dtype=torch.float32,
+            )
+            loss = -(log_probabilities / factor_counts.clamp_min(1.0)).mean()
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)

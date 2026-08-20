@@ -99,6 +99,14 @@ def test_autoregressive_mask_prevents_duplicate_target_assignment() -> None:
         actions=decision.actions,
     )
     assert torch.allclose(replay.log_probability, decision.log_probability)
+    batch_log_probability, batch_value, batch_entropy = model.evaluate_batch(
+        [_observation(scouts=2, candidate=True)], [decision.actions]
+    )
+    assert batch_log_probability[0].item() == pytest.approx(
+        decision.log_probability.item(), abs=1.0e-6
+    )
+    assert batch_value[0].item() == pytest.approx(decision.value.item(), abs=1.0e-6)
+    assert batch_entropy[0].item() == pytest.approx(decision.entropy.item(), abs=1.0e-6)
 
 
 def test_adaptive_league_is_normalized_and_contains_current_hard_field() -> None:
