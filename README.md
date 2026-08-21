@@ -89,16 +89,16 @@ Only the latest rating state is committed; permanent tournament history lives in
 <!-- LEADERBOARD_START -->
 | Rank | Controller | Author | Rating | RD | W | D | L | Games |
 | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | Gemini 3 1 Pro V1 | renj1ete0 | 2040 | 24 | 240 | 18 | 70 | 328 |
-| 2 | Sol 5 6 Rl | TanWeiXuan | 2031 | 24 | 193 | 15 | 48 | 256 |
-| 3 | Opus 5 V1 | renj1ete0 | 2012 | 24 | 581 | 45 | 82 | 708 |
-| 4 | Gpt-5.3-Codex | renj1ete0 | 1962 | 24 | 200 | 37 | 83 | 320 |
-| 5 | Sonnet 5 V3 | renj1ete0 | 1951 | 23 | 205 | 27 | 96 | 328 |
-| 6 | Luna Xhigh Opus Breaker | TanWeiXuan | 1934 | 23 | 391 | 36 | 149 | 576 |
-| 7 | Luna Xhigh Sipp Marksman V1 | TanWeiXuan | 1739 | 21 | 374 | 113 | 269 | 756 |
-| 8 | Luna Xhigh Mpc | TanWeiXuan | 1643 | 21 | 282 | 290 | 184 | 756 |
-| 9 | Bigpickle V1 | TanWeiXuan | 1619 | 21 | 402 | 378 | 256 | 1036 |
-| 10 | Wayfinder V2 | TanWeiXuan | 1573 | 21 | 366 | 402 | 372 | 1140 |
+| 1 | Gemini 3 1 Pro V1 | renj1ete0 | 2049 | 23 | 287 | 21 | 84 | 392 |
+| 2 | Opus 5 V1 | renj1ete0 | 2013 | 23 | 620 | 56 | 96 | 772 |
+| 3 | Sol 5 6 Rl | TanWeiXuan | 2004 | 24 | 228 | 19 | 73 | 320 |
+| 4 | Gpt-5.3-Codex | renj1ete0 | 1984 | 23 | 244 | 43 | 97 | 384 |
+| 5 | Sonnet 5 V3 | renj1ete0 | 1977 | 23 | 249 | 34 | 109 | 392 |
+| 6 | Luna Xhigh Opus Breaker | TanWeiXuan | 1930 | 22 | 422 | 46 | 172 | 640 |
+| 7 | Luna Xhigh Sipp Marksman V1 | TanWeiXuan | 1717 | 21 | 405 | 131 | 316 | 852 |
+| 8 | Luna Xhigh Mpc | TanWeiXuan | 1661 | 21 | 308 | 317 | 195 | 820 |
+| 9 | Bigpickle V1 | TanWeiXuan | 1626 | 21 | 430 | 400 | 270 | 1100 |
+| 10 | Wayfinder V2 | TanWeiXuan | 1571 | 21 | 382 | 422 | 400 | 1204 |
 <!-- LEADERBOARD_END -->
 
 ## Reproducibility and security
