@@ -23,10 +23,10 @@ python -m pip install -e ".[dev,competition,render]"
 python -m pytest
 python -m swarmbench arena --seed 42 --render arena.png
 python -m swarmbench match --controller-a marksman --controller-b convoy --seed 42 --replay match.json --render match.mp4
-python -m swarmbench render match.json --output match.gif
+python -m swarmbench render match.json --output match.gif --killfeed
 ```
 
-Rendering defaults to 10 FPS at 640×384. Use `--render-fps 20 --render-quality high` when fidelity matters more than rendering speed. MP4 output uses ffmpeg when available and otherwise falls back to GIF.
+Rendering defaults to 10 FPS at 640×384. Use `--render-fps 20 --render-quality high` when fidelity matters more than rendering speed. `--killfeed` adds an icon-only feed of the latest five eliminations, collisions, crashes, and scores for five seconds; adjust it with `--killfeed-lines` and `--killfeed-duration`. Header counts use `S`, `Tr`, and `Tk` for Scouts, Transports, and Tanks. MP4 output uses ffmpeg when available and otherwise falls back to GIF.
 
 Built-in controller names are `rush`, `defend`, `greedy_value`, `assignment`, `potential_field`, `marksman`, and `convoy`.
 
