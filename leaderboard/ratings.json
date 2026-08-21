@@ -297,6 +297,20 @@
     {
       "author": "renj1ete0",
       "built_in": false,
+      "controller_id": "renj1ete0/qwen_3_6_35b_extra_high_v1",
+      "deviation": 35.80079480967338,
+      "display_name": "Qwen 3 6 35B Extra High V1",
+      "draws": 0,
+      "games": 0,
+      "losses": 0,
+      "rating": 1068.458121166458,
+      "version_sha": "ff978d53f3c303d205c36dc088dcdefc07ed9001",
+      "volatility": 0.06000175900225093,
+      "wins": 0
+    },
+    {
+      "author": "renj1ete0",
+      "built_in": false,
       "controller_id": "renj1ete0/sonnet_5_v2",
       "deviation": 21.454100047761234,
       "display_name": "Sonnet 5 V2",
