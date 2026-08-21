@@ -192,6 +192,34 @@ def test_renderer_draws_icon_killfeed(short_match, tmp_path: Path) -> None:
     assert output.stat().st_size > 1_000
 
 
+def test_killfeed_panel_is_compact_translucent_and_bottom_centered() -> None:
+    class RecordingDraw:
+        bounds = None
+        fill = None
+
+        def rounded_rectangle(self, bounds, **kwargs):
+            self.bounds = bounds
+            self.fill = kwargs["fill"]
+
+        def rectangle(self, *_args, **_kwargs):
+            pass
+
+        def text(self, *_args, **_kwargs):
+            pass
+
+    draw = RecordingDraw()
+    entry = renderer._KillfeedEntry(1.0, "score", ((Team.A, DroneType.TRANSPORT),), 5)
+
+    renderer._draw_killfeed(draw, (entry,), (640, 384), object())
+
+    left, top, right, bottom = draw.bounds
+    assert (left + right) / 2 == pytest.approx(320, abs=0.5)
+    assert right - left == 135
+    assert bottom == 379
+    assert top > 350
+    assert draw.fill == (247, 247, 242, 130)
+
+
 def test_renderer_truncates_long_controller_names() -> None:
     from PIL import Image, ImageDraw, ImageFont
 

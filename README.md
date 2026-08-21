@@ -2,7 +2,7 @@
 
 SwarmBench is a deterministic, open-source benchmark and Kaggle-style competition for multi-agent swarm control and combat. Two Python controllers command mirrored mixed-class teams through a randomized 100 m × 60 m arena. The authoritative simulator is headless; replays and rendering are separate.
 
-![Luna xHigh MPC versus Wayfinder V2 match replay](match.gif)
+![Sol 5.6 RL versus Sonnet 5 V3 match replay](match.gif)
 
 Each team has 10–14 SCOUT vehicles, 4–8 TRANSPORT vehicles, and 2–4 TANK vehicles. A vehicle scores by reaching the opposite goal. All vehicle contacts—including friendly contacts—destroy both participants within 0.75 m. Tanks fire visible, non-piercing 20 m/s projectiles that obstacles or either team's vehicles can intercept. Each Tank carries five shots, cannot fire during the first five seconds, and can fire at most once every four seconds thereafter. The higher score after 90 simulation seconds wins.
 
@@ -26,7 +26,7 @@ python -m swarmbench match --controller-a marksman --controller-b convoy --seed 
 python -m swarmbench render match.json --output match.gif --killfeed
 ```
 
-Rendering defaults to 10 FPS at 640×384. Use `--render-fps 20 --render-quality high` when fidelity matters more than rendering speed. `--killfeed` adds an icon-only feed of the latest five eliminations, collisions, crashes, and scores for five seconds; adjust it with `--killfeed-lines` and `--killfeed-duration`. Header counts use `S`, `Tr`, and `Tk` for Scouts, Transports, and Tanks. MP4 output uses ffmpeg when available and otherwise falls back to GIF.
+Rendering defaults to 10 FPS at 640×384. Use `--render-fps 20 --render-quality high` when fidelity matters more than rendering speed. `--killfeed` adds a compact translucent icon-only feed at the bottom centre with the latest five eliminations, collisions, crashes, and scores for five seconds; adjust it with `--killfeed-lines` and `--killfeed-duration`. Header counts use `S`, `Tr`, and `Tk` for Scouts, Transports, and Tanks. MP4 output uses ffmpeg when available and otherwise falls back to GIF.
 
 Built-in controller names are `rush`, `defend`, `greedy_value`, `assignment`, `potential_field`, `marksman`, and `convoy`.
 
