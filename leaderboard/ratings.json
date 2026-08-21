@@ -283,6 +283,20 @@
     {
       "author": "renj1ete0",
       "built_in": false,
+      "controller_id": "renj1ete0/opus_5_v2",
+      "deviation": 35.800794809423415,
+      "display_name": "Opus 5 V2",
+      "draws": 0,
+      "games": 0,
+      "losses": 0,
+      "rating": 1929.604267430377,
+      "version_sha": "2c187fce05e61d68acb9d5ca5adedaa91074f43e",
+      "volatility": 0.06000171377642513,
+      "wins": 0
+    },
+    {
+      "author": "renj1ete0",
+      "built_in": false,
       "controller_id": "renj1ete0/sonnet_5_v2",
       "deviation": 21.454100047761234,
       "display_name": "Sonnet 5 V2",

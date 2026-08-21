@@ -94,11 +94,11 @@ Only the latest rating state is committed; permanent tournament history lives in
 | 3 | Sol 5 6 Rl | TanWeiXuan | 2004 | 24 | 228 | 19 | 73 | 320 |
 | 4 | Gpt-5.3-Codex | renj1ete0 | 1984 | 23 | 244 | 43 | 97 | 384 |
 | 5 | Sonnet 5 V3 | renj1ete0 | 1977 | 23 | 249 | 34 | 109 | 392 |
-| 6 | Luna Xhigh Opus Breaker | TanWeiXuan | 1930 | 22 | 422 | 46 | 172 | 640 |
-| 7 | Luna Xhigh Sipp Marksman V1 | TanWeiXuan | 1717 | 21 | 405 | 131 | 316 | 852 |
-| 8 | Luna Xhigh Mpc | TanWeiXuan | 1661 | 21 | 308 | 317 | 195 | 820 |
-| 9 | Bigpickle V1 | TanWeiXuan | 1626 | 21 | 430 | 400 | 270 | 1100 |
-| 10 | Wayfinder V2 | TanWeiXuan | 1571 | 21 | 382 | 422 | 400 | 1204 |
+| 6 | Opus 5 V2 | renj1ete0 | 1930 | 36 | 0 | 0 | 0 | 0 |
+| 7 | Luna Xhigh Opus Breaker | TanWeiXuan | 1930 | 22 | 422 | 46 | 172 | 640 |
+| 8 | Luna Xhigh Sipp Marksman V1 | TanWeiXuan | 1717 | 21 | 405 | 131 | 316 | 852 |
+| 9 | Luna Xhigh Mpc | TanWeiXuan | 1661 | 21 | 308 | 317 | 195 | 820 |
+| 10 | Bigpickle V1 | TanWeiXuan | 1626 | 21 | 430 | 400 | 270 | 1100 |
 <!-- LEADERBOARD_END -->
 
 ## Reproducibility and security
