@@ -210,35 +210,42 @@ def _draw_killfeed(
 ) -> None:
     if not entries:
         return
-    width, _ = size
+    width, height = size
     scale = width / 640
-    padding = max(6, round(8 * scale))
-    banner_height = max(40, round(44 * scale))
-    row_height = max(24, round(27 * scale))
-    panel_width = max(155, round(180 * scale))
-    panel_left = width - padding - panel_width
-    panel_top = banner_height + padding
-    panel_bottom = panel_top + padding + len(entries) * row_height
+    edge_gap = max(4, round(5 * scale))
+    padding = max(4, round(5 * scale))
+    row_height = max(18, round(20 * scale))
+    panel_width = max(118, round(135 * scale))
+    panel_left = (width - panel_width) // 2
+    panel_right = panel_left + panel_width
+    panel_bottom = height - edge_gap
+    panel_top = panel_bottom - padding - len(entries) * row_height
     draw.rounded_rectangle(
-        (panel_left, panel_top, width - padding, panel_bottom),
-        radius=max(4, round(6 * scale)),
-        fill=(247, 247, 242, 220),
-        outline=(34, 34, 34, 110),
+        (panel_left, panel_top, panel_right, panel_bottom),
+        radius=max(3, round(4 * scale)),
+        fill=(247, 247, 242, 130),
+        outline=(34, 34, 34, 65),
         width=max(1, round(scale)),
     )
-    icon_radius = max(5, round(6 * scale))
+    icon_radius = max(4, round(4 * scale))
     icon_x = panel_left + padding + icon_radius
     for index, entry in enumerate(entries):
         center_y = panel_top + padding // 2 + row_height * index + row_height / 2
         _draw_vehicle_icon(draw, (icon_x, center_y), entry.vehicles[0], icon_radius)
         if entry.kind in {"hit", "collision"}:
             arrow = "->" if entry.kind == "hit" else "<->"
-            arrow_x = icon_x + round(27 * scale)
-            draw.text((arrow_x, center_y), arrow, fill="#222222", font=font, anchor="mm")
-            _draw_vehicle_icon(draw, (icon_x + round(54 * scale), center_y), entry.vehicles[1], icon_radius)
+            arrow_x = icon_x + round(20 * scale)
+            draw.text((arrow_x, center_y), arrow, fill=(34, 34, 34, 220), font=font, anchor="mm")
+            _draw_vehicle_icon(draw, (icon_x + round(40 * scale), center_y), entry.vehicles[1], icon_radius)
         else:
             label = "crash" if entry.kind == "crash" else f"score (+{entry.points})"
-            draw.text((icon_x + round(18 * scale), center_y), label, fill="#222222", font=font, anchor="lm")
+            draw.text(
+                (icon_x + round(13 * scale), center_y),
+                label,
+                fill=(34, 34, 34, 220),
+                font=font,
+                anchor="lm",
+            )
 
 
 def _draw_frame(
@@ -251,6 +258,7 @@ def _draw_frame(
     killfeed_entries: tuple[_KillfeedEntry, ...] = (),
     killfeed_duration: float = 5.0,
     killfeed_lines: int = 5,
+    killfeed_font: Any | None = None,
 ) -> Any:
     from PIL import ImageDraw
 
@@ -327,7 +335,7 @@ def _draw_frame(
             limit=killfeed_lines,
         ),
         size,
-        font,
+        killfeed_font or font,
     )
     return image
 
@@ -482,6 +490,7 @@ def render_replay(
     print(f"Prepared {total_frames} frames at {fps} FPS ({quality} quality).", flush=True)
     background = _arena_background(replay, size)
     font = ImageFont.load_default(size=max(12, round(14 * size[0] / 640)))
+    killfeed_font = ImageFont.load_default(size=max(9, round(10 * size[0] / 640)))
     trails: dict[int, list[tuple[int, int]]] = {}
     killfeed_entries = _killfeed_entries(replay) if killfeed else ()
 
@@ -502,6 +511,7 @@ def render_replay(
             killfeed_entries,
             killfeed_duration,
             killfeed_lines,
+            killfeed_font,
         )
         if destination.suffix.lower() == ".png":
             image.save(destination, compress_level=png_compression)
@@ -523,6 +533,7 @@ def render_replay(
                 killfeed_entries,
                 killfeed_duration,
                 killfeed_lines,
+                killfeed_font,
             )
 
     last_reported = -1
