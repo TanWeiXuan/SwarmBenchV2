@@ -101,6 +101,95 @@ def test_renderer_header_counts_only_active_drones(short_match) -> None:
         ),
     )
     assert renderer._remaining_counts(changed, Team.A) == (expected[0] - 1, expected[1], expected[2])
+    assert renderer._count_text(expected) == f"S {expected[0]}  Tr {expected[1]}  Tk {expected[2]}"
+
+
+def test_killfeed_uses_vehicle_icons_without_names_or_ids(short_match) -> None:
+    replay = deepcopy(short_match.replay)
+    red_tank = next(drone for drone in replay.scenario.drones if drone.team is Team.B and drone.drone_type is DroneType.TANK)
+    blue_transport = next(
+        drone for drone in replay.scenario.drones if drone.team is Team.A and drone.drone_type is DroneType.TRANSPORT
+    )
+    red_scouts = [
+        drone for drone in replay.scenario.drones if drone.team is Team.B and drone.drone_type is DroneType.SCOUT
+    ][:2]
+    replay.events.extend(
+        [
+            {
+                "time": 0.2,
+                "type": "PROJECTILE_FIRED",
+                "drone_ids": [red_tank.id],
+                "position": [0.0, 0.0],
+                "team": "B",
+                "points": 0,
+                "projectile_id": 99,
+            },
+            {
+                "time": 0.5,
+                "type": "PROJECTILE_HIT",
+                "drone_ids": [blue_transport.id],
+                "position": [0.0, 0.0],
+                "team": "B",
+                "points": 0,
+                "projectile_id": 99,
+            },
+            {
+                "time": 0.6,
+                "type": "VEHICLE_COLLISION",
+                "drone_ids": [red_scouts[0].id, red_scouts[1].id],
+                "position": [0.0, 0.0],
+                "team": None,
+                "points": 0,
+            },
+            {
+                "time": 0.7,
+                "type": "GOAL",
+                "drone_ids": [blue_transport.id],
+                "position": [0.0, 0.0],
+                "team": "A",
+                "points": 5,
+            },
+        ]
+    )
+
+    entries = renderer._killfeed_entries(replay)
+
+    assert entries[-3].kind == "hit"
+    assert entries[-3].vehicles == ((Team.B, DroneType.TANK), (Team.A, DroneType.TRANSPORT))
+    assert entries[-2].kind == "collision"
+    assert entries[-2].vehicles == ((Team.B, DroneType.SCOUT), (Team.B, DroneType.SCOUT))
+    assert entries[-1].kind == "score"
+    assert entries[-1].vehicles == ((Team.A, DroneType.TRANSPORT),)
+    assert entries[-1].points == 5
+
+
+def test_killfeed_defaults_to_five_recent_seconds_and_lines(short_match) -> None:
+    vehicle = (Team.A, DroneType.SCOUT)
+    entries = tuple(renderer._KillfeedEntry(float(index), "score", (vehicle,), 1) for index in range(7))
+
+    visible = renderer._visible_killfeed_entries(entries, 6.0, duration=5.0, limit=5)
+
+    assert [entry.time for entry in visible] == [6.0, 5.0, 4.0, 3.0, 2.0]
+    assert not renderer._visible_killfeed_entries(entries, 12.0, duration=5.0, limit=5)
+
+
+def test_renderer_draws_icon_killfeed(short_match, tmp_path: Path) -> None:
+    replay = deepcopy(short_match.replay)
+    scorer = next(drone for drone in replay.scenario.drones if drone.drone_type is DroneType.TRANSPORT)
+    replay.events.append(
+        {
+            "time": 0.9,
+            "type": "GOAL",
+            "drone_ids": [scorer.id],
+            "position": list(scorer.position),
+            "team": scorer.team.value,
+            "points": 5,
+        }
+    )
+
+    output = render_replay(replay, tmp_path / "killfeed.png", killfeed=True)
+
+    assert output.stat().st_size > 1_000
 
 
 def test_renderer_truncates_long_controller_names() -> None:

@@ -6,12 +6,21 @@ import math
 import shutil
 import subprocess
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from swarmbench.api import PHYSICS_DT, CircleObstacle, DroneStatus, DroneType, RectangleObstacle, Team
 
 from .format import Replay, ReplayFrame, reconstruct_frames
+
+
+@dataclass(frozen=True, slots=True)
+class _KillfeedEntry:
+    time: float
+    kind: str
+    vehicles: tuple[tuple[Team, DroneType], ...]
+    points: int = 0
 
 
 def explosion_events_at(replay: Replay, timestamp: float, lifetime: float = 0.25) -> list[dict[str, Any]]:
@@ -21,6 +30,54 @@ def explosion_events_at(replay: Replay, timestamp: float, lifetime: float = 0.25
         if event.get("type") in {"VEHICLE_COLLISION", "PROJECTILE_HIT", "OBSTACLE_CRASH"}
         and 0.0 <= timestamp - float(event["time"]) <= lifetime
     ]
+
+
+def _killfeed_entries(replay: Replay) -> tuple[_KillfeedEntry, ...]:
+    drones = {drone.id: drone for drone in replay.scenario.drones}
+    projectile_sources: dict[int, int] = {}
+    entries: list[_KillfeedEntry] = []
+    for event in replay.events:
+        event_type = event.get("type")
+        drone_ids = event.get("drone_ids", [])
+        projectile_id = event.get("projectile_id")
+        if event_type == "PROJECTILE_FIRED":
+            if projectile_id is not None and drone_ids:
+                projectile_sources[int(projectile_id)] = int(drone_ids[0])
+            continue
+
+        vehicles = []
+        for drone_id in drone_ids:
+            drone = drones.get(int(drone_id))
+            if drone is not None:
+                vehicles.append((drone.team, drone.drone_type))
+        if event_type == "PROJECTILE_HIT" and vehicles:
+            source_id = projectile_sources.get(int(projectile_id)) if projectile_id is not None else None
+            source = drones.get(source_id) if source_id is not None else None
+            if source is not None:
+                attacker = (source.team, source.drone_type)
+            elif event.get("team") in {Team.A.value, Team.B.value}:
+                attacker = (Team(event["team"]), DroneType.TANK)
+            else:
+                continue
+            entries.append(_KillfeedEntry(float(event["time"]), "hit", (attacker, vehicles[0])))
+        elif event_type == "VEHICLE_COLLISION" and len(vehicles) == 2:
+            entries.append(_KillfeedEntry(float(event["time"]), "collision", tuple(vehicles)))
+        elif event_type == "OBSTACLE_CRASH" and vehicles:
+            entries.append(_KillfeedEntry(float(event["time"]), "crash", (vehicles[0],)))
+        elif event_type == "GOAL" and vehicles:
+            entries.append(_KillfeedEntry(float(event["time"]), "score", (vehicles[0],), int(event.get("points", 0))))
+    return tuple(sorted(entries, key=lambda entry: entry.time))
+
+
+def _visible_killfeed_entries(
+    entries: tuple[_KillfeedEntry, ...],
+    timestamp: float,
+    *,
+    duration: float,
+    limit: int,
+) -> tuple[_KillfeedEntry, ...]:
+    visible = [entry for entry in entries if 0.0 <= timestamp - entry.time <= duration]
+    return tuple(reversed(visible[-limit:]))
 
 
 def _quality_settings(quality: str) -> tuple[tuple[int, int], int, int, int, int]:
@@ -113,6 +170,11 @@ def _remaining_counts(frame: ReplayFrame, team: Team) -> tuple[int, int, int]:
     )
 
 
+def _count_text(counts: tuple[int, int, int]) -> str:
+    scout, transport, tank = counts
+    return f"S {scout}  Tr {transport}  Tk {tank}"
+
+
 def _fit_text(draw: Any, value: str, max_width: int, font: Any) -> str:
     if draw.textlength(value, font=font) <= max_width:
         return value
@@ -122,6 +184,63 @@ def _fit_text(draw: Any, value: str, max_width: int, font: Any) -> str:
     return value + suffix
 
 
+def _draw_vehicle_icon(
+    draw: Any,
+    center: tuple[float, float],
+    vehicle: tuple[Team, DroneType],
+    radius: int,
+) -> None:
+    team, drone_type = vehicle
+    color = "#1769aa" if team is Team.A else "#c62828"
+    x, y = center
+    bounds = (x - radius, y - radius, x + radius, y + radius)
+    if drone_type is DroneType.SCOUT:
+        draw.ellipse(bounds, fill=color)
+    elif drone_type is DroneType.TRANSPORT:
+        draw.rectangle(bounds, fill=color)
+    else:
+        draw.polygon(((x, y - radius), (x - radius, y + radius), (x + radius, y + radius)), fill=color)
+
+
+def _draw_killfeed(
+    draw: Any,
+    entries: tuple[_KillfeedEntry, ...],
+    size: tuple[int, int],
+    font: Any,
+) -> None:
+    if not entries:
+        return
+    width, _ = size
+    scale = width / 640
+    padding = max(6, round(8 * scale))
+    banner_height = max(40, round(44 * scale))
+    row_height = max(24, round(27 * scale))
+    panel_width = max(155, round(180 * scale))
+    panel_left = width - padding - panel_width
+    panel_top = banner_height + padding
+    panel_bottom = panel_top + padding + len(entries) * row_height
+    draw.rounded_rectangle(
+        (panel_left, panel_top, width - padding, panel_bottom),
+        radius=max(4, round(6 * scale)),
+        fill=(247, 247, 242, 220),
+        outline=(34, 34, 34, 110),
+        width=max(1, round(scale)),
+    )
+    icon_radius = max(5, round(6 * scale))
+    icon_x = panel_left + padding + icon_radius
+    for index, entry in enumerate(entries):
+        center_y = panel_top + padding // 2 + row_height * index + row_height / 2
+        _draw_vehicle_icon(draw, (icon_x, center_y), entry.vehicles[0], icon_radius)
+        if entry.kind in {"hit", "collision"}:
+            arrow = "->" if entry.kind == "hit" else "<->"
+            arrow_x = icon_x + round(27 * scale)
+            draw.text((arrow_x, center_y), arrow, fill="#222222", font=font, anchor="mm")
+            _draw_vehicle_icon(draw, (icon_x + round(54 * scale), center_y), entry.vehicles[1], icon_radius)
+        else:
+            label = "crash" if entry.kind == "crash" else f"score (+{entry.points})"
+            draw.text((icon_x + round(18 * scale), center_y), label, fill="#222222", font=font, anchor="lm")
+
+
 def _draw_frame(
     background: Any,
     replay: Replay,
@@ -129,6 +248,9 @@ def _draw_frame(
     trails: dict[int, list[tuple[int, int]]],
     size: tuple[int, int],
     font: Any,
+    killfeed_entries: tuple[_KillfeedEntry, ...] = (),
+    killfeed_duration: float = 5.0,
+    killfeed_lines: int = 5,
 ) -> Any:
     from PIL import ImageDraw
 
@@ -180,11 +302,9 @@ def _draw_frame(
         font=font,
     )
 
-    scout_a, transport_a, tank_a = _remaining_counts(frame, Team.A)
-    scout_b, transport_b, tank_b = _remaining_counts(frame, Team.B)
-    left_counts = f"S {scout_a}  X {transport_a}  T {tank_a}"
+    left_counts = _count_text(_remaining_counts(frame, Team.A))
     status = f"t={frame.time:05.2f}s   {frame.scores[0]} - {frame.scores[1]}"
-    right_counts = f"S {scout_b}  X {transport_b}  T {tank_b}"
+    right_counts = _count_text(_remaining_counts(frame, Team.B))
     draw.text((padding, details_y), left_counts, fill="#1769aa", font=font)
     draw.text(
         ((width - draw.textlength(status, font=font)) / 2, details_y),
@@ -197,6 +317,17 @@ def _draw_frame(
         right_counts,
         fill="#c62828",
         font=font,
+    )
+    _draw_killfeed(
+        draw,
+        _visible_killfeed_entries(
+            killfeed_entries,
+            frame.time,
+            duration=killfeed_duration,
+            limit=killfeed_lines,
+        ),
+        size,
+        font,
     )
     return image
 
@@ -326,6 +457,9 @@ def render_replay(
     *,
     fps: int = 10,
     quality: str = "low",
+    killfeed: bool = False,
+    killfeed_duration: float = 5.0,
+    killfeed_lines: int = 5,
 ) -> Path:
     from PIL import ImageFont
 
@@ -334,6 +468,10 @@ def render_replay(
     source_fps = round(1 / PHYSICS_DT)
     if fps not in {5, 10, source_fps}:
         raise ValueError(f"fps must be one of 5, 10, or {source_fps}")
+    if killfeed and killfeed_duration <= 0:
+        raise ValueError("killfeed duration must be positive")
+    if killfeed and killfeed_lines <= 0:
+        raise ValueError("killfeed lines must be positive")
     size, palette_colors, png_compression, jpeg_quality, bitrate = _quality_settings(quality)
     every_ticks = source_fps // fps
     total_frames = _frame_count(replay, every_ticks)
@@ -345,6 +483,7 @@ def render_replay(
     background = _arena_background(replay, size)
     font = ImageFont.load_default(size=max(12, round(14 * size[0] / 640)))
     trails: dict[int, list[tuple[int, int]]] = {}
+    killfeed_entries = _killfeed_entries(replay) if killfeed else ()
 
     if destination.suffix.lower() in {".png", ".jpg", ".jpeg"}:
         final_frame = None
@@ -353,7 +492,17 @@ def render_replay(
         if final_frame is None:
             raise RuntimeError("replay produced no frames")
         print(f"Rendering final frame to {destination}...", flush=True)
-        image = _draw_frame(background, replay, final_frame, trails, size, font)
+        image = _draw_frame(
+            background,
+            replay,
+            final_frame,
+            trails,
+            size,
+            font,
+            killfeed_entries,
+            killfeed_duration,
+            killfeed_lines,
+        )
         if destination.suffix.lower() == ".png":
             image.save(destination, compress_level=png_compression)
         else:
@@ -364,7 +513,17 @@ def render_replay(
     def images() -> Iterable[Any]:
         for frame in reconstruct_frames(replay, every_ticks=every_ticks):
             _update_trails(frame, replay, size, trails)
-            yield _draw_frame(background, replay, frame, trails, size, font)
+            yield _draw_frame(
+                background,
+                replay,
+                frame,
+                trails,
+                size,
+                font,
+                killfeed_entries,
+                killfeed_duration,
+                killfeed_lines,
+            )
 
     last_reported = -1
 
