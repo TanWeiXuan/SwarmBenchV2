@@ -17,6 +17,20 @@
     {
       "author": "TanWeiXuan",
       "built_in": false,
+      "controller_id": "TanWeiXuan/Codex_5_6_Crossfire_v1",
+      "deviation": 36.777907575239325,
+      "display_name": "Codex 5 6 Crossfire V1",
+      "draws": 0,
+      "games": 0,
+      "losses": 0,
+      "rating": 1933.5566943845572,
+      "version_sha": "b07ed6969e689d67569d90daffda107ccf7a8659",
+      "volatility": 0.06000180816833077,
+      "wins": 0
+    },
+    {
+      "author": "TanWeiXuan",
+      "built_in": false,
       "controller_id": "TanWeiXuan/Luna_xHigh_mpc",
       "deviation": 21.08023391272424,
       "display_name": "Luna Xhigh Mpc",
