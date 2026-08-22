@@ -152,16 +152,20 @@ def test_submission_jobs_install_validation_dependencies() -> None:
 def test_tournament_compute_and_report_permissions_are_separated() -> None:
     text = workflow("tournament.yml")
     assert 'cron: "17 */6 * * *"' in text
-    assert text.count("SWARMBENCH_BACKEND: docker") == 5
+    assert text.count("SWARMBENCH_BACKEND: docker") == 1
     assert text.count("Maintain live tournament Discussion") == 1
-    for index in range(5):
-        compute = text.split(f"  compute-{index}:", 1)[1]
-        compute = compute.split(f"  compute-{index + 1}:", 1)[0] if index < 4 else compute.split("  final:", 1)[0]
-        assert "contents: read" in compute
-        assert "discussions: write" not in compute
-        assert "pull-requests: write" not in compute
+    assert "compute_matrix: ${{ steps.compute_matrix.outputs.value }}" in text
 
-    reporter = text.split("  reporter:", 1)[1].split("  compute-0:", 1)[0]
+    compute = text.split("  compute:", 1)[1].split("  final:", 1)[0]
+    assert "needs: prepare" in compute
+    assert "fail-fast: false" in compute
+    assert "max-parallel: 19" in compute
+    assert "matrix: ${{ fromJSON(needs.prepare.outputs.compute_matrix) }}" in compute
+    assert "contents: read" in compute
+    assert "discussions: write" not in compute
+    assert "pull-requests: write" not in compute
+
+    reporter = text.split("  reporter:", 1)[1].split("  compute:", 1)[0]
     assert "contents: read" in reporter
     assert "actions: read" in reporter
     assert "discussions: write" in reporter
@@ -169,6 +173,7 @@ def test_tournament_compute_and_report_permissions_are_separated() -> None:
     assert "automation compute" not in reporter
 
     final = text.split("  final:", 1)[1]
+    assert "needs: compute" in final
     assert "contents: read" in final
     assert "actions: read" in final
     assert "discussions: write" not in final

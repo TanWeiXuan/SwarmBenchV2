@@ -1,4 +1,4 @@
-"""Five-batch tournament planning, compute, validation, and atomic publication."""
+"""Sharded tournament planning, compute, validation, and atomic publication."""
 
 from __future__ import annotations
 
@@ -14,6 +14,9 @@ from swarmbench.version import ENGINE_VERSION, TOURNAMENT_FORMAT_VERSION
 
 from .matchmaking import MatchmakingEntry, ScheduledGame, schedule_games, select_pairings
 from .ratings import RatingRecord, apply_rating_period, load_ratings, ratings_to_dict
+
+
+MAX_TOURNAMENT_BATCHES = 19
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,7 +42,8 @@ def create_plan(records: dict[str, RatingRecord], seed: int, *, mode: str, size:
     entries = [MatchmakingEntry(key, record.rating) for key, record in sorted(records.items())]
     pairings = select_pairings(entries, seed, target_opponents)
     games = schedule_games(pairings, seed, scenario_count)
-    batches = tuple(tuple(game.game_id for game in games[index::5]) for index in range(5))
+    batch_count = min(MAX_TOURNAMENT_BATCHES, max(1, len(games)))
+    batches = tuple(tuple(game.game_id for game in games[index::batch_count]) for index in range(batch_count))
     return TournamentPlan(seed, mode, pairings, games, batches)
 
 
@@ -155,8 +159,8 @@ def aggregate_batches(
     batches: list[dict[str, Any]],
     ratings: dict[str, RatingRecord],
 ) -> TournamentOutcome:
-    if len(batches) != 5:
-        raise ValueError("all five batches are required")
+    if len(batches) != len(plan.batches):
+        raise ValueError("all planned batches are required")
     all_games = tuple(result for index, batch in enumerate(batches) for result in validate_batch(plan, batch, index))
     if len({result["game_id"] for result in all_games}) != len(plan.games):
         raise ValueError("tournament result set is incomplete")
@@ -171,7 +175,7 @@ def tournament_cli(*, seed: int, size: str, mode: str) -> int:
     ratings = load_ratings(ratings_path)
     plan = create_plan(ratings, seed, mode=mode, size=size)
     paths = {name: baseline_path(name) for name in BASELINE_NAMES}
-    batches = [execute_batch(plan, index, paths) for index in range(5)]
+    batches = [execute_batch(plan, index, paths) for index in range(len(plan.batches))]
     outcome = aggregate_batches(plan, batches, ratings)
     if mode == "official":
         ratings_path.write_text(json.dumps(ratings_to_dict(outcome.ratings_after), indent=2, sort_keys=True) + "\n", encoding="utf-8")

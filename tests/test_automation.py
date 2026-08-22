@@ -16,6 +16,7 @@ from swarmbench.competition.automation import (
 )
 from swarmbench.competition.publisher import leaderboard_markdown, update_readme_leaderboard
 from swarmbench.competition.ratings import RatingRecord
+from swarmbench.competition.tournament import MAX_TOURNAMENT_BATCHES
 from swarmbench.version import ENGINE_VERSION, TOURNAMENT_FORMAT_VERSION
 
 
@@ -89,14 +90,29 @@ def test_automation_plan_round_trip_and_batch_coverage() -> None:
     data = prepare_plan(records(), seed=42, mode="official", size="small", run_id="123", repository="owner/repo")
     plan, restored = validate_plan(json.loads(json.dumps(data)))
     assert restored == records()
-    assert len(plan.batches) == 5
+    assert len(plan.batches) == min(MAX_TOURNAMENT_BATCHES, max(1, len(plan.games)))
     assert set(game.game_id for game in plan.games) == set().union(*map(set, plan.batches))
+
+
+def test_load_batches_orders_double_digit_indexes_numerically(tmp_path: Path) -> None:
+    for index in (10, 2, 0):
+        (tmp_path / f"batch-{index}.json").write_text(json.dumps({"batch_index": index}), encoding="utf-8")
+
+    assert [batch["batch_index"] for batch in automation._load_batches(tmp_path)] == [0, 2, 10]
 
 
 def test_plan_tampering_is_rejected() -> None:
     data = prepare_plan(records(), seed=42, mode="official", size="small", run_id="123", repository="owner/repo")
     data["engine_version"] = "tampered"
     with pytest.raises(ValueError):
+        validate_plan(data)
+
+
+def test_plan_rejects_duplicate_batch_game_assignment() -> None:
+    data = prepare_plan(records(), seed=42, mode="official", size="small", run_id="123", repository="owner/repo")
+    data["batches"][1].append(data["batches"][0][0])
+
+    with pytest.raises(ValueError, match="batch coverage mismatch"):
         validate_plan(data)
 
 
@@ -165,7 +181,7 @@ def test_progress_summary_validates_each_completed_batch() -> None:
                 }
             )
         batches.append(batch)
-    summary = progress_summary(data, batches, 1)
+    summary = progress_summary(data, list(reversed(batches)), 1)
     assert "Completed:" in summary and "provisional" in summary
     current_count = len(batches[1]["games"])
     assert (
@@ -224,14 +240,25 @@ def test_live_report_owns_discussion_until_final_artifact(tmp_path: Path, monkey
     artifacts = set(batches) | {"tournament-results"}
     jobs = [
         {"name": f"Compute batch {index + 1} (untrusted controllers)", "conclusion": "success"}
-        for index in range(5)
+        for index in range(len(plan.batches))
     ] + [{"name": "Validate all batches and publish atomically", "conclusion": "success"}]
     comments = []
+    downloads = []
+    artifact_checks = 0
+
+    def available_artifacts(*_args) -> set[str]:
+        nonlocal artifact_checks
+        artifact_checks += 1
+        if artifact_checks == 1:
+            return {f"tournament-batch-{len(plan.batches) - 1}"}
+        return artifacts
 
     def download(_repository: str, _run_id: str, name: str, destination: Path) -> None:
+        downloads.append(name)
         destination.mkdir(parents=True)
         if name in batches:
-            (destination / f"batch-{name[-1]}.json").write_text(json.dumps(batches[name]), encoding="utf-8")
+            index = int(name.rsplit("-", 1)[1])
+            (destination / f"batch-{index}.json").write_text(json.dumps(batches[name]), encoding="utf-8")
         else:
             (destination / "tournament-result.json").write_text(
                 json.dumps(
@@ -246,7 +273,7 @@ def test_live_report_owns_discussion_until_final_artifact(tmp_path: Path, monkey
             )
 
     monkeypatch.setattr(automation, "create_discussion", lambda *_args: {"id": "D1", "url": "https://example.test/1"})
-    monkeypatch.setattr(automation, "_artifact_names", lambda *_args: artifacts)
+    monkeypatch.setattr(automation, "_artifact_names", available_artifacts)
     monkeypatch.setattr(automation, "_run_jobs", lambda *_args: jobs)
     monkeypatch.setattr(automation, "_download_artifact", download)
     monkeypatch.setattr(automation, "_add_comment", lambda _id, body: comments.append(body))
@@ -254,6 +281,7 @@ def test_live_report_owns_discussion_until_final_artifact(tmp_path: Path, monkey
     discussion = live_report(data, "owner/repo", "123", tmp_path, poll_seconds=0)
 
     assert discussion["id"] == "D1"
+    assert downloads[0] == f"tournament-batch-{len(plan.batches) - 1}"
     assert len(comments) == 6 and comments[-1].startswith("### Final result")
     assert "## Status: COMPLETE" in comments[-1]
 
