@@ -28,6 +28,8 @@ jobs:
   prepare:
     name: Prepare deterministic schedule
     runs-on: ubuntu-latest
+    outputs:
+      compute_matrix: ${{ steps.compute_matrix.outputs.value }}
     permissions:
       contents: read
     steps:
@@ -46,6 +48,11 @@ jobs:
           RUN_ID: ${{ github.run_id }}
           REPOSITORY: ${{ github.repository }}
         run: python -m swarmbench.competition.automation prepare --ratings leaderboard/ratings.json --mode "$MODE" --size "$SIZE" --seed "$SEED" --run-id "$RUN_ID" --repository "$REPOSITORY" --output plan.json
+      - name: Create compute matrix
+        id: compute_matrix
+        run: |
+          matrix=$(jq -c '.batches | to_entries | map({batch: .key, label: (.key + 1)}) | {include: .}' plan.json)
+          echo "value=$matrix" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
         with:
           name: tournament-context
@@ -80,10 +87,14 @@ jobs:
           RUN_ID: ${{ github.run_id }}
         run: python -m swarmbench.competition.automation live-report --plan context/plan.json --repository "$REPOSITORY" --run-id "$RUN_ID" --work live-report
 
-  compute-0:
-    name: Compute batch 1 (untrusted controllers)
+  compute:
+    name: Compute batch ${{ matrix.label }} (untrusted controllers)
     needs: prepare
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 19
+      matrix: ${{ fromJSON(needs.prepare.outputs.compute_matrix) }}
     permissions:
       contents: read
     steps:
@@ -99,130 +110,18 @@ jobs:
           path: context
       - env:
           SWARMBENCH_BACKEND: docker
-        run: python -m swarmbench.competition.automation compute --plan context/plan.json --batch 0 --output batch-0.json --replay-dir replays
+        run: python -m swarmbench.competition.automation compute --plan context/plan.json --batch "${{ matrix.batch }}" --output "batch-${{ matrix.batch }}.json" --replay-dir replays
       - uses: actions/upload-artifact@v4
         with:
-          name: tournament-batch-0
+          name: tournament-batch-${{ matrix.batch }}
           path: |
-            batch-0.json
-            replays/
-          retention-days: 30
-
-  compute-1:
-    name: Compute batch 2 (untrusted controllers)
-    needs: compute-0
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - run: python -m pip install -e ".[competition]"
-      - run: docker build --tag swarmbench-controller --file Dockerfile.controller .
-      - uses: actions/download-artifact@v4
-        with:
-          name: tournament-context
-          path: context
-      - env:
-          SWARMBENCH_BACKEND: docker
-        run: python -m swarmbench.competition.automation compute --plan context/plan.json --batch 1 --output batch-1.json --replay-dir replays
-      - uses: actions/upload-artifact@v4
-        with:
-          name: tournament-batch-1
-          path: |
-            batch-1.json
-            replays/
-          retention-days: 30
-
-  compute-2:
-    name: Compute batch 3 (untrusted controllers)
-    needs: compute-1
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - run: python -m pip install -e ".[competition]"
-      - run: docker build --tag swarmbench-controller --file Dockerfile.controller .
-      - uses: actions/download-artifact@v4
-        with:
-          name: tournament-context
-          path: context
-      - env:
-          SWARMBENCH_BACKEND: docker
-        run: python -m swarmbench.competition.automation compute --plan context/plan.json --batch 2 --output batch-2.json --replay-dir replays
-      - uses: actions/upload-artifact@v4
-        with:
-          name: tournament-batch-2
-          path: |
-            batch-2.json
-            replays/
-          retention-days: 30
-
-  compute-3:
-    name: Compute batch 4 (untrusted controllers)
-    needs: compute-2
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - run: python -m pip install -e ".[competition]"
-      - run: docker build --tag swarmbench-controller --file Dockerfile.controller .
-      - uses: actions/download-artifact@v4
-        with:
-          name: tournament-context
-          path: context
-      - env:
-          SWARMBENCH_BACKEND: docker
-        run: python -m swarmbench.competition.automation compute --plan context/plan.json --batch 3 --output batch-3.json --replay-dir replays
-      - uses: actions/upload-artifact@v4
-        with:
-          name: tournament-batch-3
-          path: |
-            batch-3.json
-            replays/
-          retention-days: 30
-
-  compute-4:
-    name: Compute batch 5 (untrusted controllers)
-    needs: compute-3
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - run: python -m pip install -e ".[competition]"
-      - run: docker build --tag swarmbench-controller --file Dockerfile.controller .
-      - uses: actions/download-artifact@v4
-        with:
-          name: tournament-context
-          path: context
-      - env:
-          SWARMBENCH_BACKEND: docker
-        run: python -m swarmbench.competition.automation compute --plan context/plan.json --batch 4 --output batch-4.json --replay-dir replays
-      - uses: actions/upload-artifact@v4
-        with:
-          name: tournament-batch-4
-          path: |
-            batch-4.json
+            batch-${{ matrix.batch }}.json
             replays/
           retention-days: 30
 
   final:
     name: Validate all batches and publish atomically
-    needs: compute-4
+    needs: compute
     runs-on: ubuntu-latest
     concurrency:
       group: swarmbench-rating-publication

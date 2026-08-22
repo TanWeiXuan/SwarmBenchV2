@@ -19,7 +19,7 @@ from swarmbench.version import CONTROLLER_API_VERSION, ENGINE_VERSION, SCENARIO_
 from .matchmaking import ScheduledGame
 from .publisher import update_readme_leaderboard
 from .ratings import RatingRecord, load_ratings, ratings_to_dict, save_ratings
-from .tournament import TournamentPlan, aggregate_batches, create_plan, execute_batch, validate_batch
+from .tournament import MAX_TOURNAMENT_BATCHES, TournamentPlan, aggregate_batches, create_plan, execute_batch, validate_batch
 
 
 def _now() -> str:
@@ -85,7 +85,14 @@ def validate_plan(data: Any) -> tuple[TournamentPlan, dict[str, RatingRecord]]:
         plan = TournamentPlan(int(data["seed"]), str(data["mode"]), pairings, games, batches)
     except (KeyError, TypeError, ValueError) as error:
         raise ValueError(f"invalid tournament plan: {error}") from error
-    if len(batches) != 5 or set(game.game_id for game in games) != set().union(*map(set, batches)):
+    game_ids = {game.game_id for game in games}
+    scheduled_ids = set().union(*map(set, batches))
+    if (
+        not 1 <= len(batches) <= MAX_TOURNAMENT_BATCHES
+        or game_ids != scheduled_ids
+        or sum(len(batch) for batch in batches) != len(games)
+        or (bool(games) and any(not batch for batch in batches))
+    ):
         raise ValueError("plan batch coverage mismatch")
     if any(game.controller_a not in records or game.controller_b not in records for game in games):
         raise ValueError("plan references unknown controller")
@@ -254,7 +261,7 @@ def live_report(
 ) -> dict[str, str]:
     """Own one Discussion while isolated jobs publish validated JSON artifacts."""
 
-    validate_plan(data)
+    plan, _ = validate_plan(data)
     discussion = create_discussion(data, repository)
     print(f"Tournament Discussion: {discussion['url']}", flush=True)
     deadline = time.monotonic() + timeout_seconds
@@ -272,12 +279,42 @@ def live_report(
             time.sleep(poll_seconds)
 
     try:
-        for index in range(5):
-            artifact = f"tournament-batch-{index}"
-            wait_for(artifact, f"Compute batch {index + 1} (untrusted controllers)")
-            _download_artifact(repository, run_id, artifact, work / artifact)
-            summary = progress_summary(data, _load_batches(work), index)
-            _add_comment(discussion["id"], summary)
+        milestones = iter((20, 40, 60, 80, 100))
+        next_milestone = next(milestones)
+        pending = set(range(len(plan.batches)))
+        while pending:
+            jobs = _run_jobs(repository, run_id)
+            failed = _failed_stage(jobs)
+            if failed:
+                raise RuntimeError(f"{failed} failed")
+            artifacts = _artifact_names(repository, run_id)
+            ready = [
+                index
+                for index in sorted(pending)
+                if f"tournament-batch-{index}" in artifacts
+                and _job_succeeded(jobs, f"Compute batch {index + 1} (untrusted controllers)")
+            ]
+            if not ready:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("timed out waiting for tournament batches")
+                time.sleep(poll_seconds)
+                continue
+            for index in ready:
+                artifact = f"tournament-batch-{index}"
+                _download_artifact(repository, run_id, artifact, work / artifact)
+                pending.remove(index)
+                batches = _load_batches(work)
+                completed_games = sum(len(batch.get("games", ())) for batch in batches)
+                percent = round(100 * completed_games / len(plan.games)) if plan.games else 100
+                if percent >= next_milestone:
+                    summary = progress_summary(data, batches, index)
+                    _add_comment(discussion["id"], summary)
+                    while next_milestone <= percent:
+                        try:
+                            next_milestone = next(milestones)
+                        except StopIteration:
+                            next_milestone = 101
+                            break
 
         wait_for("tournament-results", "Validate all batches and publish atomically")
         result_dir = work / "tournament-results"
@@ -302,7 +339,10 @@ def live_report(
 
 
 def _load_batches(directory: Path) -> list[dict[str, Any]]:
-    return [json.loads(path.read_text(encoding="utf-8")) for path in sorted(directory.rglob("batch-*.json"))]
+    batches = [json.loads(path.read_text(encoding="utf-8")) for path in directory.rglob("batch-*.json")]
+    if any(type(batch.get("batch_index")) is not int for batch in batches):
+        raise ValueError("batch index must be an integer")
+    return sorted(batches, key=lambda batch: batch["batch_index"])
 
 
 def _matchup_progress_lines(games: list[dict[str, Any]]) -> list[str]:
@@ -341,12 +381,17 @@ def progress_summary(data: dict[str, Any], batches: list[dict[str, Any]], comple
     plan, _ = validate_plan(data)
     games = []
     current_games = []
-    for index, batch in enumerate(batches):
+    completed_indices = []
+    for batch in batches:
+        index = batch.get("batch_index")
+        if type(index) is not int or not 0 <= index < len(plan.batches) or index in completed_indices:
+            raise ValueError("invalid completed batch index")
+        completed_indices.append(index)
         validated = validate_batch(plan, batch, index)
         games.extend(validated)
         if index == completed_index:
             current_games = validated
-    expected_completed = sum(len(plan.batches[index]) for index in range(completed_index + 1))
+    expected_completed = sum(len(plan.batches[index]) for index in completed_indices)
     if len(games) != expected_completed:
         raise ValueError("progress result count mismatch")
     side_a_wins = sum(game["result_a"] == 1.0 for game in current_games)

@@ -4,7 +4,7 @@ import pytest
 
 from swarmbench.competition.matchmaking import MatchmakingEntry, schedule_games, select_pairings
 from swarmbench.competition.ratings import RatingRecord, load_ratings, save_ratings
-from swarmbench.competition.tournament import aggregate_batches, create_plan
+from swarmbench.competition.tournament import MAX_TOURNAMENT_BATCHES, aggregate_batches, create_plan
 from swarmbench.version import ENGINE_VERSION, TOURNAMENT_FORMAT_VERSION
 
 
@@ -33,6 +33,18 @@ def test_schedule_swaps_sides_for_every_scenario() -> None:
         first, second = games[index : index + 2]
         assert first.scenario_seed == second.scenario_seed
         assert (first.controller_a, first.controller_b) == (second.controller_b, second.controller_a)
+
+
+def test_plan_uses_balanced_nonempty_parallel_batches() -> None:
+    plan = create_plan(records(25), 42, mode="official", size="default")
+    sizes = [len(batch) for batch in plan.batches]
+    assert len(sizes) == MAX_TOURNAMENT_BATCHES
+    assert min(sizes) > 0
+    assert max(sizes) - min(sizes) <= 1
+
+    small = create_plan(records(2), 42, mode="exhibition", size="small")
+    assert len(small.batches) == len(small.games)
+    assert all(len(batch) == 1 for batch in small.batches)
 
 
 def complete_batches(plan):
