@@ -311,6 +311,20 @@
     {
       "author": "renj1ete0",
       "built_in": false,
+      "controller_id": "renj1ete0/opus_5_v3",
+      "deviation": 37.31140334615552,
+      "display_name": "Opus 5 V3",
+      "draws": 0,
+      "games": 0,
+      "losses": 0,
+      "rating": 1908.4069949150646,
+      "version_sha": "d87aff94ddcf6ff17a32f3ee39c9aa633091d0e2",
+      "volatility": 0.060001235306431096,
+      "wins": 0
+    },
+    {
+      "author": "renj1ete0",
+      "built_in": false,
       "controller_id": "renj1ete0/qwen_3_6_35b_extra_high_v1",
       "deviation": 28.759949873011244,
       "display_name": "Qwen 3 6 35B Extra High V1",
