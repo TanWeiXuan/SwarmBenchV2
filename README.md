@@ -97,8 +97,8 @@ Only the latest rating state is committed; permanent tournament history lives in
 | 6 | Sol 5 6 Rl | TanWeiXuan | 1982 | 22 | 1036 | 105 | 755 | 1896 |
 | 7 | Gpt-5.3-Codex | renj1ete0 | 1929 | 23 | 1030 | 201 | 761 | 1992 |
 | 8 | Luna Xhigh Opus Breaker | TanWeiXuan | 1913 | 22 | 1120 | 183 | 897 | 2200 |
-| 9 | Luna Xhigh Sipp Marksman V1 | TanWeiXuan | 1752 | 22 | 1212 | 414 | 810 | 2436 |
-| 10 | Luna Xhigh Mpc | TanWeiXuan | 1644 | 21 | 904 | 958 | 510 | 2372 |
+| 9 | Opus 5 V3 | renj1ete0 | 1908 | 37 | 0 | 0 | 0 | 0 |
+| 10 | Luna Xhigh Sipp Marksman V1 | TanWeiXuan | 1752 | 22 | 1212 | 414 | 810 | 2436 |
 <!-- LEADERBOARD_END -->
 
 ## Reproducibility and security
