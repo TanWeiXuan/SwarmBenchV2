@@ -96,9 +96,9 @@ Only the latest rating state is committed; permanent tournament history lives in
 | 5 | Sol 5 6 Rl | TanWeiXuan | 1980 | 22 | 1282 | 136 | 1022 | 2440 |
 | 6 | Gemini 3 1 Pro V1 | renj1ete0 | 1972 | 23 | 1310 | 148 | 1030 | 2488 |
 | 7 | Opus 5 V1 | renj1ete0 | 1950 | 22 | 1614 | 330 | 972 | 2916 |
-| 8 | Sonnet 5 V3 | renj1ete0 | 1945 | 22 | 1285 | 193 | 1042 | 2520 |
-| 9 | Luna Xhigh Opus Breaker | TanWeiXuan | 1894 | 22 | 1346 | 229 | 1137 | 2712 |
-| 10 | Luna Xhigh Sipp Marksman V1 | TanWeiXuan | 1731 | 22 | 1458 | 504 | 986 | 2948 |
+| 8 | Opus 5 V4 | renj1ete0 | 1947 | 37 | 0 | 0 | 0 | 0 |
+| 9 | Sonnet 5 V3 | renj1ete0 | 1945 | 22 | 1285 | 193 | 1042 | 2520 |
+| 10 | Luna Xhigh Opus Breaker | TanWeiXuan | 1894 | 22 | 1346 | 229 | 1137 | 2712 |
 <!-- LEADERBOARD_END -->
 
 ## Reproducibility and security
