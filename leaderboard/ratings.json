@@ -73,6 +73,20 @@
     {
       "author": "TanWeiXuan",
       "built_in": false,
+      "controller_id": "TanWeiXuan/Qwen_3_8_27B_INT4_Local",
+      "deviation": 37.86463604012958,
+      "display_name": "Qwen 3 8 27B Int4 Local",
+      "draws": 0,
+      "games": 0,
+      "losses": 0,
+      "rating": 1651.5664641269161,
+      "version_sha": "84e93ff7ad33c127bd13c0cf1e9909fe6df680a6",
+      "volatility": 0.059997338889317,
+      "wins": 0
+    },
+    {
+      "author": "TanWeiXuan",
+      "built_in": false,
       "controller_id": "TanWeiXuan/Sol_5_6_RL",
       "deviation": 21.788908822752642,
       "display_name": "Sol 5 6 Rl",
