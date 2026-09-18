@@ -89,16 +89,16 @@ Only the latest rating state is committed; permanent tournament history lives in
 <!-- LEADERBOARD_START -->
 | Rank | Controller | Author | Rating | RD | W | D | L | Games |
 | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | Opus 5 V4 | renj1ete0 | 2798 | 35 | 4432 | 106 | 198 | 4736 |
-| 2 | Opus 5 V3 | renj1ete0 | 2630 | 32 | 4426 | 193 | 629 | 5248 |
-| 3 | Codex 5 6 Crossfire V1 | TanWeiXuan | 2400 | 28 | 4943 | 213 | 1532 | 6688 |
-| 4 | Opus 5 V2 | renj1ete0 | 2367 | 28 | 4815 | 226 | 1887 | 6928 |
-| 5 | Gemini 3 1 Pro V1 | renj1ete0 | 2025 | 24 | 3664 | 472 | 3520 | 7656 |
-| 6 | Sonnet 5 V3 | renj1ete0 | 2018 | 23 | 3471 | 584 | 3465 | 7520 |
-| 7 | Sol 5 6 Rl | TanWeiXuan | 2011 | 23 | 3628 | 424 | 3884 | 7936 |
-| 8 | Opus 5 V1 | renj1ete0 | 1997 | 23 | 3880 | 864 | 3228 | 7972 |
-| 9 | Gpt-5.3-Codex | renj1ete0 | 1981 | 24 | 3451 | 849 | 3308 | 7608 |
-| 10 | Luna Xhigh Opus Breaker | TanWeiXuan | 1894 | 22 | 3637 | 630 | 3189 | 7456 |
+| 1 | Opus 5 V4 | renj1ete0 | 2800 | 36 | 4492 | 107 | 201 | 4800 |
+| 2 | Opus 5 V3 | renj1ete0 | 2616 | 32 | 4476 | 197 | 639 | 5312 |
+| 3 | Codex 5 6 Crossfire V1 | TanWeiXuan | 2396 | 28 | 4986 | 214 | 1552 | 6752 |
+| 4 | Opus 5 V2 | renj1ete0 | 2393 | 28 | 4871 | 227 | 1902 | 7000 |
+| 5 | Gemini 3 1 Pro V1 | renj1ete0 | 2044 | 24 | 3691 | 479 | 3558 | 7728 |
+| 6 | Sonnet 5 V3 | renj1ete0 | 2012 | 23 | 3505 | 590 | 3497 | 7592 |
+| 7 | Sol 5 6 Rl | TanWeiXuan | 2004 | 23 | 3656 | 426 | 3926 | 8008 |
+| 8 | Opus 5 V1 | renj1ete0 | 1993 | 23 | 3912 | 870 | 3254 | 8036 |
+| 9 | Gpt-5.3-Codex | renj1ete0 | 1977 | 24 | 3478 | 861 | 3333 | 7672 |
+| 10 | Luna Xhigh Opus Breaker | TanWeiXuan | 1894 | 22 | 3668 | 635 | 3217 | 7520 |
 <!-- LEADERBOARD_END -->
 
 ## Reproducibility and security
